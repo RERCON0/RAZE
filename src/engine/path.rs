@@ -98,8 +98,8 @@ impl Wide {
         // Обычный UNC: \\server\share\
         if s.len() >= 2 && s[..2] == [BSLASH, BSLASH] {
             let mut parts = 0usize;
-            for i in 2..s.len() {
-                if s[i] == BSLASH {
+            for (i, unit) in s.iter().enumerate().skip(2) {
+                if *unit == BSLASH {
                     parts += 1;
                     if parts == 2 {
                         return Some(i + 1);
@@ -210,6 +210,11 @@ pub enum PathError {
     NotAbsolute,
     /// Байты не декодируются как корректный путь Windows.
     NotUtf16,
+    /// Символы, которых в именах быть не может: `* ? " < > |`, управляющие и
+    /// двоеточие (поток NTFS). Они опасны не сами по себе, а тем, что оболочка
+    /// трактует их иначе: `C:\Users\me\*` в Корзину — это маска «все файлы», а
+    /// `C:\Windows::$INDEX_ALLOCATION` — та же папка под другим именем.
+    InvalidCharacters,
 }
 
 impl fmt::Display for PathError {
@@ -229,6 +234,10 @@ impl fmt::Display for PathError {
                 f.write_str(tr!("path cannot be resolved to absolute", "путь не удалось привести к абсолютному"))
             }
             Self::NotUtf16 => f.write_str(tr!("path is not valid UTF-16", "путь не является корректным UTF-16")),
+            Self::InvalidCharacters => f.write_str(tr!(
+                "path contains characters that names cannot have (* ? \" < > | :)",
+                "в пути есть символы, которых не бывает в именах (* ? \" < > | :)"
+            )),
         }
     }
 }
@@ -260,18 +269,23 @@ impl NtPath {
                 if rest.is_empty() || !rest.contains('\\') {
                     return Err(PathError::IncompleteUnc);
                 }
+                reject_invalid_characters(rest)?;
+                // Для показа и сравнения это обычный UNC-путь: `\\server\share`.
                 return Ok(Self {
-                    plain: Wide::new(&text[4..]),
+                    plain: normalize_absolute(&Wide::new(&format!("\\\\{rest}"))),
                     ext: raw.clone(),
                 });
             }
-            if starts_with_ignore_case(&text, "\\\\?\\GLOBALROOT\\")
-                || starts_with_ignore_case(&text, "\\\\?\\Volume{")
-            {
+            // Дальше законна только форма с буквой диска `\\?\C:\...`. Всё
+            // остальное (`GLOBALROOT`, `Volume{..}`, `PhysicalDrive0`, `pipe`,
+            // голый `\\?\C:` — сам том) — пространство устройств, а не файлы.
+            let body = &text[4..];
+            if !is_drive_spec(body) {
                 return Err(PathError::DevicePath);
             }
+            reject_invalid_characters(&body[2..])?;
             return Ok(Self {
-                plain: Wide::new(&text[4..]),
+                plain: normalize_absolute(&Wide::new(body)),
                 ext: raw.clone(),
             });
         }
@@ -284,12 +298,13 @@ impl NtPath {
         // UNC
         if first == b'\\' && text.as_bytes().get(1) == Some(&b'\\') {
             let rest = &text[2..];
+            reject_invalid_characters(rest)?;
             let body = rest.trim_start_matches('\\');
             let has_share = body.split('\\').filter(|s| !s.is_empty()).count() >= 2;
             if !has_share {
                 return Err(PathError::IncompleteUnc);
             }
-            let plain = normalize_absolute(&Wide::new(&format!("\\\\{}", body)));
+            let plain = normalize_absolute(&Wide::new(&format!("\\\\{body}")));
             // `plain` уже начинается с `\\`, а расширенная форма
             // UNC — `\\?\UNC\server\share`: разделители не дублируем.
             let plain_text = plain.to_string_lossy();
@@ -300,21 +315,22 @@ impl NtPath {
         }
 
         // Диск: `C:\...` или `C:...`
-        if text.as_bytes().len() >= 2 && text.as_bytes()[1] == b':' {
-            if text.as_bytes()[0].is_ascii_alphabetic() {
-                if text.as_bytes().len() >= 3 && text.as_bytes()[2] == b'\\' {
+        if text.len() >= 2 && text.as_bytes()[1] == b':'
+            && text.as_bytes()[0].is_ascii_alphabetic() {
+                reject_invalid_characters(&text[2..])?;
+                if text.len() >= 3 && text.as_bytes()[2] == b'\\' {
                     let plain = normalize_absolute(&Wide::new(&text));
                     return Ok(Self {
                         ext: Wide::new(&format!("\\\\?\\{}", plain.to_string_lossy())),
                         plain,
                     });
                 }
-                if text.as_bytes().len() == 2 {
+                if text.len() == 2 {
                     // Голый `C:` — спецификация диска, а не корень тома.
                     // GetFullPathNameW вернул бы `C:\` (текущий каталог
                     // диска), и путь стал бы корнем тома.
                     return Ok(Self {
-                        ext: Wide::new(&format!("\\\\?\\{}", text)),
+                        ext: Wide::new(&format!("\\\\?\\{text}")),
                         plain: Wide::new(&text),
                     });
                 }
@@ -327,12 +343,12 @@ impl NtPath {
                     plain,
                 });
             }
-        }
 
         // Всё остальное — относительный путь.
         if first == b'\\' {
             return Err(PathError::NotAbsolute);
         }
+        reject_invalid_characters(&text)?;
         let full = full_path_name(raw)?;
         let text = full.to_string_lossy();
         if !text.as_bytes().get(1).map(|b| *b == b':').unwrap_or(false) {
@@ -420,7 +436,7 @@ impl NtPath {
         self.ext.as_slice()[skip..]
             .split(|c| *c == b'\\' as u16)
             .filter(|c| !c.is_empty())
-            .map(|c| String::from_utf16_lossy(c))
+            .map(String::from_utf16_lossy)
             .collect()
     }
 
@@ -444,8 +460,8 @@ impl NtPath {
     /// Корневой компонент: `C:` для локального диска, `\\srv\shr` для UNC.
     pub fn root(&self) -> String {
         let text = self.plain.to_string_lossy();
-        if text.starts_with("\\\\") {
-            let body = text[2..].trim_start_matches('\\');
+        if let Some(rest) = text.strip_prefix("\\\\") {
+            let body = rest.trim_start_matches('\\');
             let mut parts = body.splitn(3, '\\');
             let server = parts.next().unwrap_or("");
             let share = parts.next().unwrap_or("");
@@ -501,10 +517,13 @@ pub fn is_reserved_name(name: &str) -> bool {
     {
         return true;
     }
+    // По байтам, а не срезом `str`: имя из двух кириллических букв занимает
+    // четыре байта, и `base[..3]` резал бы вторую букву посреди (паника).
+    let bytes = base.as_bytes();
     for prefix in ["COM", "LPT"] {
-        if base.len() == prefix.len() + 1
-            && base[..prefix.len()].eq_ignore_ascii_case(prefix)
-            && matches!(base.as_bytes()[prefix.len()], b'0'..=b'9')
+        if bytes.len() == prefix.len() + 1
+            && bytes[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+            && bytes[prefix.len()].is_ascii_digit()
         {
             return true;
         }
@@ -527,6 +546,27 @@ pub fn is_reserved_component_wide(name: &[u16]) -> bool {
         }
     }
     false
+}
+
+/// `X:\` — буква диска и разделитель. Голый `X:` сюда не входит: после
+/// префикса `\\?\` он означает сам том, а не файлы на нём.
+fn is_drive_spec(body: &str) -> bool {
+    let bytes = body.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
+}
+
+/// Символы, которых нет в именах NTFS: `* ? " < > |`, управляющие и `:`
+/// (двоеточие вне буквы диска — это поток данных). Проверяется только часть
+/// пути после префикса и буквы диска.
+fn reject_invalid_characters(text: &str) -> Result<(), PathError> {
+    if text
+        .chars()
+        .any(|c| c < ' ' || matches!(c, '*' | '?' | '"' | '<' | '>' | '|' | ':'))
+    {
+        Err(PathError::InvalidCharacters)
+    } else {
+        Ok(())
+    }
 }
 
 fn starts_with_ignore_case(text: &str, prefix: &str) -> bool {
@@ -651,6 +691,64 @@ mod tests {
     }
 
     #[test]
+    fn characters_that_names_cannot_have_are_refused() {
+        // `*` и `?` оболочка раскрывает как маску (Корзина удалила бы «всё»),
+        // а `::$INDEX_ALLOCATION` — это та же папка под другим именем, мимо
+        // списка запретных.
+        for bad in [
+            r"C:\Users\me\*",
+            r"C:\a\b?",
+            r"C:\a\b|c",
+            r"C:\Windows::$INDEX_ALLOCATION",
+            r"C:\a\b:stream",
+            "C:\\a\\\u{1}x",
+            r"foo:bar",
+            r#"C:\a"b"#,
+            r"\\srv\shr\a*",
+            r"\\?\C:\a\b*",
+        ] {
+            assert_eq!(
+                NtPath::new(Path::new(bad)).unwrap_err(),
+                PathError::InvalidCharacters,
+                "{bad}"
+            );
+        }
+        for fine in [
+            r"C:\a\file (1).txt",
+            r"C:\a\dir.",
+            "C:\\a\\x ",
+            r"C:\a\[abc]",
+            r"C:\a\#1&2,3'4!5@6%7^8;9=0+~$",
+            r"C:",
+            r"C:\ИП\отчёт",
+        ] {
+            assert!(NtPath::new(Path::new(fine)).is_ok(), "{fine}");
+        }
+    }
+
+    #[test]
+    fn extended_paths_must_name_a_drive_or_a_share() {
+        for device in [
+            r"\\?\PhysicalDrive0",
+            r"\\?\pipe\x",
+            r"\\?\C:",
+            r"\\?\GLOBALROOT\Device\X",
+            r"\\?\Volume{1234}\x",
+            r"\\?\HarddiskVolume1\x",
+        ] {
+            assert_eq!(
+                NtPath::new(Path::new(device)).unwrap_err(),
+                PathError::DevicePath,
+                "{device}"
+            );
+        }
+        // Для показа и сравнения расширенный UNC — обычный `\\server\share`.
+        assert_eq!(nt(r"\\?\UNC\srv\shr\dir").to_string_lossy(), r"\\srv\shr\dir");
+        assert!(nt(r"\\?\UNC\srv\shr").is_volume_root());
+        assert!(nt(r"\\?\C:\").is_volume_root());
+    }
+
+    #[test]
     fn incomplete_unc_is_refused() {
         assert_eq!(
             NtPath::new(Path::new(r"\\server")).unwrap_err(),
@@ -677,6 +775,20 @@ mod tests {
             Some("CON.log")
         );
         assert_eq!(nt(r"C:\dir\report.txt").reserved_component(), None);
+    }
+
+    #[test]
+    fn multibyte_names_never_panic_the_reserved_name_check() {
+        // Регрессия: «Да» занимает четыре байта, а проверка COMn/LPTn резала
+        // строку по третьему байту, то есть посреди второй буквы, и
+        // `str`-срез паниковал. Любая папка вроде `D:\ИП\отчёт` валила
+        // и сканер, и окно (в релизе panic = abort).
+        for name in ["Да", "ИП", "Мы", "abé", "é€", "a€", "СОМ1", "COM€"] {
+            assert!(!is_reserved_name(name), "{name}");
+        }
+        assert_eq!(nt(r"D:\ИП\отчёт").reserved_component(), None);
+        assert!(is_reserved_name("com1"));
+        assert!(is_reserved_name("LPT7.txt"));
     }
 
     #[test]
