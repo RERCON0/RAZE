@@ -1,0 +1,83 @@
+[workspace]
+members = ["shell-ext"]
+
+[package]
+name = "raze-rs"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+description = "RAZE — точечное удаление застрявших файлов и папок в Windows"
+license = "GPL-3.0-or-later"
+
+[lib]
+name = "raze_rs"
+path = "src/lib.rs"
+
+[features]
+# Explicitly opt-in, read-only native screenshot harness; not in release builds.
+ui-preview = []
+
+[[bin]]
+name = "raze-app"
+path = "src/bin/raze-app.rs"
+
+[[bin]]
+name = "raze"
+path = "src/bin/raze.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+# Ровно тот же egui/eframe, что и в SNATCH: та же визуальная «семья» и та же
+# вендорённая папка со шрифтами. glow вместо wgpu — exe заметно меньше.
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
+# Подтягивается транзитивно через eframe; объявлен явно, чтобы наш код мог
+# пережать встроенный app-иконку в egui::IconData (см. build.rs).
+image = { version = "0.25", default-features = false, features = ["png"] }
+# Нативные диалоги выбора папки/файла и подтверждения.
+rfd = { version = "0.17", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Реестр для контекстного меню: winreg заметно короче и читаемее, чем ручные
+# RegCreateKeyExW/RegSetValueExW с байтовыми буферами.
+winreg = "0.56"
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_RestartManager",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-core = "0.62"
+
+[build-dependencies]
+embed-resource = "3"
+
+[profile.release]
+strip = true
+lto = true
+opt-level = "z"
+codegen-units = 1
+panic = "abort"
+
+# opt-level="z" сильно ужимает exe, но epaint — горячий путь этого приложения
+# (перерисовка дерева файлов на каждом кадре). Ускоряем только его; остальное
+# остаётся "z".
+[profile.release.package.epaint]
+opt-level = 2
+
+# Тот же путь на уровень выше: раскладка и хеширование виджетов egui.
+[profile.release.package.egui]
+opt-level = 2

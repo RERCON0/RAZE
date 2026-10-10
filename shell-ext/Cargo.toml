@@ -1,0 +1,32 @@
+[package]
+name = "raze-shell"
+version = "0.1.0"
+edition = "2021"
+description = "RAZE context-menu COM extension for the modern Windows 11 shell menu"
+license = "GPL-3.0-or-later"
+build = "build.rs"
+
+[lib]
+name = "raze_shell"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Только `windows` и ничего больше: DLL живёт в процессе Проводника, где
+# лишние зависимости — это лишние шансы уронить explorer.exe.
+windows = { version = "0.62", features = [
+    "Foundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Ole",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-core = "0.62"
+
+[build-dependencies]
+embed-resource = "3"
