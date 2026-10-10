@@ -24,6 +24,8 @@ use serde::Serialize;
 use winreg::enums::HKEY_CURRENT_USER;
 use winreg::RegKey;
 
+use crate::engine::elevation::is_elevated;
+
 /// CLSID нашей COM-расширки. Тот же GUID зашит в `shell-ext` и в
 /// `packaging/AppxManifest.xml` (тест ниже сверяет манифест с этой
 /// константой). Менять только вместе.
@@ -35,15 +37,30 @@ const PACKAGE_FILE: &str = "RAZE.msix";
 const CERT_FILE: &str = "RAZE.cer";
 
 /// Отпечаток (SHA-1) сертификата, которым подписан `RAZE.msix`. Доверие в
-/// `TrustedPeople` выдаётся только сертификату с этим отпечатком: так
-/// случайно подменённый или повреждённый `RAZE.cer` не попадёт в хранилище.
-/// Это защита от ошибки, а не от злоумышленника с правами пользователя: тот
-/// мог бы заменить и сам `raze.exe`. При пересоздании сертификата константу
-/// надо обновить (`packaging\build-package.ps1` это проверяет).
-pub const PINNED_CERT_THUMBPRINT: &str = "1CDEBA01251B61E3E40F7465A8253BA276ED204F";
+/// `TrustedPeople` выдаётся только сертификату с этим отпечатком: подменённый
+/// или повреждённый `RAZE.cer` в хранилище не попадёт. Значение вшивается в
+/// `raze.exe` при сборке из `packaging/cert-thumbprint.txt` (ровно 40 символов,
+/// без перевода строки; тест это проверяет). Отпечаток публичного сертификата
+/// не секрет, закрытый ключ остаётся только в хранилище того, кто собирает.
+/// Чужая сборка пересоздаёт сертификат через `packaging\build-package.ps1`: он
+/// обновляет этот файл, после чего `raze.exe` пересобирается.
+pub const PINNED_CERT_THUMBPRINT: &str = include_str!("../../packaging/cert-thumbprint.txt");
 
-/// Куда всё ставится по умолчанию.
+/// Куда всё ставится: `%ProgramFiles%\RAZE`. Писать туда могут только
+/// администраторы, и это не мелочь: запрос UAC поднимает права у `raze.exe`, а
+/// файл из каталога, который может переписать любой процесс пользователя,
+/// подменили бы до запроса (повышение прав без всякой подписи). Из Program
+/// Files подменить его без прав администратора нельзя.
 pub fn default_install_dir() -> PathBuf {
+    let base = std::env::var_os("ProgramFiles")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
+    base.join("RAZE")
+}
+
+/// Где ставили прежние версии: каталог пользователя. Он перезаписываем любым
+/// процессом пользователя, поэтому копия оттуда убирается при установке.
+pub fn legacy_install_dir() -> PathBuf {
     let local = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| "C:\\".into());
     PathBuf::from(local).join("Programs").join("RAZE")
 }
@@ -101,6 +118,7 @@ pub fn install(source_dir: &Path, uninstall: bool) -> InstallReport {
     if uninstall {
         remove_classic(&mut report);
         remove_modern(&mut report);
+        remove_legacy_install(&mut report);
         return report;
     }
 
@@ -112,7 +130,26 @@ pub fn install(source_dir: &Path, uninstall: bool) -> InstallReport {
     forget_legacy_registration(&dir);
     write_classic(&dir, &mut report);
     register_modern(&dir, &mut report);
+    remove_legacy_install(&mut report);
     report
+}
+
+/// Убирает копию прежней версии из каталога пользователя (см.
+/// [`legacy_install_dir`]). Пункты меню и пакет к этому моменту уже указывают
+/// на новый каталог. Если копия запущена прямо сейчас, файл занят: это не
+/// ошибка установки, а напоминание удалить папку вручную.
+fn remove_legacy_install(report: &mut InstallReport) {
+    let old = legacy_install_dir();
+    if old == default_install_dir() || !old.join("raze.exe").exists() {
+        return;
+    }
+    match std::fs::remove_dir_all(&old) {
+        Ok(()) => report.done(format!("removed the old per-user copy {}", old.display())),
+        Err(error) => report.skipped(format!(
+            "the old per-user copy {} was not removed ({error}); delete the folder by hand",
+            old.display()
+        )),
+    }
 }
 
 /// Раскладывает исполняемые файлы, DLL и файлы пакета в каталог установки.
@@ -244,7 +281,7 @@ fn remove_modern(report: &mut InstallReport) {
              foreach ($c in @($s.Certificates.Find('FindByThumbprint', '{PINNED_CERT_THUMBPRINT}', $false))) {{ $s.Remove($c) }}; \
              $s.Close()"
         );
-        let result = run_elevated_powershell(&script);
+        let result = run_privileged_powershell(&script);
         if certificate_trusted().unwrap_or(false) {
             let reason = result.err().unwrap_or_else(|| "the certificate is still trusted".into());
             report.skipped(format!("the RAZE certificate was not removed from LocalMachine\\TrustedPeople ({reason})"));
@@ -335,7 +372,7 @@ fn ensure_certificate_trusted(cert: &Path) -> Result<(), String> {
          {STORE_PREAMBLE} $s.Open('ReadWrite'); $s.Add($c); $s.Close()",
         ps_quote(cert)
     );
-    let launched = run_elevated_powershell(&script);
+    let launched = run_privileged_powershell(&script);
     if certificate_trusted()? {
         Ok(())
     } else {
@@ -358,6 +395,17 @@ fn run_powershell(script: &str) -> Result<String, String> {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+/// Скрипт, которому нужны права администратора: если мы уже повышены (установка
+/// в Program Files начинается с UAC), он идёт в обычный PowerShell, и второго
+/// запроса не будет; иначе — с повышением.
+fn run_privileged_powershell(script: &str) -> Result<(), String> {
+    if is_elevated() {
+        run_powershell(script).map(|_| ())
+    } else {
+        run_elevated_powershell(script)
     }
 }
 
@@ -443,9 +491,15 @@ mod tests {
     }
 
     #[test]
-    fn install_dir_is_inside_local_appdata() {
+    fn install_dir_is_in_program_files_and_the_old_user_copy_is_elsewhere() {
+        // Из Program Files процесс без прав администратора файл не подменит;
+        // каталог пользователя для этого не годится.
         let dir = default_install_dir();
-        assert!(dir.ends_with("Programs/RAZE") || dir.ends_with("Programs\\RAZE"));
+        assert!(dir.ends_with("RAZE"));
+        if let Some(files) = std::env::var_os("ProgramFiles") {
+            assert_eq!(dir.parent(), Some(Path::new(&files)));
+        }
+        assert_ne!(dir, legacy_install_dir());
     }
 
     #[test]

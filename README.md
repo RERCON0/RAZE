@@ -104,30 +104,35 @@ deleted.
 ## Installation
 
 Build the Windows x64 binaries using the [development instructions](#development),
-then run `raze-app.exe` or `raze.exe`. RAZE itself needs no installation.
-
-To add **RAZE delete** to Explorer's right-click menu:
+then run `raze-app.exe` or `raze.exe` straight from the build folder. To add
+**RAZE delete** to Explorer's right-click menu:
 
 ```powershell
 raze --install
 ```
 
-This writes the classic verbs to `HKCU` (no admin rights needed), copies the
-binaries to `%LOCALAPPDATA%\Programs\RAZE` and, when `RAZE.msix` and `RAZE.cer`
-are next to `raze.exe` (see [Development](#development)), registers the
-**modern Windows 11 menu** — the one that opens on a plain right-click, where
-the entry reads **Delete with RAZE** (**Удалить с помощью RAZE** on a Russian
-Windows). The classic verb lives under *Show more options*.
+This asks for administrator rights **once** (one UAC prompt) and installs RAZE
+into `%ProgramFiles%\RAZE`. That folder is writable only by administrators, which
+matters: elevation re-runs `raze.exe`, and a copy in a folder any of your own
+programs can overwrite could be swapped for something else before the prompt.
+A copy left by an earlier version in `%LOCALAPPDATA%\Programs\RAZE` is removed.
 
-Windows only accepts menu extensions from signed packages, so the first
-registration asks for administrator confirmation (UAC) **once**: it adds RAZE's
-public, self-signed certificate (`CN=RERCON RAZE`) to
-`LocalMachine\TrustedPeople`, and only if its thumbprint matches the one pinned
-in `src\shell\install.rs`. Nothing else is changed, and no private key is
-involved. To repeat just that step: `raze --register-package`.
+The same run writes the classic verbs to `HKCU` and, when `RAZE.msix` and
+`RAZE.cer` are next to `raze.exe` (see [Development](#development)), registers
+the **modern Windows 11 menu** — the one that opens on a plain right-click,
+where the entry reads **Delete with RAZE** (**Удалить с помощью RAZE** on a
+Russian Windows). The classic verb lives under *Show more options*.
 
-To remove everything — the package, the classic verbs and that certificate (one
-more UAC prompt):
+Windows only accepts menu extensions from signed packages. RAZE's package is
+signed with a self-signed certificate (`CN=RERCON RAZE`), so the install adds
+its **public** part to `LocalMachine\TrustedPeople` — and only if its
+thumbprint matches the one compiled into `raze.exe` (`packaging\cert-thumbprint.txt`).
+Nothing else is changed, and no private key is involved. To repeat just that
+step: `raze --register-package`. (If you would rather not trust a certificate,
+skip `RAZE.msix`/`RAZE.cer`: the classic menu entry works without them.)
+
+To remove everything — the package, the classic verbs, that certificate and the
+installed files (one UAC prompt):
 
 ```powershell
 raze --uninstall
@@ -205,17 +210,19 @@ Windows x64, Rust 1.88+, Visual Studio Build Tools (MSVC + Windows SDK
 resources:
 
 ```powershell
-cargo build --release --workspace
 packaging\build-package.ps1
+cargo build --release --workspace
 cargo test --lib --workspace
 ```
 
-`build-package.ps1` packs and signs the sparse package that gives
-`raze_shell.dll` an identity (needs `makeappx.exe` and `signtool.exe` from the
-Windows SDK). The package is signed with a self-signed certificate whose
-private key stays, non-exportable, in your user certificate store; if you ever
-recreate it, update `PINNED_CERT_THUMBPRINT` in `src\shell\install.rs` (the
-script checks this).
+`build-package.ps1` comes first: it packs and signs the sparse package that
+gives `raze_shell.dll` an identity (needs `makeappx.exe` and `signtool.exe` from
+the Windows SDK). The package is signed with a self-signed certificate whose
+private key stays, non-exportable, in *your* user certificate store, so every
+builder gets a certificate of their own: the script creates it on first run and
+writes its thumbprint to `packaging\cert-thumbprint.txt`, which `cargo build`
+compiles into `raze.exe` as the only certificate its installer will trust.
+The committed value is the author's; yours replaces it in your working copy.
 
 Artifacts in `target\release`:
 

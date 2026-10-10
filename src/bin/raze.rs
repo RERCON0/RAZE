@@ -9,7 +9,9 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Parser};
 
-use raze_rs::engine::elevation::{build_arguments, is_elevated, needs_elevation, relaunch_elevated};
+use raze_rs::engine::elevation::{
+    build_arguments, is_elevated, needs_elevation, relaunch_elevated, run_elevated_and_wait,
+};
 use raze_rs::engine::path::NtPath;
 use raze_rs::engine::scan::ScanOptions;
 use raze_rs::job::{self, Options};
@@ -78,17 +80,21 @@ struct Cli {
     #[arg(long, hide = true)]
     elevated: bool,
 
-    /// Install the Explorer context-menu integration.
-    #[arg(long, exclusive = true)]
+    /// Install RAZE into Program Files with the Explorer context menu (asks for administrator rights).
+    #[arg(long)]
     install: bool,
 
-    /// Remove the Explorer context-menu integration.
-    #[arg(long, exclusive = true)]
+    /// Remove RAZE and its Explorer context menu (asks for administrator rights).
+    #[arg(long)]
     uninstall: bool,
 
     /// Register the modern Windows 11 menu package (needs PowerShell).
     #[arg(long, exclusive = true)]
     register_package: bool,
+
+    /// Internal: where the elevated copy writes the install/uninstall report.
+    #[arg(long, hide = true, value_name = "PATH")]
+    report_file: Option<PathBuf>,
 
     /// Print the machine-readable plan and exit.
     #[arg(long)]
@@ -115,10 +121,10 @@ fn main() {
 
 fn run(cli: Cli) -> i32 {
     if cli.install {
-        return shell_install(false);
+        return shell_install(&cli, false);
     }
     if cli.uninstall {
-        return shell_install(true);
+        return shell_install(&cli, true);
     }
     if cli.register_package {
         return match shell::install::register_sparse_package() {
@@ -251,50 +257,120 @@ fn dedupe(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     out
 }
 
-fn shell_install(uninstall: bool) -> i32 {
+/// Установка и снятие меню. Каталог установки — Program Files, туда пишут
+/// только администраторы, поэтому без прав процесс перезапускает себя через UAC
+/// (один запрос на всё, включая доверие сертификату) и печатает отчёт
+/// повышенной копии, которая пишет его в файл.
+fn shell_install(cli: &Cli, uninstall: bool) -> i32 {
+    if needs_elevation() && cli.report_file.is_none() {
+        return install_elevated(uninstall);
+    }
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
     let report = shell::install(&exe_dir, uninstall);
-    for step in &report.steps {
-        match step {
-            shell::Step::Done { what } => println!("[ok]   {what}"),
-            shell::Step::Skipped { what } => println!("[skip] {what}"),
-            shell::Step::Failed { what, error } => {
-                eprintln!("[fail] {what}: {error}")
+    let (lines, code) = install_summary(&report, uninstall);
+    match &cli.report_file {
+        Some(path) => {
+            let _ = std::fs::write(path, lines.join("\n"));
+        }
+        None => {
+            for line in lines {
+                println!("{line}");
             }
         }
     }
+    code
+}
+
+fn install_elevated(uninstall: bool) -> i32 {
+    let Ok(exe) = std::env::current_exe() else {
+        eprintln!("{}", tr!("Cannot find this program.", "Не удалось определить путь программы."));
+        return 1;
+    };
+    let report_file = std::env::temp_dir().join(format!("raze-install-{}.txt", std::process::id()));
+    let _ = std::fs::remove_file(&report_file);
+    let line = build_arguments(&[
+        (if uninstall { "--uninstall" } else { "--install" }).to_string(),
+        "--lang".to_string(),
+        i18n::language().code().to_string(),
+        "--report-file".to_string(),
+        report_file.to_string_lossy().into_owned(),
+    ]);
+    eprintln!(
+        "{}",
+        tr!(
+            "RAZE lives in Program Files, which only administrators can write: confirm the Windows prompt.",
+            "RAZE ставится в Program Files, куда пишут только администраторы: подтвердите запрос Windows."
+        )
+    );
+    let result = run_elevated_and_wait(&exe, &line, std::time::Duration::from_secs(600));
+    let text = std::fs::read_to_string(&report_file);
+    let _ = std::fs::remove_file(&report_file);
+    match result {
+        Ok(code) => {
+            match text {
+                Ok(text) => println!("{text}"),
+                Err(_) => eprintln!("{}", tr!("The elevated copy left no report.", "Повышенная копия не оставила отчёта.")),
+            }
+            code as i32
+        }
+        // 1223 — человек отказал в запросе UAC.
+        Err(error) if error.code() == 1223 => {
+            eprintln!(
+                "{}",
+                tr!(
+                    "Administrator rights were not granted. Nothing was changed.",
+                    "Права администратора не выданы. Ничего не изменено."
+                )
+            );
+            1
+        }
+        Err(error) => {
+            eprintln!("{}: {error}", tr!("Cannot restart", "Не удалось перезапустить"));
+            1
+        }
+    }
+}
+
+/// Строки отчёта об установке и код выхода.
+fn install_summary(report: &shell::InstallReport, uninstall: bool) -> (Vec<String>, i32) {
+    let mut lines: Vec<String> = report
+        .steps
+        .iter()
+        .map(|step| match step {
+            shell::Step::Done { what } => format!("[ok]   {what}"),
+            shell::Step::Skipped { what } => format!("[skip] {what}"),
+            shell::Step::Failed { what, error } => format!("[fail] {what}: {error}"),
+        })
+        .collect();
     if uninstall {
-        println!(
-            "{}",
-            tr_format!(
+        lines.push(
+            tr!(
                 "Done. The context menu is back to normal.",
                 "Готово. Контекстное меню снова обычное."
             )
+            .to_string(),
         );
-        return 0;
+        return (lines, 0);
     }
     if !report.ok() {
-        eprintln!(
-            "{}",
-            tr_format!(
+        lines.push(
+            tr!(
                 "Some steps failed; the classic menu verb is still registered if it succeeded.",
                 "Часть шагов не удалась; если verb зарегистрирован, он работает."
             )
+            .to_string(),
         );
-        return 1;
+        return (lines, 1);
     }
-    println!(
-        "{}",
-        tr_format!(
-            "Installed into {}. If the Windows 11 menu does not show RAZE yet, open a new Explorer window or sign out and back in.",
-            "Установлено в {}. Если RAZE ещё нет в меню Windows 11, откройте новое окно Проводника или перезайдите в сеанс.",
-            report.install_dir.display()
-        )
-    );
-    0
+    lines.push(tr_format!(
+        "Installed into {}. If the Windows 11 menu does not show RAZE yet, open a new Explorer window or sign out and back in.",
+        "Установлено в {}. Если RAZE ещё нет в меню Windows 11, откройте новое окно Проводника или перезайдите в сеанс.",
+        report.install_dir.display()
+    ));
+    (lines, 0)
 }
 
 fn relaunch_as_admin(cli: &Cli, planned: &[job::Target]) -> Option<i32> {
@@ -523,6 +599,30 @@ mod tests {
         assert_eq!(paths.len(), 1);
         assert!(paths[0].as_bytes()[1] == b':', "{}", paths[0]);
         assert!(paths[0].to_lowercase().ends_with("relative-target"));
+    }
+
+    #[test]
+    fn install_and_uninstall_accept_the_internal_report_file() {
+        // Повышенная копия запускается как `--install --lang xx --report-file PATH`:
+        // раньше `--install` был exclusive и такой вызов не разбирался.
+        let cli = Cli::parse_from(["raze", "--install", "--lang", "ru", "--report-file", "C:\\tmp\\r.txt"]);
+        assert!(cli.install);
+        assert_eq!(cli.report_file, Some(PathBuf::from("C:\\tmp\\r.txt")));
+        let cli = Cli::parse_from(["raze", "--uninstall", "--report-file", "r.txt"]);
+        assert!(cli.uninstall);
+    }
+
+    #[test]
+    fn a_failed_step_makes_the_install_summary_fail() {
+        let mut report = shell::InstallReport::default();
+        let (_, code) = install_summary(&report, false);
+        assert_eq!(code, 0);
+        report.steps.push(shell::Step::Failed { what: "copy x".into(), error: "boom".into() });
+        let (lines, code) = install_summary(&report, false);
+        assert_eq!(code, 1);
+        assert!(lines.iter().any(|l| l == "[fail] copy x: boom"));
+        // Снятие всегда заканчивается «Готово».
+        assert_eq!(install_summary(&report, true).1, 0);
     }
 
     #[test]

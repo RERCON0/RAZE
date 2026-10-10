@@ -35,6 +35,55 @@ pub fn relaunch_elevated(exe: &Path, arguments: &str) -> Result<bool, NtError> {
     Ok(code > 32)
 }
 
+/// Запускает `exe` с правами администратора, ждёт его завершения и отдаёт код
+/// выхода. Окно скрыто: что произошло, процесс сообщает сам (файлом отчёта).
+/// `Err` — запуск не удался; отказ в UAC даёт код 1223.
+pub fn run_elevated_and_wait(
+    exe: &Path,
+    arguments: &str,
+    timeout: std::time::Duration,
+) -> Result<u32, NtError> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+    use windows::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+    struct Process(HANDLE);
+    impl Drop for Process {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    const WAIT_TIMEOUT: u32 = 258;
+    let file = Wide::from_path(exe);
+    let verb = Wide::new("runas");
+    let params = Wide::new(arguments);
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: verb.pc(),
+        lpFile: file.pc(),
+        lpParameters: params.pc(),
+        nShow: SW_HIDE.0,
+        ..Default::default()
+    };
+    unsafe { ShellExecuteExW(&mut info) }.map_err(|_| NtError::last())?;
+    if info.hProcess.is_invalid() {
+        return Err(NtError::last());
+    }
+    let process = Process(info.hProcess);
+    let millis = timeout.as_millis().min(u128::from(u32::MAX - 1)) as u32;
+    if unsafe { WaitForSingleObject(process.0, millis) } != WAIT_OBJECT_0 {
+        return Err(NtError(WAIT_TIMEOUT));
+    }
+    let mut code = 0u32;
+    unsafe { GetExitCodeProcess(process.0, &mut code) }.map_err(|_| NtError::last())?;
+    Ok(code)
+}
+
 pub fn needs_elevation() -> bool {
     !is_elevated()
 }

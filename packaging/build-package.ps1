@@ -2,17 +2,18 @@
   Builds the signed sparse MSIX that gives raze_shell.dll a package identity, which is
   what Windows 11 needs to show "RAZE" in the new right-click menu.
 
-  Needs the Windows SDK (makeappx.exe, signtool.exe) and a release build:
-      cargo build --release --workspace
+  Needs the Windows SDK (makeappx.exe, signtool.exe). Run it BEFORE building, because it may update the
+  certificate thumbprint that raze.exe pins:
       packaging\build-package.ps1
+      cargo build --release --workspace
 
   Output: target\<Configuration>\RAZE.msix and RAZE.cer. Both are copied next to raze.exe by
   `raze --install` and registered by `raze --register-package`.
 
   The package is signed with a self-signed certificate (CN=RERCON RAZE) whose private key stays,
-  non-exportable, in the current user's store. RAZE pins that certificate's thumbprint in
-  src\shell\install.rs; if the certificate is ever recreated the pin has to be updated and the new
-  certificate trusted again (one UAC prompt).
+  non-exportable, in the current user's store. RAZE pins that certificate's thumbprint
+  (packaging\cert-thumbprint.txt); if the certificate is ever recreated the pin is updated, raze.exe
+  rebuilt and the new certificate trusted again (one UAC prompt).
 #>
 param([string]$Configuration = 'release')
 $ErrorActionPreference = 'Stop'
@@ -43,9 +44,13 @@ if (-not $cert) {
     -NotAfter (Get-Date).AddYears(5) -TextExtension @('2.5.29.37={text}1.3.6.1.5.5.7.3.3', '2.5.29.19={text}')
   Write-Host "created certificate $($cert.Thumbprint)"
 }
-$pinned = (Select-String -Path (Join-Path $root 'src\shell\install.rs') -Pattern 'PINNED_CERT_THUMBPRINT: &str = "([0-9A-F]{40})"' | Select-Object -First 1).Matches[0].Groups[1].Value
+# raze.exe trusts only this thumbprint (compiled in from cert-thumbprint.txt). A certificate of your own
+# changes it: the file is rewritten here, and raze.exe has to be rebuilt afterwards.
+$pinFile = Join-Path $PSScriptRoot 'cert-thumbprint.txt'
+$pinned = if (Test-Path $pinFile) { (Get-Content $pinFile -Raw).Trim() } else { '' }
 if ($pinned -ne $cert.Thumbprint) {
-  throw "Certificate $($cert.Thumbprint) differs from PINNED_CERT_THUMBPRINT ($pinned) in src\shell\install.rs. Update the constant and rebuild raze.exe."
+  [System.IO.File]::WriteAllText($pinFile, $cert.Thumbprint)
+  Write-Warning "Pinned certificate thumbprint changed ($pinned -> $($cert.Thumbprint)). Rebuild raze.exe (cargo build --release --workspace), otherwise its installer will refuse this certificate."
 }
 
 # --- stage, pack, sign --------------------------------------------------------------------------
