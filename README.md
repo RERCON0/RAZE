@@ -22,10 +22,11 @@
 </p>
 
 > [!TIP]
-> **One click in Explorer, one confirmation, done.** Install the context-menu
-> integration (`raze --install`), right-click any stubborn folder or file,
-> and choose **RAZE delete**. Deletion runs without opening the main window;
-> the UAC prompt appears only when the object really needs admin rights.
+> **One click in Explorer, done.** Install the context-menu integration
+> (`raze --install`), right-click any stubborn folder or file, and choose
+> **Delete with RAZE**. The click is the confirmation: nothing else is asked and
+> the main window does not open. The UAC prompt appears only when the object
+> really needs admin rights.
 
 > [!NOTE]
 > The `raze` CLI and `raze-app` GUI share the same engine
