@@ -288,8 +288,8 @@ fn shell_install(uninstall: bool) -> i32 {
     println!(
         "{}",
         tr_format!(
-            "Installed into {}. Restart Explorer or sign out to see it in the modern menu.",
-            "Установлено в {}. Перезапустите Проводник или выйдите из сеанса, чтобы пункт появился в новом меню.",
+            "Installed into {}. If the Windows 11 menu does not show RAZE yet, open a new Explorer window or sign out and back in.",
+            "Установлено в {}. Если RAZE ещё нет в меню Windows 11, откройте новое окно Проводника или перезайдите в сеанс.",
             report.install_dir.display()
         )
     );

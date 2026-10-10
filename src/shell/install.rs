@@ -5,28 +5,42 @@
 //! Windows, но в Windows 11 живёт внутри «Показать дополнительные параметры».
 //!
 //! **Современное меню** (`IExplorerCommand` + разреженный MSIX-пакет) — это
-//! то самое меню со скриншота. Оно регистрируется на пользователя, без
-//! подписи и без установки в `Program Files`.
+//! то самое меню первого уровня. Windows показывает в нём команды только тех
+//! программ, у которых есть идентификатор пакета, а пакет обязан быть
+//! подписан доверенным сертификатом. Поэтому пакет `RAZE.msix` собирается
+//! заранее (`packaging\build-package.ps1`) и подписывается самоподписанным
+//! сертификатом `CN=RERCON RAZE`; установщик один раз добавляет **публичную**
+//! часть сертификата в `LocalMachine\TrustedPeople` (запрос UAC) и
+//! регистрирует пакет.
 //!
-//! Если со вторым способом не выйдет (например, на редакции без
-//! разреженных пакетов), первый всё равно работает — установщик сообщает об
-//! этом и не считает установку неудачной.
+//! Если со вторым способом не выйдет (нет файлов пакета, отказ в UAC, редакция
+//! без разреженных пакетов), первый всё равно работает — установщик сообщает
+//! об этом и не считает установку неудачной.
 
 use std::path::{Path, PathBuf};
-
+use std::process::Command;
 
 use serde::Serialize;
 use winreg::enums::HKEY_CURRENT_USER;
 use winreg::RegKey;
 
-/// CLSID нашей COM-расширки. Тот же GUID зашит в `shell-ext` — он
-/// загружается в процесс Проводника и не должен зависеть от основного крейта.
-/// Менять только вместе с ним.
+/// CLSID нашей COM-расширки. Тот же GUID зашит в `shell-ext` и в
+/// `packaging/AppxManifest.xml` (тест ниже сверяет манифест с этой
+/// константой). Менять только вместе.
 pub const COMMAND_CLSID: &str = "{8E5B2C41-6D3A-4F17-9C0B-51D2A7E4F108}";
 
-/// Имя пакета для `Add-AppxPackage`.
+/// Имя пакета для `Get-AppxPackage` / `Remove-AppxPackage`.
 const PACKAGE_NAME: &str = "RAZE.ShellExtension";
-const PUBLISHER: &str = "CN=RERCON RAZE";
+const PACKAGE_FILE: &str = "RAZE.msix";
+const CERT_FILE: &str = "RAZE.cer";
+
+/// Отпечаток (SHA-1) сертификата, которым подписан `RAZE.msix`. Доверие в
+/// `TrustedPeople` выдаётся только сертификату с этим отпечатком: так
+/// случайно подменённый или повреждённый `RAZE.cer` не попадёт в хранилище.
+/// Это защита от ошибки, а не от злоумышленника с правами пользователя: тот
+/// мог бы заменить и сам `raze.exe`. При пересоздании сертификата константу
+/// надо обновить (`packaging\build-package.ps1` это проверяет).
+pub const PINNED_CERT_THUMBPRINT: &str = "1CDEBA01251B61E3E40F7465A8253BA276ED204F";
 
 /// Куда всё ставится по умолчанию.
 pub fn default_install_dir() -> PathBuf {
@@ -91,14 +105,17 @@ pub fn install(source_dir: &Path, uninstall: bool) -> InstallReport {
     }
 
     let dir = report.install_dir.clone();
+    // Зарегистрированный пакет держит `raze_shell.dll` загруженной, и файл
+    // нельзя заменить. Снимаем регистрацию, ниже она ставится заново.
+    let _ = unregister_package();
     copy_binaries(source_dir, &dir, &mut report);
-    write_appx_assets(&dir, &mut report);
-    register_com(&dir, &mut report);
+    forget_legacy_registration(&dir);
     write_classic(&dir, &mut report);
+    register_modern(&dir, &mut report);
     report
 }
 
-/// Раскладывает исполняемые файлы и DLL в каталог установки.
+/// Раскладывает исполняемые файлы, DLL и файлы пакета в каталог установки.
 fn copy_binaries(source: &Path, target: &Path, report: &mut InstallReport) {
     if let Err(error) = std::fs::create_dir_all(target) {
         report.failed("create install directory", error.to_string());
@@ -106,7 +123,7 @@ fn copy_binaries(source: &Path, target: &Path, report: &mut InstallReport) {
     }
     // DLL крейта `raze-shell` собирается как `raze_shell.dll`:
     // cargo не разрешает дефисы в именах lib-таргетов.
-    let wanted = ["raze.exe", "raze-app.exe", "raze_shell.dll"];
+    let wanted = ["raze.exe", "raze-app.exe", "raze_shell.dll", PACKAGE_FILE, CERT_FILE];
     let mut copied = 0usize;
     for name in wanted {
         let from = source.join(name);
@@ -126,61 +143,28 @@ fn copy_binaries(source: &Path, target: &Path, report: &mut InstallReport) {
     }
 }
 
-/// Пишет манифест разреженного пакета и картинку, которые нужны
-/// современному меню.
-fn write_appx_assets(dir: &Path, report: &mut InstallReport) {
-    let manifest = dir.join("AppxManifest.xml");
-    let xml = manifest_xml();
-    if let Err(error) = std::fs::write(&manifest, xml) {
-        report.failed("write AppxManifest.xml", error.to_string());
+/// Прежние версии установщика писали сюда собственный манифест и
+/// регистрировали COM-класс в `HKCU`. Пакет теперь сам объявляет класс, а
+/// лишняя регистрация только путает, поэтому остатки убираются молча.
+fn forget_legacy_registration(dir: &Path) {
+    let _ = std::fs::remove_file(dir.join("AppxManifest.xml"));
+    let _ = std::fs::remove_file(dir.join("logo.png"));
+    let _ = RegKey::predef(HKEY_CURRENT_USER)
+        .delete_subkey_all(format!(r"Software\Classes\CLSID\{COMMAND_CLSID}"));
+}
+
+/// Современное меню Windows 11: доверие сертификату и регистрация пакета.
+fn register_modern(dir: &Path, report: &mut InstallReport) {
+    if !dir.join(PACKAGE_FILE).exists() || !dir.join(CERT_FILE).exists() {
+        report.skipped(format!(
+            "modern Windows 11 menu: {PACKAGE_FILE} / {CERT_FILE} were not found next to raze.exe \
+             (build them with packaging\\build-package.ps1, then run raze --install again)"
+        ));
         return;
     }
-    report.done("wrote AppxManifest.xml");
-
-    // Логотип пакета: MSIX требует файл, даже если он не показывается.
-    let logo = dir.join("logo.png");
-    if let Err(error) = write_logo(&logo) {
-        report.failed("write logo.png", error.to_string());
-    } else {
-        report.done("wrote logo.png");
-    }
-}
-
-/// Уменьшает app-иконку до размера, который ожидает манифест пакета.
-fn write_logo(target: &Path) -> Result<(), String> {
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("icons")
-        .join("icon-app.png");
-    let bytes = std::fs::read(&source).map_err(|e| e.to_string())?;
-    let image = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
-    let resized = image.resize_exact(44, 44, image::imageops::FilterType::Triangle);
-    resized.save_with_format(target, image::ImageFormat::Png).map_err(|e| e.to_string())
-}
-
-/// Регистрирует COM-класс в `HKCU\Software\Classes\CLSID`. Проводник сам
-/// поднимет его через `DllGetClassObject`.
-fn register_com(dir: &Path, report: &mut InstallReport) {
-    let key = format!(r"Software\Classes\CLSID\{COMMAND_CLSID}");
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let result = (|| -> Result<(), String> {
-        let (clsid, _) = hkcu.create_subkey(&key).map_err(|e| e.to_string())?;
-        clsid.set_value("", &"RAZE delete command").map_err(|e| e.to_string())?;
-
-        let (server, _) = clsid.create_subkey("InprocServer32").map_err(|e| e.to_string())?;
-        server
-            .set_value("", &dir.join("raze_shell.dll").to_string_lossy().to_string())
-            .map_err(|e| e.to_string())?;
-        // Объект не хранит состояния (всё приходит параметрами,
-        // единственный глобал — атомарный счётчик), поэтому
-        // модель потоков «оба» безопасна.
-        server
-            .set_value("ThreadingModel", &"Both")
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    })();
-    match result {
-        Ok(()) => report.done("registered COM class in HKCU"),
-        Err(error) => report.failed("register COM class", error),
+    match register_sparse_package() {
+        Ok(()) => report.done("registered the Windows 11 context menu package"),
+        Err(error) => report.skipped(format!("modern Windows 11 menu was not registered: {error}")),
     }
 }
 
@@ -220,16 +204,18 @@ fn write_classic(dir: &Path, report: &mut InstallReport) {
 
     if written > 0 {
         report.done(format!("registered {written} classic context-menu verb(s)"));
-        report.skipped(
-            "modern Windows 11 menu needs the sparse package; restart Explorer or log off to see it",
-        );
     }
 }
 
 fn remove_classic(report: &mut InstallReport) {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    remove_verbs(&RegKey::predef(HKEY_CURRENT_USER), &VERB_KEYS, report);
+}
+
+/// Список ключей передаётся параметром, чтобы тест мог работать во
+/// временной ветке реестра и не стирал настоящие пункты меню.
+fn remove_verbs(hkcu: &RegKey, verbs: &[&str], report: &mut InstallReport) {
     let mut removed = 0usize;
-    for verb in VERB_KEYS {
+    for verb in verbs {
         if hkcu.delete_subkey_all(verb).is_ok() {
             removed += 1;
         }
@@ -242,12 +228,34 @@ fn remove_classic(report: &mut InstallReport) {
 }
 
 fn remove_modern(report: &mut InstallReport) {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let key = format!(r"Software\Classes\CLSID\{COMMAND_CLSID}");
-    match hkcu.delete_subkey_all(&key) {
-        Ok(()) => report.done("removed COM class registration"),
-        Err(error) => report.skipped(format!("COM class was not registered ({error})")),
+    match package_registered() {
+        Ok(true) => match unregister_package() {
+            Ok(()) => report.done("unregistered the Windows 11 context menu package"),
+            Err(error) => report.failed("unregister the Windows 11 context menu package", error),
+        },
+        Ok(false) => report.skipped("the Windows 11 context menu package was not registered"),
+        Err(error) => report.skipped(format!("could not query the package ({error})")),
     }
+
+    // Доверие выдавали мы — мы его и снимаем (одно подтверждение UAC).
+    if certificate_trusted().unwrap_or(false) {
+        let script = format!(
+            "{STORE_PREAMBLE} $s.Open('ReadWrite'); \
+             foreach ($c in @($s.Certificates.Find('FindByThumbprint', '{PINNED_CERT_THUMBPRINT}', $false))) {{ $s.Remove($c) }}; \
+             $s.Close()"
+        );
+        let result = run_elevated_powershell(&script);
+        if certificate_trusted().unwrap_or(false) {
+            let reason = result.err().unwrap_or_else(|| "the certificate is still trusted".into());
+            report.skipped(format!("the RAZE certificate was not removed from LocalMachine\\TrustedPeople ({reason})"));
+        } else {
+            report.done("removed the RAZE certificate from LocalMachine\\TrustedPeople");
+        }
+    }
+
+    // Остаток старых установок.
+    let _ = RegKey::predef(HKEY_CURRENT_USER)
+        .delete_subkey_all(format!(r"Software\Classes\CLSID\{COMMAND_CLSID}"));
 
     let dir = default_install_dir();
     // Каталог удаляем только если он действительно наш и там нечего терять.
@@ -265,64 +273,126 @@ fn label() -> &'static str {
     crate::tr!("Delete with RAZE", "Удалить с помощью RAZE")
 }
 
-fn manifest_xml() -> String {
-    let label = "Delete with RAZE";
-    format!(
-        r#"<?xml version="1.0" encoding="utf-8"?>
-<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
-         xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
-         xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
-         IgnorableNamespaces="uap rescap">
-  <Identity Name="{PACKAGE_NAME}" Publisher="{PUBLISHER}" Version="{version}" />
-  <Properties>
-    <DisplayName>RAZE</DisplayName>
-    <PublisherDisplayName>RAZE</PublisherDisplayName>
-    <Logo>logo.png</Logo>
-  </Properties>
-  <Dependencies>
-    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.22621.0" MaxVersionTested="10.0.26100.0" />
-  </Dependencies>
-  <Resources>
-    <Resource Language="en" />
-    <Resource Language="ru" />
-  </Resources>
-  <Applications />
-  <Extensions>
-    <uap:Extension Category="windows.explorerCommand" dllPath="raze_shell.dll" Clsid="{clsid}">
-      <uap:ExtensionData>
-        <uap:Data Name="Label" Value="{label}" />
-        <uap:Data Name="Icon" Value="logo.png" />
-      </uap:ExtensionData>
-    </uap:Extension>
-  </Extensions>
-</Package>
-"#,
-        version = crate::VERSION,
-        clsid = COMMAND_CLSID,
-        label = label,
-    )
+/// Регистрация разреженного пакета: сначала доверие сертификату, затем
+/// `Add-AppxPackage` с каталогом установки как внешним расположением.
+/// Вынесено отдельно, чтобы вызывать и без полной установки.
+pub fn register_sparse_package() -> Result<(), String> {
+    let dir = default_install_dir();
+    let package = dir.join(PACKAGE_FILE);
+    let cert = dir.join(CERT_FILE);
+    for file in [&package, &cert] {
+        if !file.exists() {
+            return Err(format!(
+                "{} is missing; build it with packaging\\build-package.ps1 and run raze --install",
+                file.display()
+            ));
+        }
+    }
+    ensure_certificate_trusted(&cert)?;
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         Get-AppxPackage -Name '{PACKAGE_NAME}' | Remove-AppxPackage; \
+         Add-AppxPackage -Path {} -ExternalLocation {}",
+        ps_quote(&package),
+        ps_quote(&dir)
+    );
+    run_powershell(&script).map(|_| ())
 }
 
-/// Регистрация разреженного пакета средствами PowerShell. Вынесено
-/// отдельно, чтобы установщик можно было вызвать и без нас.
-pub fn register_sparse_package() -> Result<(), String> {
-    let manifest = default_install_dir().join("AppxManifest.xml");
-    if !manifest.exists() {
-        return Err(format!("{} is missing", manifest.display()));
+/// Открывает хранилище `LocalMachine\TrustedPeople` (общая строка скриптов).
+const STORE_PREAMBLE: &str = "$s = New-Object System.Security.Cryptography.X509Certificates.X509Store 'TrustedPeople', 'LocalMachine';";
+
+fn certificate_trusted() -> Result<bool, String> {
+    let script = format!(
+        "Test-Path -LiteralPath 'Cert:\\LocalMachine\\TrustedPeople\\{PINNED_CERT_THUMBPRINT}'"
+    );
+    Ok(run_powershell(&script)?.eq_ignore_ascii_case("True"))
+}
+
+fn package_registered() -> Result<bool, String> {
+    let script = format!("@(Get-AppxPackage -Name '{PACKAGE_NAME}').Count");
+    Ok(run_powershell(&script)?.trim() != "0")
+}
+
+fn unregister_package() -> Result<(), String> {
+    let script = format!("Get-AppxPackage -Name '{PACKAGE_NAME}' | Remove-AppxPackage");
+    run_powershell(&script).map(|_| ())
+}
+
+/// Добавляет сертификат в `LocalMachine\TrustedPeople`, если его там нет.
+/// Для записи в машинное хранилище нужны права администратора — Windows
+/// спросит подтверждение (UAC). Сертификат читается из файла один раз, а
+/// отпечаток проверяется у того самого объекта, который затем добавляется,
+/// так что подменить файл между проверкой и добавлением нельзя.
+fn ensure_certificate_trusted(cert: &Path) -> Result<(), String> {
+    if certificate_trusted()? {
+        return Ok(());
     }
     let script = format!(
-        "Add-AppxPackage -DisableDevelopmentMode -Register \"{}\"",
-        manifest.display()
+        "$ErrorActionPreference = 'Stop'; \
+         $c = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 {}; \
+         if ($c.Thumbprint -ne '{PINNED_CERT_THUMBPRINT}') {{ exit 3 }}; \
+         {STORE_PREAMBLE} $s.Open('ReadWrite'); $s.Add($c); $s.Close()",
+        ps_quote(cert)
     );
-    let output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+    let launched = run_elevated_powershell(&script);
+    if certificate_trusted()? {
+        Ok(())
+    } else {
+        Err(match launched {
+            Err(error) => format!("the certificate was not trusted (was the UAC prompt declined?): {error}"),
+            Ok(()) => format!(
+                "the certificate was not trusted: {} does not match the pinned thumbprint",
+                cert.display()
+            ),
+        })
+    }
+}
+
+fn run_powershell(script: &str) -> Result<String, String> {
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
         .map_err(|e| e.to_string())?;
     if output.status.success() {
-        Ok(())
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
         Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
     }
+}
+
+/// Запускает скрипт в отдельном PowerShell с повышением прав. Скрипт уходит
+/// в `-EncodedCommand`, а не во временный файл: файл в каталоге пользователя
+/// мог бы быть подменён до запуска с правами администратора.
+fn run_elevated_powershell(script: &str) -> Result<(), String> {
+    let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let launcher = format!(
+        "Start-Process -FilePath powershell.exe -Verb RunAs -Wait -WindowStyle Hidden \
+         -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','{}'",
+        base64(&utf16)
+    );
+    run_powershell(&launcher).map(|_| ())
+}
+
+/// Строка в одинарных кавычках PowerShell (внутри них ничего не
+/// раскрывается, кавычка удваивается).
+fn ps_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "''"))
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+    }
+    out
 }
 
 #[cfg(test)]
@@ -341,12 +411,35 @@ mod tests {
     }
 
     #[test]
-    fn manifest_contains_the_command_declaration() {
-        let xml = manifest_xml();
-        assert!(xml.contains(COMMAND_CLSID));
-        assert!(xml.contains("windows.explorerCommand"));
+    fn package_template_agrees_with_the_code() {
+        let xml = include_str!("../../packaging/AppxManifest.xml");
+        assert!(xml.contains(&COMMAND_CLSID[1..37]), "CLSID in the manifest");
+        assert!(xml.contains(&format!("Name=\"{PACKAGE_NAME}\"")));
+        assert!(xml.contains("Publisher=\"CN=RERCON RAZE\""));
         assert!(xml.contains("raze_shell.dll"));
-        assert!(xml.contains(crate::VERSION));
+        assert!(xml.contains("windows.fileExplorerContextMenus"));
+        assert!(xml.contains("Version=\"@VERSION@\""), "version is filled in by build-package.ps1");
+    }
+
+    #[test]
+    fn pinned_thumbprint_is_a_sha1_in_upper_hex() {
+        assert_eq!(PINNED_CERT_THUMBPRINT.len(), 40);
+        assert!(PINNED_CERT_THUMBPRINT
+            .chars()
+            .all(|c| c.is_ascii_digit() || ('A'..='F').contains(&c)));
+    }
+
+    #[test]
+    fn base64_matches_the_standard_vectors() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"M"), "TQ==");
+        assert_eq!(base64(b"Ma"), "TWE=");
+        assert_eq!(base64(b"Man"), "TWFu");
+    }
+
+    #[test]
+    fn powershell_literals_double_their_quotes() {
+        assert_eq!(ps_quote(Path::new("C:\\a b\\it's")), "'C:\\a b\\it''s'");
     }
 
     #[test]
@@ -356,10 +449,22 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_without_installation_is_not_an_error() {
+    fn removing_verbs_that_are_not_there_is_not_an_error() {
         // Повторный запуск сноса не должен падать — он просто ничего не найдёт.
+        // Настоящие ключи не трогаем: тесты идут на машине, где RAZE может
+        // быть установлен, и `remove_classic` стёр бы его пункты меню.
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let verb = format!(r"Software\RAZE.Tests\{}\shell\RAZE.Delete", std::process::id());
+
         let mut report = InstallReport::default();
-        remove_classic(&mut report);
+        remove_verbs(&hkcu, &[verb.as_str()], &mut report);
         assert!(report.steps.iter().all(|s| !matches!(s, Step::Failed { .. })));
+        assert!(matches!(report.steps[0], Step::Skipped { .. }));
+
+        hkcu.create_subkey(&verb).unwrap();
+        let mut report = InstallReport::default();
+        remove_verbs(&hkcu, &[verb.as_str()], &mut report);
+        assert!(matches!(report.steps[0], Step::Done { .. }));
+        let _ = hkcu.delete_subkey_all(r"Software\RAZE.Tests");
     }
 }

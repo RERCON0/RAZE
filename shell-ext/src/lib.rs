@@ -27,15 +27,19 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use windows::core::{implement, BOOL, GUID, HRESULT, Interface, PWSTR, Ref};
+use windows::core::{implement, BOOL, GUID, HRESULT, Interface, PCWSTR, PWSTR, Ref};
 use windows::Win32::Foundation::{
     CloseHandle, CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_NOTIMPL, E_NOINTERFACE,
-    E_OUTOFMEMORY,
+    E_OUTOFMEMORY, HMODULE,
 };
+use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::System::Com::{
     CoTaskMemAlloc, CoTaskMemFree, IBindCtx, IClassFactory, IClassFactory_Impl,
 };
-use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
+use windows::Win32::System::LibraryLoader::{
+    GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+};
 use windows::Win32::System::Ole::{IObjectWithSite, IObjectWithSite_Impl};
 use windows::Win32::System::Threading::{
     CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW,
@@ -64,9 +68,18 @@ const COMMAND_GUID: GUID = GUID::from_values(
     [0x2C, 0x77, 0x9E, 0x4B, 0x6D, 0x1A, 0xC0, 0x31],
 );
 
-/// Подпись в меню. Язык определяется системой, поэтому строка одна
-/// на все локали: её читают не только мы.
-const TITLE: &str = "RAZE";
+/// Подпись в меню: что именно делает пункт. Язык берётся из языка
+/// интерфейса Windows (`LANG_RUSSIAN` — основной язык 0x19), как и у
+/// остальных пунктов Проводника.
+fn title() -> &'static str {
+    const PRIMARY_LANGUAGE_MASK: u16 = 0x3ff;
+    const LANG_RUSSIAN: u16 = 0x19;
+    if unsafe { GetUserDefaultUILanguage() } & PRIMARY_LANGUAGE_MASK == LANG_RUSSIAN {
+        "Удалить с помощью RAZE"
+    } else {
+        "Delete with RAZE"
+    }
+}
 
 /// Всплывающая подсказка — почему вообще «RAZE», а не «Удалить».
 const TOOLTIP: &str = "Remove with RAZE";
@@ -98,7 +111,7 @@ impl Drop for RazeCommand {
 
 impl IExplorerCommand_Impl for RazeCommand_Impl {
     fn GetTitle(&self, _items: Ref<IShellItemArray>) -> windows::core::Result<PWSTR> {
-        task_string(TITLE)
+        task_string(title())
     }
 
     fn GetIcon(&self, _items: Ref<IShellItemArray>) -> windows::core::Result<PWSTR> {
@@ -334,8 +347,21 @@ fn icon_reference() -> Option<String> {
 /// Путь к этой DLL — оттуда берётся каталог программы.
 fn module_path() -> Option<PathBuf> {
     const MAX_PATH_CHARS: usize = 32768;
+    // `GetModuleFileNameW(None, ..)` назвал бы процесс-хозяин (explorer.exe
+    // или dllhost.exe), а не эту DLL, и `raze.exe` искался бы не там. Поэтому
+    // модуль находится по адресу собственной функции.
+    let mut module = HMODULE::default();
+    let anchor = module_path as usize as *const u16;
+    unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            PCWSTR(anchor),
+            &mut module,
+        )
+    }
+    .ok()?;
     let mut buffer = vec![0u16; MAX_PATH_CHARS];
-    let length = unsafe { GetModuleFileNameW(None, &mut buffer) };
+    let length = unsafe { GetModuleFileNameW(Some(module), &mut buffer) };
     if length == 0 || length as usize >= MAX_PATH_CHARS {
         return None;
     }

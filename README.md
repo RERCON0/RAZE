@@ -94,24 +94,30 @@ To add **RAZE delete** to Explorer's right-click menu:
 raze --install
 ```
 
-This writes the classic verbs to `HKCU` (no admin rights needed) and copies
-the binaries to `%LOCALAPPDATA%\Programs\RAZE`. To remove it:
+This writes the classic verbs to `HKCU` (no admin rights needed), copies the
+binaries to `%LOCALAPPDATA%\Programs\RAZE` and, when `RAZE.msix` and `RAZE.cer`
+are next to `raze.exe` (see [Development](#development)), registers the
+**modern Windows 11 menu** — the one that opens on a plain right-click, where
+the entry reads **Delete with RAZE** (**Удалить с помощью RAZE** on a Russian
+Windows). The classic verb lives under *Show more options*.
+
+Windows only accepts menu extensions from signed packages, so the first
+registration asks for administrator confirmation (UAC) **once**: it adds RAZE's
+public, self-signed certificate (`CN=RERCON RAZE`) to
+`LocalMachine\TrustedPeople`, and only if its thumbprint matches the one pinned
+in `src\shell\install.rs`. Nothing else is changed, and no private key is
+involved. To repeat just that step: `raze --register-package`.
+
+To remove everything — the package, the classic verbs and that certificate (one
+more UAC prompt):
 
 ```powershell
 raze --uninstall
 ```
 
-The **modern Windows 11 menu** additionally needs a sparse package
-registration (PowerShell, one-time):
-
-```powershell
-raze --register-package
-```
-
-The package points at `raze_shell.dll` next to `raze.exe`; both must stay
-in the same folder. The extension never deletes anything itself — it just
-launches `raze.exe` with the selected paths, so a crash in Explorer can
-never corrupt a deletion in progress.
+The extension never deletes anything itself — it just launches `raze.exe` with
+the selected paths, so a crash in Explorer can never corrupt a deletion in
+progress. `raze_shell.dll` and `raze.exe` must stay in the same folder.
 
 ## Quick start
 
@@ -181,9 +187,17 @@ Windows x64, Rust 1.88+, Visual Studio Build Tools (MSVC + Windows SDK
 resources:
 
 ```powershell
-cargo build --release
-cargo test
+cargo build --release --workspace
+packaging\build-package.ps1
+cargo test --lib --workspace
 ```
+
+`build-package.ps1` packs and signs the sparse package that gives
+`raze_shell.dll` an identity (needs `makeappx.exe` and `signtool.exe` from the
+Windows SDK). The package is signed with a self-signed certificate whose
+private key stays, non-exportable, in your user certificate store; if you ever
+recreate it, update `PINNED_CERT_THUMBPRINT` in `src\shell\install.rs` (the
+script checks this).
 
 Artifacts in `target\release`:
 
@@ -192,6 +206,7 @@ Artifacts in `target\release`:
 | `raze.exe` | CLI |
 | `raze-app.exe` | GUI |
 | `raze_shell.dll` | COM shell extension for the modern Windows 11 menu |
+| `RAZE.msix`, `RAZE.cer` | Signed sparse package and its public certificate (from `build-package.ps1`) |
 
 The shell extension is a `cdylib` loaded into `explorer.exe`: it has no
 `unwrap`/`expect` in shared paths, cannot panic, and `Invoke` only spawns
