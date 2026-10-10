@@ -15,7 +15,7 @@ use raze_rs::engine::scan::ScanOptions;
 use raze_rs::job::{self, Options};
 use raze_rs::report::{Report, human_bytes};
 use raze_rs::shell;
-use raze_rs::{BANNER, TELEGRAM_URL, VERSION, i18n, tr, tr_format};
+use raze_rs::{TELEGRAM_URL, VERSION, banner, i18n, tr, tr_format};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -336,7 +336,7 @@ fn relaunch_as_admin(paths: &[PathBuf], verbose: bool) -> Option<i32> {
 }
 
 fn print_plan(targets: &[job::Target], summary: &job::Summary, verbose: u8) {
-    println!("{BANNER}");
+    println!("\n{}", banner());
     for target in &summary.targets {
         let mode = match target.mode {
             raze_rs::engine::recycle::Disposition::RecycleBin => tr!("Recycle Bin", "Корзина"),
@@ -449,7 +449,7 @@ fn confirm(targets: &[job::Target]) -> bool {
 }
 
 fn print_usage() {
-    println!("{BANNER}");
+    println!("\n{}", banner());
     println!("{}", tr_format!("Usage: raze [OPTIONS] <PATH>...", "Использование: raze [ПАРАМЕТРЫ] <ПУТЬ>..."));
     println!("  {}", tr!("Example: raze C:\\Users\\me\\Desktop\\Seller", "Пример: raze C:\\Users\\me\\Desktop\\Seller"));
     println!("  {}", tr!("Example: raze -n C:\\tmp", "Пример: raze -n C:\\tmp"));

@@ -2,8 +2,32 @@
 use eframe::egui::{self, Color32, FontFamily, FontId, RichText, Stroke};
 
 const MONO: &[u8] = include_bytes!("../../../fonts/CascadiaMono-Light.ttf");
-pub const CONTENT_WIDTH: f32 = 720.0;
+/// Same cap as SNATCH: a wider window keeps the form centred, not stretched.
+pub const CONTENT_WIDTH: f32 = 608.0;
 pub const CONTROL_HEIGHT: f32 = 40.0;
+/// Wider than the 40px window buttons: "день"/"ночь" need more room.
+pub const THEME_BTN_WIDTH: f32 = 56.0;
+
+/// Window size in egui points, as in SNATCH.
+pub const WINDOW_SIZE: [f32; 2] = [460.0, 720.0];
+pub const WINDOW_MIN_SIZE: [f32; 2] = [460.0, 600.0];
+
+/// One design pixel is UI_SCALE physical pixels on any display, whatever the
+/// OS scaling reports: fractional scales (125/150%) otherwise rasterise 13pt
+/// text blurry and make RAZE measure differently from SNATCH. Viewport
+/// commands take egui points; winit applies the effective scale itself.
+const UI_SCALE: f32 = 1.18;
+
+pub fn pin_pixel_scale(ctx: &egui::Context, resize_viewport: bool) {
+    if ctx.pixels_per_point() == UI_SCALE && !resize_viewport {
+        return;
+    }
+    ctx.set_pixels_per_point(UI_SCALE);
+    if resize_viewport {
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(WINDOW_SIZE[0], WINDOW_SIZE[1])));
+    }
+    ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(WINDOW_MIN_SIZE[0], WINDOW_MIN_SIZE[1])));
+}
 
 pub fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
@@ -29,9 +53,9 @@ pub fn setup_theme(ctx: &egui::Context, dark: bool) {
     ctx.all_styles_mut(|style| {
         style.visuals = terminal_visuals(dark);
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        style.spacing.button_padding = egui::vec2(12.0, 9.0);
+        style.spacing.button_padding = egui::vec2(12.0, 10.0);
         style.spacing.interact_size.y = 28.0;
-        style.spacing.window_margin = egui::Margin::symmetric(18.0, 16.0);
+        style.spacing.window_margin = egui::Margin::symmetric(10.0, 15.0);
         style.spacing.scroll = egui::style::ScrollStyle {
             foreground_color: true,
             ..egui::style::ScrollStyle::solid()
@@ -48,47 +72,65 @@ pub fn setup_theme(ctx: &egui::Context, dark: bool) {
     });
 }
 
+/// Same palette and widget chrome as SNATCH in both modes; only the accent is
+/// RAZE's own. Square corners, hairline ghost buttons, one accent used sparingly.
 pub fn terminal_visuals(dark: bool) -> egui::Visuals {
     let rgb = Color32::from_rgb;
-    let (bg, surface, field, line, bright, text, muted, accent, warn, error) = if dark {
-        (rgb(11,11,14), rgb(14,14,17), rgb(17,17,20), rgb(37,37,44),
-         rgb(65,65,76), rgb(220,220,226), rgb(151,151,161),
-         rgb(255,138,60), rgb(224,179,77), rgb(240,112,104))
+    let (bg, bg_lift, field, line, line_bright, text, text_dim, accent, warn, err) = if dark {
+        (rgb(0x0b, 0x0b, 0x0e), rgb(0x0e, 0x0e, 0x11), rgb(0x11, 0x11, 0x14),
+         rgb(0x1e, 0x1e, 0x24), rgb(0x33, 0x33, 0x3c), rgb(0xd6, 0xd6, 0xda),
+         rgb(0x83, 0x83, 0x8c), rgb(255, 138, 60), rgb(0xe0, 0xb3, 0x4d), rgb(0xe0, 0x65, 0x5c))
     } else {
-        (rgb(243,243,241), rgb(255,255,255), rgb(251,251,250), rgb(218,218,214),
-         rgb(181,181,176), rgb(28,28,30), rgb(92,92,98),
-         rgb(163,70,12), rgb(138,89,0), rgb(185,32,45))
+        (rgb(0xf3, 0xf3, 0xf1), rgb(0xff, 0xff, 0xff), rgb(0xfb, 0xfb, 0xfa),
+         rgb(0xda, 0xda, 0xd6), rgb(0xb5, 0xb5, 0xb0), rgb(0x1c, 0x1c, 0x1e),
+         rgb(0x5c, 0x5c, 0x62), rgb(163, 70, 12), rgb(0x9a, 0x67, 0x00), rgb(0xcf, 0x22, 0x2e))
     };
     let mut v = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
     v.window_rounding = egui::Rounding::ZERO;
     v.menu_rounding = egui::Rounding::ZERO;
-    v.window_fill = surface;
+    v.window_fill = bg_lift;
     v.window_stroke = Stroke::new(1.0, line);
     v.window_shadow = egui::Shadow::NONE;
     v.popup_shadow = egui::Shadow::NONE;
     v.panel_fill = bg;
-    v.extreme_bg_color = field;
+    v.extreme_bg_color = field; // TextEdit background: the one filled surface
     v.faint_bg_color = field;
     v.code_bg_color = field;
     v.hyperlink_color = accent;
     v.warn_fg_color = warn;
-    v.error_fg_color = error;
-    v.selection.bg_fill = accent.gamma_multiply(0.16);
+    v.error_fg_color = err;
+    v.selection.bg_fill = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 45);
     v.selection.stroke = Stroke::new(1.0, accent);
     for widget in [&mut v.widgets.noninteractive, &mut v.widgets.inactive,
         &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
         widget.rounding = egui::Rounding::ZERO;
+        // bg_fill backs checkboxes and must stay visible; weak_bg_fill backs
+        // plain buttons, which is what makes them "ghost" (border only).
         widget.bg_fill = field;
-        widget.weak_bg_fill = Color32::TRANSPARENT;
-        widget.bg_stroke = Stroke::new(1.0, line);
-        widget.fg_stroke = Stroke::new(1.0, text);
         widget.expansion = 0.0;
     }
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, muted);
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, bright);
-    v.widgets.active.bg_stroke = Stroke::new(1.0, accent);
+    // `weak` text tints its colour towards noninteractive.weak_bg_fill. It has
+    // to be the page background: a transparent fill tints towards black and
+    // makes weak text *darker* than normal text in the light theme.
+    v.widgets.noninteractive.weak_bg_fill = bg;
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, line);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text_dim);
+
+    v.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, line);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0, text_dim);
+
+    v.widgets.hovered.weak_bg_fill = Color32::TRANSPARENT;
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, line_bright);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0, text);
+
     v.widgets.active.weak_bg_fill = field;
-    v.widgets.open.bg_stroke = Stroke::new(1.0, bright);
+    v.widgets.active.bg_stroke = Stroke::new(1.0, accent);
+    v.widgets.active.fg_stroke = Stroke::new(1.0, text);
+
+    v.widgets.open.weak_bg_fill = Color32::TRANSPARENT;
+    v.widgets.open.bg_stroke = Stroke::new(1.0, line_bright);
+    v.widgets.open.fg_stroke = Stroke::new(1.0, text);
     v
 }
 
@@ -96,18 +138,50 @@ pub fn field_font() -> FontId {
     FontId::new(13.0, FontFamily::Name("field".into()))
 }
 
+/// Window captions use the un-nudged "title" face at 13pt; a plain `&str`
+/// would fall back to the 18pt Heading style.
+pub fn window_title(text: &str) -> RichText {
+    RichText::new(text).font(FontId::new(13.0, FontFamily::Name("title".into())))
+}
+
 pub fn accent_button(text: &str, accent: Color32) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text.to_owned()).color(accent))
         .stroke(Stroke::new(1.0, accent)).fill(Color32::TRANSPARENT)
+}
+
+/// Flat "● label" / "○ label" choice with no box, as SNATCH's engine row.
+/// `active` is the colour of the picked choice.
+pub fn choice(ui: &mut egui::Ui, label: &str, selected: bool, active: Color32) -> egui::Response {
+    let color = if selected { active } else { ui.visuals().widgets.inactive.fg_stroke.color };
+    let dot_color = if selected { active } else { ui.visuals().weak_text_color() };
+    // The dot is 11pt and the label 13pt: two sizes in one label need a LayoutJob.
+    let mut job = egui::text::LayoutJob::default();
+    job.append(if selected { "● " } else { "○ " }, 0.0, egui::TextFormat {
+        font_id: FontId::monospace(11.0), color: dot_color, ..Default::default()
+    });
+    job.append(label, 0.0, egui::TextFormat {
+        font_id: FontId::monospace(13.0), color, ..Default::default()
+    });
+    let text: egui::WidgetText = job.into();
+    // Not .fill()/.stroke(): each of them silently turns the frame back on.
+    ui.add(egui::Button::new(text).frame(false))
 }
 
 pub fn tag(ui: &mut egui::Ui, text: &str) {
     ui.weak(RichText::new(format!("› {text}")).size(12.0));
 }
 
+/// Dashed 1px rule across the available width, as SNATCH's separator.
 pub fn rule(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
-    ui.painter().hline(rect.x_range(), rect.center().y, ui.visuals().widgets.noninteractive.bg_stroke);
+    let stroke = Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
+    let (dash, gap) = (4.0, 3.0);
+    let mut x = rect.left();
+    while x < rect.right() {
+        let end = (x + dash).min(rect.right());
+        ui.painter().line_segment([egui::pos2(x, rect.center().y), egui::pos2(end, rect.center().y)], stroke);
+        x += dash + gap;
+    }
 }
 
 pub fn badge(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
@@ -118,15 +192,37 @@ pub fn badge(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
         .response
 }
 
+/// The wordmark, drawn like SNATCH's banner: the font shrinks from 11pt until
+/// the widest row fits, then the rows are pinned to one left edge and the
+/// whole block is centred. Only line breaks are trimmed: `trim()` would eat the
+/// first row's leading space and shift it one column left.
 pub fn wordmark(ui: &mut egui::Ui) {
-    const ART: &str = "    ____  ___  __________\n   / __ \\/   |/_  / ____/\n  / /_/ / /| | / / / __/  \n / _, _/ ___ |/ /_/ /___  \n/_/ |_/_/  |_/___/_____/  ";
-    let font = FontId::monospace(15.0);
-    let color = ui.visuals().weak_text_color().gamma_multiply(0.7);
-    let galley = ui.painter().layout_no_wrap(ART.to_owned(), font, color);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), galley.size().y + 16.0), egui::Sense::hover());
-    ui.painter().galley(egui::pos2(rect.center().x - galley.size().x / 2.0, rect.top() + 4.0), galley, color);
-    ui.vertical_centered(|ui| {
-        ui.weak(RichText::new(crate::tr!("stubborn files, clean folders", "сложные файлы. чистые папки.")).size(11.0));
+    let lines: Vec<&str> = raze_rs::WORDMARK.trim_matches(['\r', '\n']).lines().collect();
+    let measure = |ui: &egui::Ui, text: &str, size: f32| -> egui::Vec2 {
+        ui.fonts(|fonts| fonts.layout_job(egui::text::LayoutJob::single_section(
+            text.to_string(),
+            egui::TextFormat { font_id: FontId::monospace(size), ..Default::default() },
+        )).size())
+    };
+    ui.add_space(2.0);
+    ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+        let available = ui.available_width();
+        let width_at = |size: f32| lines.iter().map(|line| measure(ui, line, size).x).fold(0.0_f32, f32::max);
+        let mut size = 11.0_f32;
+        while size > 5.0 && width_at(size) > available {
+            size -= 0.5;
+        }
+        let block = egui::vec2(width_at(size) + 2.0, measure(ui, "█", size).y * lines.len() as f32);
+        // Align::Min: the art is not a padded rectangle, so rows that centred
+        // themselves would drift sideways from their neighbours.
+        ui.allocate_ui_with_layout(block, egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+            for line in &lines {
+                ui.label(RichText::new(*line).monospace().size(size).weak());
+            }
+        });
+        ui.add_space(4.0);
+        ui.weak(RichText::new(raze_rs::tagline()).size(11.0));
     });
-    ui.add_space(18.0);
+    ui.add_space(14.0);
 }

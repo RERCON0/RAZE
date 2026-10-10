@@ -1,6 +1,7 @@
 use super::*;
 use egui::{Align, Color32, RichText, Stroke};
 use raze_rs::engine::scan::EntryKind;
+use raze_rs::scrollbar::ScrollAreaExt;
 
 #[cfg(test)]
 #[derive(Default)]
@@ -41,7 +42,7 @@ impl RazeApp {
                     ui.allocate_ui_with_layout(egui::vec2(width, ui.available_height()),
                         egui::Layout::top_down(Align::Min), |ui| {
                             egui::ScrollArea::vertical().id_salt("main-scroll")
-                                .auto_shrink([false, false]).show(ui, |ui| {
+                                .auto_shrink([false, false]).show_terminal(ui, |ui| {
                                     style::wordmark(ui);
                                     self.render_path(ui);
                                     ui.add_space(16.0);
@@ -71,19 +72,20 @@ impl RazeApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    let width = (ui.available_width() - 226.0).max(0.0);
+                    let width = (ui.available_width() - 3.0 * 40.0 - style::THEME_BTN_WIDTH - 40.0).max(0.0);
                     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 42.0), egui::Sense::click_and_drag());
                     ui.painter().text(rect.left_center(), egui::Align2::LEFT_CENTER,
                         "RAZE — by rercon prod.", egui::FontId::new(13.0, egui::FontFamily::Name("title".into())),
                         ui.visuals().weak_text_color());
                     if response.double_clicked() { self.toggle_maximized(ctx); }
                     else if response.drag_started() { ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag); }
-                    if ui.add_sized([40.0, 38.0], egui::Button::new(i18n::language().toggled().label()).frame(false))
-                        .on_hover_text(tr!("Switch language", "Переключить язык")).clicked() {
+                    // Both buttons name what a click switches *to*, as in SNATCH.
+                    if ui.add_sized([40.0, 38.0], egui::Button::new(tr!("RU", "EN")).frame(false))
+                        .on_hover_text(tr!("Switch to Russian", "Переключить на английский")).clicked() {
                         i18n::set_language(i18n::language().toggled());
                     }
-                    if ui.add_sized([66.0, 38.0], egui::Button::new(if self.dark { tr!("light", "день") } else { tr!("dark", "ночь") }).frame(false))
-                        .on_hover_text(tr!("Switch theme", "Переключить тему")).clicked() {
+                    if ui.add_sized([style::THEME_BTN_WIDTH, 38.0], egui::Button::new(if self.dark { tr!("light", "день") } else { tr!("dark", "ночь") }).frame(false))
+                        .on_hover_text(if self.dark { tr!("Light theme", "Светлая тема") } else { tr!("Dark theme", "Тёмная тема") }).clicked() {
                         self.dark = !self.dark;
                         style::setup_theme(ctx, self.dark);
                     }
@@ -233,16 +235,13 @@ impl RazeApp {
         let enabled = idle && total.targets > 0;
         style::tag(ui, tr!("removal mode", "режим удаления"));
         ui.add_enabled_ui(idle, |ui| {
-            let width = (ui.available_width() - 8.0) / 2.0;
             ui.horizontal(|ui| {
                 for (mode, label) in [(Confirm::Recycle, tr!("recycle if possible", "корзина, если возможно")),
                     (Confirm::Permanent, tr!("permanent", "безвозвратно"))] {
-                    let selected = self.mode == mode;
-                    let color = if selected { if mode == Confirm::Permanent { ui.visuals().error_fg_color }
-                        else { ui.visuals().hyperlink_color } } else { ui.visuals().weak_text_color() };
-                    let response = ui.add_sized([width, style::CONTROL_HEIGHT],
-                        egui::Button::new(RichText::new(format!("{} {label}", if selected { "●" } else { "○" })).color(color))
-                            .stroke(Stroke::new(1.0, if selected { color } else { ui.visuals().widgets.inactive.bg_stroke.color })));
+                    // The irreversible choice reads red when picked.
+                    let active = if mode == Confirm::Permanent { ui.visuals().error_fg_color }
+                        else { ui.visuals().hyperlink_color };
+                    let response = style::choice(ui, label, self.mode == mode, active);
                     #[cfg(test)]
                     self.geometry.modes.push(response.rect);
                     if response.clicked() { self.mode = mode; }
@@ -274,10 +273,14 @@ impl RazeApp {
         let preview = ui.add_enabled(enabled, egui::Button::new(tr!("preview — no deletion", "проверить — без удаления")));
         if preview.clicked() { self.start_removal(ui.ctx(), Options { dry_run: true, ..self.base_options() }); }
         ui.add_space(6.0);
-        let color = if enabled { if self.mode == Confirm::Permanent { ui.visuals().error_fg_color }
-            else { ui.visuals().hyperlink_color } } else { ui.visuals().widgets.inactive.bg_stroke.color };
-        let primary = ui.add_enabled(enabled, style::accent_button(tr!("▶ DELETE SELECTED", "▶ УДАЛИТЬ ВЫБРАННОЕ"), color)
-            .min_size(egui::vec2(ui.available_width(), 44.0)));
+        // A disabled button keeps its accent and egui fades it: painting it in the
+        // hairline colour made the main action all but invisible until a target was added.
+        let color = if self.mode == Confirm::Permanent { ui.visuals().error_fg_color }
+            else { ui.visuals().hyperlink_color };
+        // add_sized centres the label, as SNATCH's "▶ DOWNLOAD"; min_size would leave it left-aligned.
+        let primary = ui.add_enabled_ui(enabled, |ui| {
+            ui.add_sized([ui.available_width(), 44.0], style::accent_button(tr!("▶ DELETE SELECTED", "▶ УДАЛИТЬ ВЫБРАННОЕ"), color))
+        }).inner;
         #[cfg(test)]
         { self.geometry.primary = Some(primary.rect); self.geometry.primary_enabled = enabled; }
         if primary.clicked() { self.phase = Phase::Confirming(self.mode); }
@@ -306,7 +309,7 @@ impl RazeApp {
             egui::Frame::none().stroke(ui.visuals().widgets.noninteractive.bg_stroke)
                 .inner_margin(egui::Margin::same(10.0)).show(ui, |ui| {
                     egui::ScrollArea::vertical().id_salt("log-scroll").max_height(160.0)
-                        .auto_shrink([false,false]).stick_to_bottom(true).show(ui, |ui| {
+                        .auto_shrink([false,false]).stick_to_bottom(true).show_terminal(ui, |ui| {
                             if self.log.is_empty() { ui.weak(tr!("Operations will appear here.", "Здесь появится отчёт о действиях.")); }
                             for line in &self.log { ui.label(RichText::new(line).monospace().size(11.5)); }
                         });
@@ -321,8 +324,11 @@ impl RazeApp {
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) { self.phase = Phase::Idle; return; }
         let total = self.totals();
         let width = (screen.width() - 80.0).min(440.0);
-        let window = egui::Window::new(tr!("Confirm deletion", "Подтвердите удаление"))
+        // Foreground: the dimmer above is a bare layer and would otherwise be
+        // drawn over the dialog itself, dimming the one thing the user must read.
+        let window = egui::Window::new(style::window_title(tr!("Confirm deletion", "Подтвердите удаление")))
             .id(egui::Id::new("delete-confirmation"))
+            .order(egui::Order::Foreground)
             .collapsible(false).resizable(false).movable(false)
             .default_width(width).max_width(width)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -331,7 +337,7 @@ impl RazeApp {
                     n = total.targets, size = human_bytes(total.bytes))).size(15.0));
                 ui.add_space(8.0);
                 egui::ScrollArea::vertical().id_salt("confirm-targets")
-                    .max_height((screen.height() * 0.25).min(180.0)).show(ui, |ui| {
+                    .max_height((screen.height() * 0.25).min(180.0)).show_terminal(ui, |ui| {
                         for (target, row) in self.plan.iter().zip(&self.rows) {
                             if !row.selected || target.refused.is_some() { continue; }
                             ui.add(egui::Label::new(&target.display).truncate()).on_hover_text(&target.display);
@@ -392,7 +398,7 @@ impl RazeApp {
 fn render_entries(ui: &mut egui::Ui, target: &Target, index: usize) {
     if target.entries.is_empty() { ui.weak(tr!("No child entries.", "Нет вложенных объектов.")); return; }
     egui::ScrollArea::vertical().id_salt(("entries",index)).max_height(220.0)
-        .auto_shrink([false,false]).show_rows(ui, 46.0, target.entries.len(), |ui,range| {
+        .auto_shrink([false,false]).show_terminal_rows(ui, 46.0, target.entries.len(), |ui,range| {
             for entry in &target.entries[range] {
                 let name = match entry.kind { EntryKind::File => tr!("file", "файл"),
                     EntryKind::Directory => tr!("folder", "папка"), EntryKind::Link => tr!("link", "ссылка") };

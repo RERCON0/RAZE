@@ -119,6 +119,7 @@ impl RazeApp {
     fn new(ctx: &egui::Context) -> Self {
         style::setup_fonts(ctx);
         style::setup_theme(ctx, true);
+        style::pin_pixel_scale(ctx, true);
         let (tx, rx) = mpsc::channel();
         Self {
             phase: Phase::Idle,
@@ -380,6 +381,9 @@ fn note_display(note: &raze_rs::engine::remove::Note) -> String {
 
 impl eframe::App for RazeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // eframe re-applies the OS scale factor on DPI/monitor changes, so the
+        // pin is re-asserted every frame, not just at startup.
+        style::pin_pixel_scale(ctx, false);
         self.drain_messages();
         if ctx.input(|i| i.viewport().close_requested()) && self.phase.working() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -400,8 +404,8 @@ fn main() -> eframe::Result {
         &tr_format!("RAZE could not continue.\n\n{info}", "RAZE не смог продолжить работу.\n\n{info}")
     )));
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([660.0, 860.0])
-        .with_min_inner_size([520.0, 640.0])
+        .with_inner_size(style::WINDOW_SIZE)
+        .with_min_inner_size(style::WINDOW_MIN_SIZE)
         .with_title("RAZE — by rercon prod.");
     #[cfg(windows)]
     { viewport = viewport.with_decorations(false); }
