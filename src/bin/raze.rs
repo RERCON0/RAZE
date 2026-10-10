@@ -186,7 +186,8 @@ fn run(cli: Cli) -> i32 {
     }
 
     // Подтверждение: из контекстного меню и с --yes вопросов не задаём.
-    if !cli.yes && !cli.from_shell && !confirm(&planned) {
+    // Пробный прогон ничего не меняет, спрашивать нечего.
+    if !cli.dry_run && !cli.yes && !cli.from_shell && !confirm(&planned) {
         println!("{}", tr!("Cancelled.", "Отменено."));
         return 1;
     }
@@ -195,7 +196,7 @@ fn run(cli: Cli) -> i32 {
 
     // Один раз предлагаем повышение и повторяем всё с начала.
     if report.needs_elevation && !cli.elevated && !is_elevated() {
-        if let Some(code) = relaunch_as_admin(&targets_paths, cli.verbose > 0) {
+        if let Some(code) = relaunch_as_admin(&cli, &planned) {
             return code;
         }
     }
@@ -296,27 +297,15 @@ fn shell_install(uninstall: bool) -> i32 {
     0
 }
 
-fn relaunch_as_admin(paths: &[PathBuf], verbose: bool) -> Option<i32> {
+fn relaunch_as_admin(cli: &Cli, planned: &[job::Target]) -> Option<i32> {
     if !needs_elevation() {
         return None;
     }
     let Ok(exe) = std::env::current_exe() else {
         return None;
     };
-    let mut arguments: Vec<String> = vec![
-        "--elevated".into(),
-        "--yes".into(),
-        std::env::args()
-            .nth(1)
-            .filter(|arg| arg.starts_with("--"))
-            .unwrap_or_default(),
-    ];
-    arguments.retain(|arg| !arg.is_empty());
-    for path in paths {
-        arguments.push(path.to_string_lossy().to_string());
-    }
-    let line = build_arguments(&arguments);
-    if verbose {
+    let line = build_arguments(&elevation_arguments(cli, planned));
+    if cli.verbose > 0 {
         eprintln!("{}", tr_format!("Requesting admin rights…", "Запрашиваю права администратора…"));
     }
     match relaunch_elevated(&exe, &line) {
@@ -333,6 +322,37 @@ fn relaunch_as_admin(paths: &[PathBuf], verbose: bool) -> Option<i32> {
             Some(1)
         }
     }
+}
+
+/// Копия с правами администратора должна сделать ровно то, о чём просили:
+/// с теми же параметрами и над теми же объектами. Раньше передавался только
+/// первый аргумент командной строки, да и тот лишь если начинался с `--`:
+/// `-p` и `--keep-owners` терялись, и повышенный процесс брал владение там, где
+/// просили этого не делать. Пути идут абсолютными из плана: у повышенного
+/// процесса другой рабочий каталог, и относительный путь указал бы на другое.
+fn elevation_arguments(cli: &Cli, planned: &[job::Target]) -> Vec<String> {
+    let mut args = vec!["--elevated".to_string(), "--yes".to_string()];
+    for (enabled, flag) in [
+        (cli.permanent, "--permanent"),
+        (cli.recycle, "--recycle"),
+        (cli.close_locks, "--close-locks"),
+        (cli.keep_owners, "--keep-owners"),
+        (cli.json, "--json"),
+    ] {
+        if enabled {
+            args.push(flag.to_string());
+        }
+    }
+    args.extend(["--lang".to_string(), i18n::language().code().to_string()]);
+    // `--`: путь, начинающийся с «-», не должен читаться как параметр.
+    args.push("--".to_string());
+    args.extend(
+        planned
+            .iter()
+            .filter(|target| target.refused.is_none())
+            .map(|target| target.display.clone()),
+    );
+    args
 }
 
 fn print_plan(targets: &[job::Target], summary: &job::Summary, verbose: u8) {
@@ -454,7 +474,7 @@ fn print_usage() {
     println!("  {}", tr!("Example: raze C:\\Users\\me\\Desktop\\Seller", "Пример: raze C:\\Users\\me\\Desktop\\Seller"));
     println!("  {}", tr!("Example: raze -n C:\\tmp", "Пример: raze -n C:\\tmp"));
     println!("\n{}", tr!("Run raze --help for the full list.", "Полный список — raze --help."));
-    println!("{}", TELEGRAM_URL);
+    println!("{TELEGRAM_URL}");
 }
 
 #[cfg(test)]
@@ -485,6 +505,30 @@ mod tests {
         // Вызов из меню без цели — пустой набор.
         let cli = Cli::parse_from(["raze", "--from-shell"]);
         assert!(collect_paths(&cli).is_empty());
+    }
+
+    #[test]
+    fn the_elevated_copy_gets_every_option_and_absolute_paths() {
+        let cli = Cli::parse_from(["raze", "-p", "-c", "--keep-owners", "relative-target"]);
+        let planned = job::plan(&collect_paths(&cli), &Options::default());
+        let args = elevation_arguments(&cli, &planned);
+
+        for expected in ["--elevated", "--yes", "--permanent", "--close-locks", "--keep-owners", "--"] {
+            assert!(args.iter().any(|a| a == expected), "{expected}: {args:?}");
+        }
+        assert!(!args.iter().any(|a| a == "--recycle"));
+        // Пути идут после `--` и абсолютными, а не «как набрали».
+        let separator = args.iter().position(|a| a == "--").unwrap();
+        let paths = &args[separator + 1..];
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].as_bytes()[1] == b':', "{}", paths[0]);
+        assert!(paths[0].to_lowercase().ends_with("relative-target"));
+    }
+
+    #[test]
+    fn a_dry_run_never_asks_for_confirmation() {
+        let cli = Cli::parse_from(["raze", "-n", "C:\tmp"]);
+        assert!(cli.dry_run && !cli.yes && !cli.from_shell);
     }
 
     #[test]

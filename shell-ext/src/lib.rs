@@ -29,8 +29,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows::core::{implement, BOOL, GUID, HRESULT, Interface, PCWSTR, PWSTR, Ref};
 use windows::Win32::Foundation::{
-    CloseHandle, CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_NOTIMPL, E_NOINTERFACE,
-    E_OUTOFMEMORY, HMODULE,
+    CloseHandle, CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_INVALIDARG, E_NOTIMPL,
+    E_NOINTERFACE, E_OUTOFMEMORY, E_POINTER, HMODULE,
 };
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::System::Com::{
@@ -205,6 +205,9 @@ impl IClassFactory_Impl for RazeFactory_Impl {
         riid: *const GUID,
         object: *mut *mut c_void,
     ) -> windows::core::Result<()> {
+        if object.is_null() {
+            return Err(E_POINTER.into());
+        }
         unsafe {
             *object = ptr::null_mut();
             // Агрегация нам не нужна: команда не должна становиться
@@ -243,16 +246,25 @@ impl IClassFactory_Impl for RazeFactory_Impl {
 
 /// Точка входа `DllGetClassObject`. Проводник вызывает её с CLSID из
 /// манифеста пакета и IID `IClassFactory`.
+///
+/// # Safety
+/// Указатели приходят от COM и должны быть либо нулевыми, либо валидными;
+/// `object` — выходной параметр, в который пишется результат.
 #[no_mangle]
-pub extern "system" fn DllGetClassObject(
+pub unsafe extern "system" fn DllGetClassObject(
     class: *const GUID,
     interface: *const GUID,
     object: *mut *mut c_void,
 ) -> HRESULT {
+    // Выходной указатель проверяется до первой записи в него: эта DLL живёт в
+    // процессе Проводника, и разыменование NULL здесь роняет не нас, а его.
+    if object.is_null() {
+        return E_POINTER;
+    }
     unsafe {
         *object = ptr::null_mut();
         if class.is_null() || interface.is_null() {
-            return E_NOINTERFACE;
+            return E_INVALIDARG;
         }
         if *class != COMMAND_CLSID {
             return CLASS_E_CLASSNOTAVAILABLE;
@@ -395,7 +407,7 @@ fn spawn_raze(paths: &[PathBuf]) {
     }
     command.push(0);
 
-    let mut startup = STARTUPINFOW {
+    let startup = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
         ..Default::default()
     };
@@ -411,7 +423,7 @@ fn spawn_raze(paths: &[PathBuf]) {
             windows::Win32::System::Threading::DETACHED_PROCESS,
             None,
             None,
-            &mut startup,
+            &startup,
             &mut process,
         )
     };

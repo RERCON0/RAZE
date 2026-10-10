@@ -362,7 +362,7 @@ fn elevation_arguments(paths: &[PathBuf], options: &Options) -> String {
     if options.permanent { args.push("--permanent".into()); }
     if options.close_locks { args.push("--close-locks".into()); }
     if !options.take_ownership { args.push("--keep-owners".into()); }
-    args.extend(["--lang".into(), i18n::language().label().to_ascii_lowercase(), "--".into()]);
+    args.extend(["--lang".into(), i18n::language().code().into(), "--".into()]);
     args.extend(paths.iter().map(|p| p.to_string_lossy().into_owned()));
     build_arguments(&args)
 }

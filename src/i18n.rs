@@ -32,6 +32,15 @@ impl Language {
         }
     }
 
+    /// Значение для `--lang`. Отличается от [`Language::label`]: тот — название
+    /// для людей («Русский»), и `--lang русский` не разбирается.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::En => "en",
+            Self::Ru => "ru",
+        }
+    }
+
     pub fn toggled(self) -> Self {
         match self {
             Self::En => Self::Ru,
@@ -107,6 +116,16 @@ macro_rules! tr_format {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_language_code_round_trips_through_parse() {
+        for language in [Language::En, Language::Ru] {
+            assert_eq!(Language::parse(language.code()), Ok(language));
+        }
+        // Название для людей — не код: на нём и спотыкалась передача языка
+        // повышенному процессу.
+        assert!(Language::parse(Language::Ru.label().to_lowercase().as_str()).is_err());
+    }
 
     #[test]
     fn both_languages_cover_every_removal_reason() {

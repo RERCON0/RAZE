@@ -167,6 +167,34 @@ pub fn choice(ui: &mut egui::Ui, label: &str, selected: bool, active: Color32) -
     ui.add(egui::Button::new(text).frame(false))
 }
 
+/// `egui::Spinner` с ограниченной частотой перерисовки. Штатный вызывает
+/// `request_repaint()` на каждом кадре, и пока идёт сканирование или удаление,
+/// окно крутится на полной частоте и отбирает процессор у потока, который
+/// эту работу делает. Здесь тот же рисунок (дуга 240°, 20 точек), но следующий
+/// кадр запрашивается через ~66 мс; события ввода перерисовывают сразу.
+pub fn slow_spinner(ui: &mut egui::Ui) {
+    let size = ui.style().spacing.interact_size.y;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    response.widget_info(|| egui::WidgetInfo::new(egui::WidgetType::ProgressIndicator));
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(66));
+    let radius = (rect.height() / 2.0) - 2.0;
+    let time = ui.input(|i| i.time);
+    let start = time * std::f64::consts::TAU;
+    let end = start + 240f64.to_radians() * time.sin();
+    let points: Vec<egui::Pos2> = (0..20)
+        .map(|i| {
+            let angle = egui::lerp(start..=end, f64::from(i) / 20.0);
+            let (sin, cos) = angle.sin_cos();
+            rect.center() + radius * egui::vec2(cos as f32, sin as f32)
+        })
+        .collect();
+    ui.painter()
+        .add(egui::Shape::line(points, Stroke::new(3.0, ui.visuals().strong_text_color())));
+}
+
 pub fn tag(ui: &mut egui::Ui, text: &str) {
     ui.weak(RichText::new(format!("› {text}")).size(12.0));
 }
@@ -208,10 +236,21 @@ pub fn wordmark(ui: &mut egui::Ui) {
     ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
         let available = ui.available_width();
         let width_at = |size: f32| lines.iter().map(|line| measure(ui, line, size).x).fold(0.0_f32, f32::max);
-        let mut size = 11.0_f32;
-        while size > 5.0 && width_at(size) > available {
-            size -= 0.5;
-        }
+        // Подбор кегля — до двенадцати замеров всех строк; он зависит только от
+        // ширины окна, поэтому считается один раз на ширину, а не на кадр.
+        let cache_id = egui::Id::new("wordmark-size");
+        let cached: Option<(u32, f32)> = ui.ctx().data(|data| data.get_temp(cache_id));
+        let size = match cached {
+            Some((width_bits, size)) if width_bits == available.to_bits() => size,
+            _ => {
+                let mut size = 11.0_f32;
+                while size > 5.0 && width_at(size) > available {
+                    size -= 0.5;
+                }
+                ui.ctx().data_mut(|data| data.insert_temp(cache_id, (available.to_bits(), size)));
+                size
+            }
+        };
         let block = egui::vec2(width_at(size) + 2.0, measure(ui, "█", size).y * lines.len() as f32);
         // Align::Min: the art is not a padded rectangle, so rows that centred
         // themselves would drift sideways from their neighbours.

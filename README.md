@@ -54,10 +54,28 @@ or a normalization surprise to abuse.
 restored; objects the bin cannot hold (reserved names, extended paths) are
 removed permanently — and the report says which happened. The check runs
 *before* deletion, because the shell silently deletes permanently when the
-bin is full.
+bin is full. For the same reason RAZE reads the drive's Recycle Bin settings
+("don't move files to the Recycle Bin", the size limit, the policy) and plans
+such objects as permanent instead of reporting a Recycle Bin that never
+happened.
 
-**Safety rails:** volume roots (`C:\`), system anchors (`C:\Windows` and
-friends) and the RAZE program folder itself are refused outright.
+**Safety rails:** volume roots (`C:\`), the system folders themselves
+(`C:\Windows`, `C:\Program Files`, `C:\ProgramData`, your profile and their
+parents) and the RAZE program folder are refused outright. So is most of what
+lies *inside* them: under `C:\Windows` only throwaway folders may be removed
+(`Temp`, `Logs`, `Minidump`, `SoftwareDistribution`, `Panther`, `Debug`,
+`Prefetch`, the print queue); in `Program Files` the folders that belong to
+Windows itself (`WindowsApps`, `Windows *`, `Common Files`); on the system
+drive `System Volume Information`, `Recovery`, `Boot`, `EFI`. A path is checked
+twice — as typed and as it really lies on disk — so `C:\PROGRA~1` and a path
+through a junction into `C:\Windows` are caught too, and the check is repeated
+right before deletion. Paths with `* ? " < > |` or an NTFS stream (`:`) are
+rejected: the shell would read the first as a mask.
+
+While a tree is being removed every object is verified, through the very
+handle that is about to be deleted, to lie inside the target. If a folder was
+swapped for a junction in the meantime, the object is skipped and reported, not
+deleted.
 
 ## Features
 

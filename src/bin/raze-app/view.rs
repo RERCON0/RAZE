@@ -119,7 +119,10 @@ impl RazeApp {
                 let button_width = 104.0;
                 let field_width = (ui.available_width() - button_width - ui.spacing().item_spacing.x).max(40.0);
                 let response = ui.add_sized([field_width, style::CONTROL_HEIGHT],
+                    // По умолчанию текст прижат к верху поля (LEFT_TOP), а поле
+                    // растянуто до 40 pt: подпись и ввод стояли выше центра.
                     egui::TextEdit::singleline(&mut self.typed).font(style::field_font())
+                        .vertical_align(Align::Center)
                         .margin(egui::vec2(12.0, 10.0)).hint_text(tr!("C:\\path\\to\\stubborn-folder", "C:\\путь\\к\\сложной-папке")));
                 submit = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let add = ui.add_enabled(!self.typed.trim().is_empty(),
@@ -287,7 +290,7 @@ impl RazeApp {
         if self.phase.working() {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
-                ui.spinner();
+                style::slow_spinner(ui);
                 ui.label(if self.phase == Phase::Planning { tr!("Scanning…", "Сканирую…") }
                     else { tr!("Removing… Keep the window open.", "Удаляю… Не закрывайте окно.") });
             });

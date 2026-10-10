@@ -42,23 +42,34 @@ pub fn needs_elevation() -> bool {
 /// Собирает командную строку из аргументов, экранируя пробелы и кавычки по
 /// правилам `CommandLineToArgvW`, иначе путь с пробелами развалится.
 pub fn quote(argument: &str) -> String {
+    let needs_quotes = argument.is_empty() || argument.chars().any(|c| c.is_whitespace() || c == '"');
+    if !needs_quotes {
+        return argument.to_string();
+    }
+    // Правило CommandLineToArgvW: обратные черты удваиваются только перед
+    // кавычкой и перед закрывающей кавычкой. Без этого хвостовая черта пути
+    // с пробелом экранирует закрывающую кавычку, и аргумент съедает соседний.
     let mut out = String::with_capacity(argument.len() + 2);
-    let mut needs_quotes = argument.is_empty();
+    out.push('"');
+    let mut backslashes = 0usize;
     for ch in argument.chars() {
-        if ch.is_whitespace() || ch == '"' {
-            needs_quotes = true;
-        }
         match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push('\\'),
-            _ => out.push(ch),
+            '\\' => backslashes += 1,
+            '"' => {
+                out.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.extend(std::iter::repeat_n('\\', backslashes));
+                out.push(ch);
+                backslashes = 0;
+            }
         }
     }
-    if needs_quotes {
-        format!("\"{out}\"")
-    } else {
-        out
-    }
+    out.extend(std::iter::repeat_n('\\', backslashes * 2));
+    out.push('"');
+    out
 }
 
 pub fn build_arguments(args: &[String]) -> String {
@@ -78,6 +89,16 @@ mod tests {
         assert_eq!(quote("with space"), "\"with space\"");
         assert_eq!(quote(""), "\"\"");
         assert_eq!(quote("a\"b"), "\"a\\\"b\"");
+    }
+
+    #[test]
+    fn backslashes_before_a_quote_follow_the_argv_rules() {
+        // Хвостовая черта в пути с пробелом удваивается: иначе закрывающая
+        // кавычка оказалась бы экранированной.
+        assert_eq!(quote("C:\\my folder\\"), "\"C:\\my folder\\\\\"");
+        assert_eq!(quote("a\\\"b"), "\"a\\\\\\\"b\"");
+        // Без пробелов и кавычек строка остаётся как есть, черты тоже.
+        assert_eq!(quote("C:\\a\\"), "C:\\a\\");
     }
 
     #[test]
