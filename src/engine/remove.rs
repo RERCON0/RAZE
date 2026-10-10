@@ -10,7 +10,6 @@
 //! Пункт 5 обязателен: пометка на удаление не означает, что файл исчез, и
 //! молча рапортовать об успехе там, где объект остался, нельзя.
 
-use std::collections::HashSet;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -22,8 +21,10 @@ use windows::Win32::Storage::FileSystem::{
 };
 
 use super::dir;
-use super::error::NtError;
-use super::handle::{clear_read_only, open_for_delete, open_for_read, privileged_access, attributes};
+use super::error::{ERROR_OUTSIDE_TREE, NtError};
+use super::handle::{
+    Containment, attributes, clear_read_only, open_for_delete, open_for_read, privileged_access,
+};
 use super::locker::{self, Holder};
 use super::path::{NtPath, Wide};
 use super::privs;
@@ -127,6 +128,14 @@ impl Outcome {
 
 /// Удаляет дерево `root` целиком. `root` может быть файлом, папкой или
 /// ссылкой — тип определяется на лету.
+///
+/// Обход потоковый: каталог перечисляется, его содержимое сразу удаляется, и
+/// только потом удаляется сам каталог. В памяти остаются списки каталогов на
+/// текущем пути вниз, а не всё дерево (миллион файлов — это гигабайт путей),
+/// и между «увидели» и «удалили» проходят мгновения, а не минуты. Каждый
+/// удаляемый объект ещё и проверяется на принадлежность корню
+/// (см. [`Containment`]): подмену каталога на junction посреди обхода это
+/// ловит.
 pub fn remove_tree(root: &NtPath, options: &RemoveOptions) -> Outcome {
     let mut outcome = Outcome {
         dry_run: options.dry_run,
@@ -140,61 +149,153 @@ pub fn remove_tree(root: &NtPath, options: &RemoveOptions) -> Outcome {
     // удаляем одним шагом. Корень-каталог идёт снизу вверх.
     if let Some((kind, size)) = classify_root(root) {
         if kind != EntryKind::Directory {
-            remove_leaf(root, kind, size, options, &mut outcome, true);
+            remove_leaf(root, kind, size, options, None, &mut outcome, true);
             return outcome;
         }
     }
 
-    // Стек обхода: каталоги, из которых нужно вычистить содержимое. Порядок
-    // удаления снизу вверх, поэтому сначала собираем всё, потом сносим.
-    let mut pending: Vec<(NtPath, EntryKind, u64)> = Vec::new();
-    let mut stack = vec![(root.clone(), 0usize)];
-    let mut seen: HashSet<String> = HashSet::new();
+    // Пробный прогон ничего не меняет, и защищать в нём нечего.
+    let guard = if options.dry_run {
+        None
+    } else {
+        match Containment::new(root) {
+            Ok(guard) => guard,
+            Err(error) if error.not_found() => {
+                outcome.notes.push(Note::Vanished {
+                    path: root.to_string_lossy(),
+                });
+                return outcome;
+            }
+            Err(error) => {
+                // Корень не открывается даже на чтение атрибутов: дальше идти
+                // вслепую нельзя. Это отказ в доступе — значит, нужен UAC.
+                outcome.fail(root, error, Vec::new());
+                return outcome;
+            }
+        }
+    };
+    let guard = guard.as_ref();
+
+    let mut stack: Vec<Frame> = Vec::new();
+    match Frame::enter(root, options, guard, &mut outcome) {
+        Entered::Frame(frame) => stack.push(frame),
+        Entered::Gone | Entered::Failed => return outcome,
+    }
     let max_depth = 512;
 
-    while let Some((dir, depth)) = stack.pop() {
-        if depth > max_depth {
-            outcome.fail(&dir, NtError(206), Vec::new());
-            continue;
-        }
-        match dir::children(&dir) {
-            Ok(children) => {
-                for child in children {
-                    let path = dir.child_raw(&child.name);
-                    let kind = kind_of(child.attributes);
-                    if kind == EntryKind::Directory {
-                        stack.push((path.clone(), depth + 1));
-                    }
-                    pending.push((path, kind, child.size));
+    while let Some(top) = stack.len().checked_sub(1) {
+        let Some(child) = stack[top].children.next() else {
+            // Содержимое каталога обработано.
+            let finished = stack.pop().expect("the frame was just seen");
+            let Some(parent) = stack.last_mut() else {
+                // Корень удаляем последним и в отчёт не включаем: пользователь
+                // и так видит, какую папку удаляет, а считаем содержимое. При
+                // сбое на содержимом корень не сносится (он не пуст), попытка
+                // только добавила бы шум.
+                if !outcome.failed() {
+                    remove_leaf(&finished.dir, EntryKind::Directory, 0, options, guard, &mut outcome, false);
+                }
+                break;
+            };
+            if finished.failed {
+                // Внутри остались объекты: каталог не пуст, и по «папка не
+                // пуста» на каждом предке ничего нового не узнать.
+                parent.failed = true;
+            } else {
+                let before = outcome.failures.len();
+                remove_leaf(&finished.dir, EntryKind::Directory, 0, options, guard, &mut outcome, true);
+                if outcome.failures.len() > before {
+                    parent.failed = true;
                 }
             }
+            continue;
+        };
+
+        let path = stack[top].dir.child_raw(&child.name);
+        let kind = kind_of(child.attributes);
+        if kind == EntryKind::Directory {
+            if stack.len() > max_depth {
+                outcome.fail(&path, NtError(206), Vec::new());
+                stack[top].failed = true;
+                continue;
+            }
+            match Frame::enter(&path, options, guard, &mut outcome) {
+                Entered::Frame(frame) => stack.push(frame),
+                Entered::Gone => {}
+                Entered::Failed => stack[top].failed = true,
+            }
+        } else {
+            let before = outcome.failures.len();
+            remove_leaf(&path, kind, child.size, options, guard, &mut outcome, true);
+            if outcome.failures.len() > before {
+                stack[top].failed = true;
+            }
+        }
+    }
+
+    outcome
+}
+
+/// Каталог в обходе: его ещё не обработанное содержимое и признак, что
+/// что-то внутри удалить не удалось.
+struct Frame {
+    dir: NtPath,
+    children: std::vec::IntoIter<dir::Child>,
+    failed: bool,
+}
+
+enum Entered {
+    Frame(Frame),
+    /// Каталог исчез между перечислением родителя и заходом в него.
+    Gone,
+    Failed,
+}
+
+impl Frame {
+    fn enter(
+        dir: &NtPath,
+        options: &RemoveOptions,
+        guard: Option<&Containment>,
+        outcome: &mut Outcome,
+    ) -> Entered {
+        let mut listing = dir::children(dir);
+        // ACL-стена на самой папке: пока не стал владельцем, содержимого не
+        // увидеть, и до удаления дело не доходит. Владение и права берутся ровно
+        // так же, как для файла (после настоящего отказа), и перечисление
+        // повторяется один раз. Пробный прогон права не меняет.
+        if let Err(error) = &listing {
+            if error.access_denied() && options.take_ownership && !options.dry_run {
+                if security::take_ownership(dir, guard).is_ok() {
+                    outcome.notes.push(Note::OwnershipTaken {
+                        path: dir.to_string_lossy(),
+                    });
+                }
+                if security::grant_full_control(dir, guard).is_ok() {
+                    outcome.notes.push(Note::AccessGranted {
+                        path: dir.to_string_lossy(),
+                    });
+                }
+                listing = dir::children(dir);
+            }
+        }
+        match listing {
+            Ok(children) => Entered::Frame(Self {
+                dir: dir.clone(),
+                children: children.into_iter(),
+                failed: false,
+            }),
             Err(error) if error.not_found() => {
                 outcome.notes.push(Note::Vanished {
                     path: dir.to_string_lossy(),
                 });
+                Entered::Gone
             }
-            Err(error) => outcome.fail(&dir, error, Vec::new()),
+            Err(error) => {
+                outcome.fail(dir, error, Vec::new());
+                Entered::Failed
+            }
         }
     }
-
-    // Каталоги удаляем в обратном порядке: содержимое уже снесено.
-    for (path, kind, size) in pending.into_iter().rev() {
-        if !seen.insert(path.to_string_lossy()) {
-            continue;
-        }
-        remove_leaf(&path, kind, size, options, &mut outcome, true);
-    }
-
-    // Корень удаляем последним: содержимое уже снесено.
-    // В отчёт его не включаем — пользователь и так видит,
-    // какую папку удаляет; считаем только содержимое.
-    // При сбое на содержимом корень и так не сносится
-    // (он не пуст), попытка только добавила бы шум.
-    if !outcome.failed() {
-        remove_leaf(root, EntryKind::Directory, 0, options, &mut outcome, false);
-    }
-
-    outcome
 }
 
 /// Удаляет уже перечисленные объекты — так работает «точечный» режим GUI,
@@ -223,7 +324,7 @@ pub fn remove_selected(
             outcome.notes.extend(inner.notes);
             outcome.failures.extend(inner.failures);
         } else {
-            remove_leaf(path, *kind, *size, options, &mut outcome, true);
+            remove_leaf(path, *kind, *size, options, None, &mut outcome, true);
         }
     }
     outcome
@@ -276,6 +377,7 @@ fn remove_leaf(
     kind: EntryKind,
     size: u64,
     options: &RemoveOptions,
+    guard: Option<&Containment>,
     outcome: &mut Outcome,
     record: bool,
 ) {
@@ -289,7 +391,7 @@ fn remove_leaf(
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        match try_delete(path, options, outcome) {
+        match try_delete(path, options, guard, outcome) {
             DeleteStep::Done => {
                 if record {
                     outcome.record(kind, size);
@@ -303,6 +405,10 @@ fn remove_leaf(
                 if record {
                     outcome.record(kind, size);
                 }
+                return;
+            }
+            DeleteStep::Refused(error) => {
+                outcome.fail(path, error, Vec::new());
                 return;
             }
             DeleteStep::Retry(error) => {
@@ -322,7 +428,7 @@ fn remove_leaf(
                         }
                         if locker::wait_for_release(
                             &[path.to_path()],
-                            options.lock_timeout.min(Duration::from_millis(400) * u32::from(attempt)),
+                            options.lock_timeout.min(Duration::from_millis(400) * attempt),
                         ) {
                             continue;
                         }
@@ -349,9 +455,16 @@ enum DeleteStep {
     Done,
     AlreadyGone,
     Retry(NtError),
+    /// Повторять бессмысленно: объект не из нашего дерева.
+    Refused(NtError),
 }
 
-fn try_delete(path: &NtPath, options: &RemoveOptions, outcome: &mut Outcome) -> DeleteStep {
+fn try_delete(
+    path: &NtPath,
+    options: &RemoveOptions,
+    guard: Option<&Containment>,
+    outcome: &mut Outcome,
+) -> DeleteStep {
     let handle = match open_for_delete(path) {
         Ok(handle) => handle,
         Err(error) if error.not_found() => return DeleteStep::AlreadyGone,
@@ -361,12 +474,12 @@ fn try_delete(path: &NtPath, options: &RemoveOptions, outcome: &mut Outcome) -> 
             }
             // Сначала владение, потом права: без владения WRITE_DAC
             // недоступен, и второй шаг был бы пустой тратой времени.
-            if security::take_ownership(path).is_ok() {
+            if security::take_ownership(path, guard).is_ok() {
                 outcome.notes.push(Note::OwnershipTaken {
                     path: path.to_string_lossy(),
                 });
             }
-            if security::grant_full_control(path).is_ok() {
+            if security::grant_full_control(path, guard).is_ok() {
                 outcome.notes.push(Note::AccessGranted {
                     path: path.to_string_lossy(),
                 });
@@ -380,6 +493,14 @@ fn try_delete(path: &NtPath, options: &RemoveOptions, outcome: &mut Outcome) -> 
         }
         Err(error) => return DeleteStep::Retry(error),
     };
+
+    // Проверка по тому самому дескриптору, который сейчас будет удалён: между
+    // «проверили» и «удалили» объект подменить уже нельзя.
+    if let Some(guard) = guard {
+        if !guard.holds(&handle) {
+            return DeleteStep::Refused(NtError(ERROR_OUTSIDE_TREE));
+        }
+    }
 
     if let Ok(attrs) = attributes(&handle) {
         if attrs.is_read_only() {
@@ -496,6 +617,17 @@ pub fn exists(path: &NtPath) -> bool {
     open_for_read(path).is_ok()
 }
 
+/// Есть ли такой объект — в том числе тот, что нельзя даже открыть на чтение
+/// атрибутов (ACL-стена). «Нет такого пути» — единственный ответ «нет»; отказ в
+/// доступе означает, что объект на месте, и разбираться с ним предстоит
+/// удалению (с владением и повышением), а не молчаливому «делать нечего».
+pub fn present(path: &NtPath) -> bool {
+    match open_for_read(path) {
+        Ok(_) => true,
+        Err(error) => !error.not_found(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,6 +727,86 @@ mod tests {
             "цель junction не должна пострадать"
         );
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `mklink /J` не требует прав администратора. Если создать не вышло, тест
+    /// не имеет смысла и просто выходит.
+    fn make_junction(link: &Path, target: &Path) -> bool {
+        std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn an_object_swapped_out_of_the_tree_is_refused_not_deleted() {
+        // Имитация гонки: по дороге к файлу каталог внутри дерева подменили
+        // junction'ом на чужую папку. Дескриптор откроется, но объект лежит
+        // снаружи, и удалять его нельзя.
+        let base = scratch("escape");
+        let work = base.join("work");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("victim.txt"), b"keep me").unwrap();
+        let link = work.join("swapped");
+        if !make_junction(&link, &outside) {
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        let guard = Containment::new(&NtPath::new(&work).unwrap())
+            .unwrap()
+            .expect("NTFS reports the final path");
+        let through_link = NtPath::new(&link.join("victim.txt")).unwrap();
+        let options = RemoveOptions::default();
+
+        let mut outcome = Outcome::default();
+        remove_leaf(&through_link, EntryKind::File, 7, &options, Some(&guard), &mut outcome, true);
+        assert_eq!(outcome.failures.len(), 1, "{:?}", outcome.failures);
+        assert_eq!(outcome.failures[0].code, ERROR_OUTSIDE_TREE);
+        assert_eq!(outcome.removed_files, 0);
+        assert!(outside.join("victim.txt").exists(), "чужой файл не тронут");
+
+        // Без проверки тот же вызов сносит чужой файл: это и была дыра.
+        let mut unguarded = Outcome::default();
+        remove_leaf(&through_link, EntryKind::File, 7, &options, None, &mut unguarded, true);
+        assert!(!outside.join("victim.txt").exists());
+
+        let _ = std::fs::remove_dir(&link); // сама ссылка, без захода в цель
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_locked_file_is_one_failure_not_one_per_ancestor() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let base = scratch("locked");
+        let deep = base.join("a").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        let locked = deep.join("busy.bin");
+        std::fs::write(&locked, b"x").unwrap();
+        std::fs::write(base.join("a").join("free.txt"), b"x").unwrap();
+        // Открыт без FILE_SHARE_DELETE: удалить нельзя, пока держат.
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&locked)
+            .unwrap();
+
+        let options = RemoveOptions {
+            retries: 1,
+            ..Default::default()
+        };
+        let outcome = remove_tree(&NtPath::new(&base).unwrap(), &options);
+        assert_eq!(outcome.failures.len(), 1, "{:?}", outcome.failures);
+        assert!(locked.exists());
+        assert!(!base.join("a").join("free.txt").exists(), "остальное уходит");
+
+        drop(held);
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -24,6 +24,9 @@ pub const ERROR_CANNOT_DELETE: u32 = 1011;
 pub const ERROR_USER_MAPPED_FILE: u32 = 1224;
 pub const ERROR_PRIVILEGE_NOT_HELD: u32 = 1314;
 pub const ERROR_FILE_IS_OFFLINE: u32 = 4350;
+/// Собственный код (бит 29 — «определено приложением»): объект лежит вне
+/// удаляемого дерева, то есть путь по дороге подменили ссылкой.
+pub const ERROR_OUTSIDE_TREE: u32 = 0xE0A5_0001;
 
 impl NtError {
     pub fn last() -> Self {
@@ -108,6 +111,10 @@ impl NtError {
                 "файл отсутствует на диске"
             )),
             ERROR_PENDING | ERROR_BUSY => Some(tr!("operation is busy", "операция занята")),
+            ERROR_OUTSIDE_TREE => Some(tr!(
+                "object lies outside the folder being removed (a link was swapped in)",
+                "объект оказался вне удаляемой папки (по пути подменили ссылку)"
+            )),
             _ => None,
         };
         match known {

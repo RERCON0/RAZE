@@ -148,6 +148,63 @@ pub fn attributes(handle: &OwnedHandle) -> Result<Attributes, NtError> {
     })
 }
 
+/// Окончательный путь объекта по его дескриптору: промежуточные junction и
+/// symlink раскрыты, 8.3-имена и регистр приведены к тем, что лежат на диске.
+/// Дескриптор открыт с `OPEN_REPARSE_POINT`, поэтому у самой ссылки это путь
+/// ссылки, а не её цели.
+pub fn final_path(handle: &OwnedHandle) -> Option<Vec<u16>> {
+    use windows::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, VOLUME_NAME_DOS};
+    let mut buffer = vec![0u16; 1024];
+    for _ in 0..2 {
+        let written = unsafe { GetFinalPathNameByHandleW(handle.raw(), &mut buffer, VOLUME_NAME_DOS) } as usize;
+        if written == 0 {
+            return None;
+        }
+        if written < buffer.len() {
+            buffer.truncate(written);
+            return Some(buffer);
+        }
+        // Не поместилось: функция вернула нужный размер вместе с NUL.
+        buffer = vec![0u16; written + 1];
+    }
+    None
+}
+
+/// Корень удаляемого дерева, как он лежит на диске. Каждый объект, который
+/// собираются удалить, должен лежать внутри него — иначе между обходом и
+/// удалением каталог подменили на junction, и удаление ушло бы в чужое дерево.
+/// Проверка идёт по дескриптору, который затем и удаляется, поэтому между
+/// «проверили» и «удалили» подменить уже нечего.
+#[derive(Clone, Debug)]
+pub struct Containment {
+    root: Vec<u16>,
+}
+
+impl Containment {
+    /// `Ok(None)` — файловая система не умеет отдавать окончательный путь:
+    /// защиту включить нечем, и это не повод отказывать в удалении всему тому.
+    pub fn new(root: &NtPath) -> Result<Option<Self>, NtError> {
+        let handle = open_with(root, FILE_READ_ATTRIBUTES, object_flags())?;
+        Ok(final_path(&handle).map(|root| Self { root }))
+    }
+
+    pub fn holds(&self, handle: &OwnedHandle) -> bool {
+        match final_path(handle) {
+            Some(path) => self.contains(&path),
+            None => false,
+        }
+    }
+
+    /// Лежит ли `path` в корне или под ним. Граница — разделитель компонента:
+    /// `\\?\C:\ab` не принадлежит дереву `\\?\C:\a`.
+    fn contains(&self, path: &[u16]) -> bool {
+        const BSLASH: u16 = b'\\' as u16;
+        let root = self.root.as_slice();
+        path.starts_with(root)
+            && (path.len() == root.len() || path[root.len()] == BSLASH || root.last() == Some(&BSLASH))
+    }
+}
+
 /// Снимает атрибут «только чтение» прямо через дескриптор. Обычный
 /// `SetFileAttributesW` не работает с путями, которые не проходят разбор
 /// имени, — то есть ровно с теми, ради которых существует RAZE.
@@ -184,4 +241,31 @@ pub fn last_write_time(path: &NtPath) -> Option<std::time::SystemTime> {
     Some(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(
         (ft.dwHighDateTime as u64) << 32 | ft.dwLowDateTime as u64,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+
+    #[test]
+    fn containment_respects_component_boundaries() {
+        let guard = Containment { root: wide(r"\\?\C:\a") };
+        assert!(guard.contains(&wide(r"\\?\C:\a")));
+        assert!(guard.contains(&wide(r"\\?\C:\a\b\c")));
+        assert!(!guard.contains(&wide(r"\\?\C:\ab")), "похожий сосед не принадлежит дереву");
+        assert!(!guard.contains(&wide(r"\\?\C:\")));
+        assert!(!guard.contains(&wide(r"\\?\D:\a\b")));
+    }
+
+    #[test]
+    fn final_path_resolves_a_real_object() {
+        let dir = std::env::temp_dir();
+        let handle = open_for_read(&NtPath::new(&dir).unwrap()).unwrap();
+        let path = String::from_utf16_lossy(&final_path(&handle).expect("final path"));
+        assert!(path.starts_with(r"\\?\"), "{path}");
+    }
 }

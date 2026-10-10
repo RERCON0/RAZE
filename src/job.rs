@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 use crate::engine::path::NtPath;
+use crate::engine::privs;
 use crate::engine::recycle::{self, Disposition, RecycleVerdict};
 use crate::engine::remove::{self, Note, Outcome, RemoveOptions};
 use crate::engine::scan::{self, Entry, ScanOptions, ScanSummary};
@@ -113,6 +114,10 @@ pub struct TargetSummary {
 
 /// Разбирает список путей и сканирует каждый. Ничего не удаляет.
 pub fn plan(paths: &[PathBuf], options: &Options) -> Vec<Target> {
+    // Привилегии нужны уже при планировании: без Backup/Restore повышенный
+    // процесс не откроет даже корень папки с чужим ACL, и план покажет «пусто».
+    // Включение запоминается, повторные вызовы ничего не стоят.
+    privs::enable_backup_restore();
     let mut targets = Vec::new();
     for raw in paths {
         let display = raw.to_string_lossy().to_string();
@@ -141,7 +146,18 @@ pub fn plan(paths: &[PathBuf], options: &Options) -> Vec<Target> {
                 .to_string(),
             }
         } else {
-            recycle::is_recyclable(&path)
+            let mut verdict = recycle::is_recyclable(&path);
+            // Предел Корзины тома зависит от размера, а он известен только после
+            // обхода: объект больше предела оболочка удалила бы молча.
+            if verdict.reusable {
+                if let Some(reason) = recycle::bin_settings(&path).refusal(summary.bytes) {
+                    verdict = RecycleVerdict {
+                        reusable: false,
+                        reason,
+                    };
+                }
+            }
+            verdict
         };
         targets.push(Target {
             display: path.to_string_lossy(),
@@ -224,6 +240,16 @@ pub fn execute(targets: &[Target], options: &Options) -> Report {
         let Some(path) = target.path.as_ref() else {
             continue;
         };
+        // План мог лежать в окне минутами, а путь за это время — стать другим
+        // (родитель подменён ссылкой, папку переименовали). Запретные места
+        // проверяются заново перед самим удалением, а не только при разборе.
+        if let Err(reason) = protect::check(path) {
+            report.refused.push(Refused {
+                path: target.display.clone(),
+                reason: reason.message(),
+            });
+            continue;
+        }
 
         let mut target_report = TargetReport {
             path: target.display.clone(),
@@ -286,11 +312,15 @@ fn absorb(target: &mut TargetReport, outcome: Outcome) {
     target.failures.extend(outcome.failures);
 }
 
-/// Готова ли задача к запуску: есть хоть что-то удаляемое.
+/// Готова ли задача к запуску: есть хоть что-то удаляемое. Пустая папка тоже
+/// работа: в счётчиках её содержимого нули, но сама она есть и подлежит
+/// удалению (раньше `raze` молча выходил, не тронув пустую «зависшую» папку).
 pub fn has_work(targets: &[Target]) -> bool {
-    targets
-        .iter()
-        .any(|t| t.refused.is_none() && (t.summary.files + t.summary.directories + t.summary.links) > 0)
+    targets.iter().any(|t| {
+        t.refused.is_none()
+            && ((t.summary.files + t.summary.directories + t.summary.links) > 0
+                || t.path.as_ref().is_some_and(remove::present))
+    })
 }
 
 #[cfg(test)]
@@ -363,6 +393,48 @@ mod tests {
         assert!(!file.exists());
         assert!(base.exists(), "удаляется файл, а не его папка");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_empty_folder_is_work_and_is_removed() {
+        // Регрессия: у пустой папки в плане нули, `has_work` был ложным, и
+        // удалить её было нечем.
+        let base = scratch("empty-folder");
+        let empty = base.join("stuck");
+        std::fs::create_dir_all(&empty).unwrap();
+        let options = Options {
+            permanent: true,
+            ..Default::default()
+        };
+
+        let targets = plan(&[empty.clone()], &options);
+        assert!(has_work(&targets));
+        let report = execute(&targets, &options);
+        assert!(!report.failed(), "{:?}", report.targets);
+        assert!(!empty.exists());
+
+        // А несуществующая цель — не работа.
+        assert!(!has_work(&plan(&[empty], &options)));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn execute_checks_the_protected_places_again() {
+        // План собран, а путь потом стал запретным: удаление не должно
+        // полагаться на проверку, сделанную при разборе.
+        let windows = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+        let forged = Target {
+            display: format!("{windows}\\System32"),
+            path: Some(NtPath::new(std::path::Path::new(&format!("{windows}\\System32"))).unwrap()),
+            entries: Vec::new(),
+            summary: ScanSummary::default(),
+            verdict: RecycleVerdict { reusable: false, reason: String::new() },
+            refused: None,
+        };
+        let options = Options { dry_run: true, ..Default::default() };
+        let report = execute(&[forged], &options);
+        assert_eq!(report.refused.len(), 1);
+        assert!(report.targets.is_empty());
     }
 
     #[test]

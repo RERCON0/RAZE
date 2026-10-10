@@ -11,7 +11,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 
 use super::error::{NtError, nt};
-use super::path::{NtPath, Wide};
+use super::path::NtPath;
 
 #[derive(Clone, Debug)]
 pub struct Child {
@@ -30,7 +30,7 @@ const PARENT: &[u16] = &[b'.' as u16, b'.' as u16];
 /// вызывающий решает сам, что с этим делать (в обходе это «пропустить»,
 /// в удалении — «записать отказ»).
 pub fn children(dir: &NtPath) -> Result<Vec<Child>, NtError> {
-    let pattern = dir.ext().join(&Wide::new("*").as_slice().to_vec());
+    let pattern = dir.ext().join(&[b'*' as u16]);
     let mut data = WIN32_FIND_DATAW::default();
     let handle = nt(unsafe {
         FindFirstFileExW(
@@ -54,15 +54,19 @@ pub fn children(dir: &NtPath) -> Result<Vec<Child>, NtError> {
             });
         }
         data = WIN32_FIND_DATAW::default();
-        if nt(unsafe { FindNextFileW(handle, &mut data) }).is_err() {
-            break;
+        if let Err(error) = nt(unsafe { FindNextFileW(handle, &mut data) }) {
+            unsafe {
+                let _ = FindClose(handle);
+            }
+            // Нормальный конец списка — ERROR_NO_MORE_FILES. Всё остальное
+            // (отказ посреди каталога, обрыв сети) раньше тоже означало «конец»,
+            // и недочитанный каталог выдавался за полностью прочитанный.
+            return if error.code() == ERROR_NO_MORE_FILES { Ok(out) } else { Err(error) };
         }
     }
-    unsafe {
-        let _ = FindClose(handle);
-    }
-    Ok(out)
 }
+
+const ERROR_NO_MORE_FILES: u32 = 18;
 
 fn name_of(data: &WIN32_FIND_DATAW) -> &[u16] {
     let end = data

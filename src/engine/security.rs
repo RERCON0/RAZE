@@ -18,8 +18,8 @@ use windows::Win32::Security::Authorization::{
 };
 use windows::core::PWSTR;
 
-use super::error::NtError;
-use super::handle::{OwnedHandle, open_with, security_access};
+use super::error::{ERROR_OUTSIDE_TREE, NtError};
+use super::handle::{Containment, OwnedHandle, open_with, security_access};
 use super::path::{NtPath, Wide};
 use super::privs;
 
@@ -68,8 +68,18 @@ impl Drop for LocalSid {
     }
 }
 
+/// Объект должен лежать в удаляемом дереве. Права и владельца нельзя менять
+/// у того, что оказалось снаружи: иначе подмена каталога на junction дала бы
+/// возможность забрать чужой системный файл, а не только удалить его.
+fn ensure_inside(handle: &OwnedHandle, guard: Option<&Containment>) -> Result<(), NtError> {
+    match guard {
+        Some(guard) if !guard.holds(handle) => Err(NtError(ERROR_OUTSIDE_TREE)),
+        _ => Ok(()),
+    }
+}
+
 /// Перехватывает объект и назначает владельцем текущего пользователя.
-pub fn take_ownership(path: &NtPath) -> Result<(), NtError> {
+pub fn take_ownership(path: &NtPath, guard: Option<&Containment>) -> Result<(), NtError> {
     let _ = privs::enable_take_ownership();
     let owner = privs::current_user_sid()?;
     // С привилегией достаточно права только на смену владельца; DELETE
@@ -82,20 +92,11 @@ pub fn take_ownership(path: &NtPath) -> Result<(), NtError> {
         windows::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS
             | windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
     )?;
+    ensure_inside(&handle, guard)?;
+    // Раньше здесь стоял `GetSecurityInfo(OWNER)`: результат нигде не
+    // использовался, а читать владельца без READ_CONTROL нельзя, так что вызов
+    // мог только провалить смену владельца отказом в доступе.
     unsafe {
-        GetSecurityInfo(
-            handle.raw(),
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .ok()
-        .map_err(|_| NtError::last())?;
-
         SetSecurityInfo(
             handle.raw(),
             SE_FILE_OBJECT,
@@ -113,9 +114,10 @@ pub fn take_ownership(path: &NtPath) -> Result<(), NtError> {
 /// Добавляет в DACL полный доступ для текущего пользователя, SYSTEM и
 /// администраторов, **не трогая** уже существующие записи: файлы часто
 /// наследуют права от родителя, и сбрасывать их целиком нельзя.
-pub fn grant_full_control(path: &NtPath) -> Result<(), NtError> {
+pub fn grant_full_control(path: &NtPath, guard: Option<&Containment>) -> Result<(), NtError> {
     let _ = privs::enable_take_ownership();
     let handle: OwnedHandle = open_with(path, security_access(), backup_semantics())?;
+    ensure_inside(&handle, guard)?;
 
     // SID-ы живут до конца вызова: SetEntriesInAclW читает их по указателям
     // из TRUSTEE_W, поэтому освобождать раньше времени нельзя.

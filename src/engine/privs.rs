@@ -6,6 +6,7 @@
 //! Права меняются отдельным осознанным шагом в [`super::security`].
 
 use std::mem;
+use std::sync::OnceLock;
 
 use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
 use windows::Win32::Security::{
@@ -30,7 +31,9 @@ pub fn enable(name: &str) -> Result<(), NtError> {
     let mut luid = windows::Win32::Foundation::LUID::default();
     unsafe { nt(LookupPrivilegeValueW(None, name.pc(), &mut luid)) }?;
 
-    let token = unsafe { open_process_token()? };
+    // Дескриптор токена закрывается сам: раньше он утекал при каждом вызове, а
+    // вызывали его на каждый объект, у которого менялись права.
+    let token = unsafe { TokenHandle(open_process_token()?) };
     let privileges = TOKEN_PRIVILEGES {
         PrivilegeCount: 1,
         Privileges: [LUID_AND_ATTRIBUTES {
@@ -40,7 +43,7 @@ pub fn enable(name: &str) -> Result<(), NtError> {
     };
     unsafe {
         nt(AdjustTokenPrivileges(
-            token,
+            token.0,
             false,
             Some(&privileges),
             mem::size_of::<TOKEN_PRIVILEGES>() as u32,
@@ -58,16 +61,27 @@ pub fn enable(name: &str) -> Result<(), NtError> {
 /// Включает пару привилегий, нужных почти каждому «трудному» удалению.
 /// Частичный успех — не ошибка: у непривилегированного процесса их может не
 /// быть вовсе, и тогда просто останется ACCESS_DENIED.
+///
+/// Привилегия включается в токене процесса один раз и дальше не меняется, так
+/// что результат запоминается: иначе каждый объект платил бы четырьмя
+/// системными вызовами за то, что уже сделано.
 pub fn enable_backup_restore() -> bool {
-    let se_backup = enable(SE_BACKUP).is_ok();
-    let se_restore = enable(SE_RESTORE).is_ok();
-    se_backup || se_restore
+    static RESULT: OnceLock<bool> = OnceLock::new();
+    *RESULT.get_or_init(|| {
+        let se_backup = enable(SE_BACKUP).is_ok();
+        let se_restore = enable(SE_RESTORE).is_ok();
+        se_backup || se_restore
+    })
 }
 
 pub fn enable_take_ownership() -> bool {
-    enable(SE_TAKE_OWNERSHIP).is_ok()
+    static RESULT: OnceLock<bool> = OnceLock::new();
+    *RESULT.get_or_init(|| enable(SE_TAKE_OWNERSHIP).is_ok())
 }
 
+/// # Safety
+/// Возвращённый дескриптор принадлежит вызывающему: его нужно закрыть
+/// (`CloseHandle`), например обернув в [`TokenHandle`].
 pub unsafe fn open_process_token() -> Result<HANDLE, NtError> {
     let mut token = HANDLE::default();
     nt(OpenProcessToken(

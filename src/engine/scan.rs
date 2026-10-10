@@ -15,7 +15,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 
 use super::dir;
-use super::handle::{Attributes, attributes, open_for_delete, open_for_read};
+use super::handle::{attributes, open_for_delete, open_for_read};
 use super::locker::{self, Holder};
 use super::path::{LONG_PATH_WARN, NtPath, is_reserved_component_wide};
 
@@ -328,22 +328,26 @@ fn scan_leaf(root: &NtPath, attributes: u32, size: u64, options: &ScanOptions) -
 /// проверяет доступ и держателей.
 fn probe(entry: Entry, options: &ScanOptions) -> Entry {
     let mut entry = entry;
-    if let Ok(handle) = open_for_delete(&entry.nt_path) {
-        if let Ok(attrs) = attributes(&handle) {
-            entry.attributes = attrs.attributes;
-            entry.reparse_tag = attrs.reparse_tag;
-            if matches!(entry.kind, EntryKind::Link) {
-                entry.blockers.retain(|b| !matches!(b, Blocker::ReparsePoint { .. }));
-                entry.blockers.push(Blocker::ReparsePoint {
-                    tag: attrs.reparse_tag,
-                });
+    // Проверка доступа — это открытие каждого объекта на удаление: на дереве в
+    // сотни тысяч файлов самая дорогая часть плана. Опция существовала, но
+    // никем не читалась; при ошибке файл к тому же открывался второй раз.
+    if options.probe_access {
+        match open_for_delete(&entry.nt_path) {
+            Ok(handle) => {
+                if let Ok(attrs) = attributes(&handle) {
+                    entry.attributes = attrs.attributes;
+                    entry.reparse_tag = attrs.reparse_tag;
+                    if matches!(entry.kind, EntryKind::Link) {
+                        entry.blockers.retain(|b| !matches!(b, Blocker::ReparsePoint { .. }));
+                        entry.blockers.push(Blocker::ReparsePoint {
+                            tag: attrs.reparse_tag,
+                        });
+                    }
+                }
             }
-        }
-    } else if let Err(error) = open_for_delete(&entry.nt_path) {
-        if error.access_denied() {
-            entry.blockers.push(Blocker::AccessDenied);
-        } else if !error.not_found() {
-            entry.blockers.push(Blocker::Unreadable { code: error.code() });
+            Err(error) if error.access_denied() => entry.blockers.push(Blocker::AccessDenied),
+            Err(error) if error.not_found() => {}
+            Err(error) => entry.blockers.push(Blocker::Unreadable { code: error.code() }),
         }
     }
 
@@ -395,9 +399,8 @@ fn reserved_component(path: &NtPath) -> Option<String> {
 
 fn extended_root_len(path: &NtPath) -> usize {
     let text = path.ext().to_string_lossy();
-    if text.starts_with("\\\\?\\UNC\\") {
+    if let Some(rest) = text.strip_prefix("\\\\?\\UNC\\") {
         // \\?\UNC\server\share — корень заканчивается после имени шары.
-        let rest = &text[8..];
         match rest.find('\\') {
             Some(pos) => 8 + pos + 1,
             None => text.len(),
@@ -423,10 +426,7 @@ fn find_data_name(data: &windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW) 
 /// Быстрая проверка одного пути без полного обхода — для контекстного меню и
 /// для проверки «а что вообще выбрано».
 pub fn probe_single(path: &NtPath, options: &ScanOptions) -> Option<Entry> {
-    let data = match attributes(&open_for_delete(path).ok()?) {
-        Ok(attrs) => attrs,
-        Err(_) => Attributes::default(),
-    };
+    let data = attributes(&open_for_delete(path).ok()?).unwrap_or_default();
     let name = path
         .to_string_lossy()
         .rsplit('\\')

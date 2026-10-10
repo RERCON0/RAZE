@@ -18,6 +18,9 @@ use windows::Win32::UI::Shell::{
     SHFileOperationW, SHFILEOPSTRUCTW,
 };
 
+use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+use winreg::RegKey;
+
 use super::error::NtError;
 use super::handle::open_with;
 use super::path::{MAX_PATH, NtPath, Wide};
@@ -106,10 +109,101 @@ pub fn is_recyclable(path: &NtPath) -> RecycleVerdict {
             .to_string(),
         };
     }
+    // Размер здесь неизвестен: предел Корзины проверяет `job::plan`, когда
+    // дерево уже просканировано (`BinSettings::refusal`).
+    if let Some(reason) = bin_settings(path).refusal(0) {
+        return RecycleVerdict {
+            reusable: false,
+            reason,
+        };
+    }
     RecycleVerdict {
         reusable: true,
         reason: String::new(),
     }
+}
+
+const BITBUCKET: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket";
+const EXPLORER_POLICY: &str = r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer";
+
+/// Настройки Корзины, по которым оболочка **молча** удаляет насовсем: при
+/// `FOF_NOCONFIRMATION` она не спрашивает, и отчёт «ушло в Корзину» был бы
+/// неправдой. Читаются только твёрдо известные значения; не нашли — значит,
+/// ограничений нет.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BinSettings {
+    /// «Не перемещать файлы в Корзину» — для тома или политикой.
+    pub nuke_on_delete: bool,
+    /// Предельный размер Корзины тома в мегабайтах.
+    pub max_megabytes: Option<u32>,
+}
+
+impl BinSettings {
+    /// Читает настройки тома `guid` (вида `{xxxxxxxx-…}`). Корни и пути ключей
+    /// передаются параметрами, чтобы тест мог работать во временной ветке.
+    fn read(user: &RegKey, machine: &RegKey, bitbucket: &str, policy: &str, guid: &str) -> Self {
+        let flag = |key: &RegKey, name: &str| key.get_value::<u32, _>(name).map(|v| v != 0).unwrap_or(false);
+        let mut settings = Self::default();
+        for root in [user, machine] {
+            if let Ok(key) = root.open_subkey(policy) {
+                settings.nuke_on_delete |= flag(&key, "NoRecycleFiles");
+            }
+        }
+        if let Ok(key) = user.open_subkey(format!(r"{bitbucket}\Volume\{guid}")) {
+            settings.nuke_on_delete |= flag(&key, "NukeOnDelete");
+            settings.max_megabytes = key.get_value::<u32, _>("MaxCapacity").ok().filter(|mb| *mb > 0);
+        }
+        settings
+    }
+
+    /// Почему оболочка не положила бы `bytes` в Корзину, а удалила бы сразу.
+    pub fn refusal(&self, bytes: u64) -> Option<String> {
+        use crate::tr;
+        if self.nuke_on_delete {
+            return Some(
+                tr!(
+                    "the Recycle Bin is set to delete immediately on this drive",
+                    "для этого диска Корзина настроена на немедленное удаление"
+                )
+                .to_string(),
+            );
+        }
+        match self.max_megabytes {
+            Some(limit) if bytes > u64::from(limit) * 1024 * 1024 => Some(tr_format!(
+                "{size} is over the Recycle Bin limit of {limit} MB for this drive",
+                "{size} больше предела Корзины этого диска ({limit} МБ)",
+                size = crate::report::human_bytes(bytes),
+                limit = limit
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// GUID тома, на котором лежит путь: ключ настроек Корзины называется им.
+fn volume_guid(path: &NtPath) -> Option<String> {
+    use windows::Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW;
+
+    let root = Wide::new(&format!("{}\\", path.root()));
+    let mut buffer = [0u16; 64];
+    unsafe { GetVolumeNameForVolumeMountPointW(root.pc(), &mut buffer) }.ok()?;
+    let end = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
+    let text = String::from_utf16_lossy(&buffer[..end]);
+    let (start, stop) = (text.find('{')?, text.find('}')?);
+    text.get(start..=stop).map(str::to_string)
+}
+
+pub fn bin_settings(path: &NtPath) -> BinSettings {
+    let Some(guid) = volume_guid(path) else {
+        return BinSettings::default();
+    };
+    BinSettings::read(
+        &RegKey::predef(HKEY_CURRENT_USER),
+        &RegKey::predef(HKEY_LOCAL_MACHINE),
+        BITBUCKET,
+        EXPLORER_POLICY,
+        &guid,
+    )
 }
 
 /// Отправляет пути в Корзину. Возвращает `Ok(false)`, если оболочка отказала
@@ -246,6 +340,49 @@ mod tests {
         assert!(!verdict.reusable);
         assert!(verdict.reason.contains("NUL"));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_shell_would_delete_silently_in_these_cases_and_we_say_so() {
+        let machine = RegKey::predef(HKEY_LOCAL_MACHINE);
+        let user = RegKey::predef(HKEY_CURRENT_USER);
+        let scratch = format!(r"Software\RAZE.Tests\bin-{}", std::process::id());
+        let guid = "{11111111-2222-3333-4444-555555555555}";
+        let bitbucket = format!(r"{scratch}\BitBucket");
+        let policy = format!(r"{scratch}\Policy");
+
+        // Ничего не задано — ограничений нет.
+        assert_eq!(BinSettings::read(&user, &machine, &bitbucket, &policy, guid), BinSettings::default());
+        assert!(BinSettings::default().refusal(u64::MAX).is_none());
+
+        // Предел Корзины тома: 100 МБ.
+        let (volume, _) = user.create_subkey(format!(r"{bitbucket}\Volume\{guid}")).unwrap();
+        volume.set_value("MaxCapacity", &100u32).unwrap();
+        let settings = BinSettings::read(&user, &machine, &bitbucket, &policy, guid);
+        assert_eq!(settings.max_megabytes, Some(100));
+        assert!(settings.refusal(99 * 1024 * 1024).is_none());
+        assert!(settings.refusal(101 * 1024 * 1024).is_some());
+
+        // «Не перемещать файлы в Корзину» — отказ при любом размере.
+        volume.set_value("NukeOnDelete", &1u32).unwrap();
+        let settings = BinSettings::read(&user, &machine, &bitbucket, &policy, guid);
+        assert!(settings.nuke_on_delete);
+        assert!(settings.refusal(0).is_some());
+
+        // То же самое политикой.
+        volume.set_value("NukeOnDelete", &0u32).unwrap();
+        let (policy_key, _) = user.create_subkey(&policy).unwrap();
+        policy_key.set_value("NoRecycleFiles", &1u32).unwrap();
+        assert!(BinSettings::read(&user, &machine, &bitbucket, &policy, guid).nuke_on_delete);
+
+        let _ = user.delete_subkey_all(r"Software\RAZE.Tests");
+    }
+
+    #[test]
+    fn a_real_volume_has_a_guid() {
+        let dir = NtPath::new(&std::env::temp_dir()).unwrap();
+        let guid = volume_guid(&dir).expect("the volume of %TEMP% has a GUID name");
+        assert!(guid.starts_with('{') && guid.ends_with('}'), "{guid}");
     }
 
     #[test]
