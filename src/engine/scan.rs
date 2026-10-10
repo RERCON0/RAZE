@@ -15,7 +15,7 @@ use windows::Win32::Storage::FileSystem::{
 };
 
 use super::dir;
-use super::handle::{Attributes, attributes, open_for_delete};
+use super::handle::{Attributes, attributes, open_for_delete, open_for_read};
 use super::locker::{self, Holder};
 use super::path::{LONG_PATH_WARN, NtPath, is_reserved_component_wide};
 
@@ -163,6 +163,12 @@ pub struct ScanSummary {
 /// Рекурсивный обход без рекурсии в стеке: глубина в Windows ограничена
 /// только стеком, а нам не хочется его исчерпывать на пути в 200 компонентов.
 pub fn scan(root: &NtPath, options: &ScanOptions) -> (Vec<Entry>, ScanSummary) {
+    // Цель-файл или цель-ссылка: каталога нет, читать нечего. Раньше такая
+    // цель читалась как каталог и выглядела «нечитаемой папкой» из нуля
+    // объектов, поэтому удаление одиночного файла молча не запускалось.
+    if let Some((attributes, size)) = root_leaf(root) {
+        return scan_leaf(root, attributes, size, options);
+    }
     let mut entries = Vec::new();
     let mut summary = ScanSummary::default();
     let mut stack = vec![(root.clone(), 0usize)];
@@ -187,50 +193,16 @@ pub fn scan(root: &NtPath, options: &ScanOptions) -> (Vec<Entry>, ScanSummary) {
             }
         };
         for child in children {
-            let name = child.name;
-            let attributes = child.attributes;
-            let path = dir.child_raw(&name);
-            let kind = classify(attributes);
-            let is_dir = matches!(kind, EntryKind::Directory);
-            let size = if matches!(kind, EntryKind::File) {
-                child.size
-            } else {
-                0
-            };
-            let mut blockers = Vec::new();
-            if let Some(component) = reserved_component(&path) {
-                blockers.push(Blocker::ReservedName { component });
-            }
-            if path.plain_len() >= LONG_PATH_WARN {
-                blockers.push(Blocker::LongPath {
-                    length: path.plain_len(),
-                });
-            }
-            if attributes & FILE_ATTRIBUTE_READONLY.0 != 0 {
-                blockers.push(Blocker::ReadOnly);
-            }
-            if attributes & FILE_ATTRIBUTE_SYSTEM.0 != 0 {
-                blockers.push(Blocker::System);
-            }
-            if attributes & FILE_ATTRIBUTE_HIDDEN.0 != 0 {
-                blockers.push(Blocker::Hidden);
-            }
-            if matches!(kind, EntryKind::Link) {
-                blockers.push(Blocker::ReparsePoint { tag: 0 });
-            }
-
-            let entry = Entry {
-                nt_path: path.clone(),
-                path: path.to_path(),
-                name: String::from_utf16_lossy(&name),
+            let path = dir.child_raw(&child.name);
+            let is_dir = matches!(classify(child.attributes), EntryKind::Directory);
+            let entry = make_entry(
+                path.clone(),
+                String::from_utf16_lossy(&child.name),
                 depth,
-                kind,
-                size,
-                attributes,
-                reparse_tag: 0,
-                blockers,
-            };
-            let entry = probe(entry, options);
+                child.attributes,
+                child.size,
+                options,
+            );
             match entry.kind {
                 EntryKind::File => summary.files += 1,
                 EntryKind::Directory => summary.directories += 1,
@@ -257,6 +229,99 @@ pub fn scan(root: &NtPath, options: &ScanOptions) -> (Vec<Entry>, ScanSummary) {
     }
 
     (entries, summary)
+}
+
+/// Запись об одном объекте со всеми пометками. Одна и та же для детей
+/// каталога и для цели-файла, чтобы они не расходились.
+fn make_entry(
+    path: NtPath,
+    name: String,
+    depth: usize,
+    attributes: u32,
+    size: u64,
+    options: &ScanOptions,
+) -> Entry {
+    let kind = classify(attributes);
+    let size = if matches!(kind, EntryKind::File) { size } else { 0 };
+    let mut blockers = Vec::new();
+    if let Some(component) = reserved_component(&path) {
+        blockers.push(Blocker::ReservedName { component });
+    }
+    if path.plain_len() >= LONG_PATH_WARN {
+        blockers.push(Blocker::LongPath {
+            length: path.plain_len(),
+        });
+    }
+    if attributes & FILE_ATTRIBUTE_READONLY.0 != 0 {
+        blockers.push(Blocker::ReadOnly);
+    }
+    if attributes & FILE_ATTRIBUTE_SYSTEM.0 != 0 {
+        blockers.push(Blocker::System);
+    }
+    if attributes & FILE_ATTRIBUTE_HIDDEN.0 != 0 {
+        blockers.push(Blocker::Hidden);
+    }
+    if matches!(kind, EntryKind::Link) {
+        blockers.push(Blocker::ReparsePoint { tag: 0 });
+    }
+    probe(
+        Entry {
+            nt_path: path.clone(),
+            path: path.to_path(),
+            name,
+            depth,
+            kind,
+            size,
+            attributes,
+            reparse_tag: 0,
+            blockers,
+        },
+        options,
+    )
+}
+
+/// Атрибуты и размер цели, если это файл или ссылка. У каталога обход
+/// нужен, поэтому `None`; `None` и когда цель не открылась — обход сам
+/// доложит «нет такого пути» или отказ в доступе.
+fn root_leaf(root: &NtPath) -> Option<(u32, u64)> {
+    use windows::Win32::Storage::FileSystem::{
+        FileStandardInfo, GetFileInformationByHandleEx, FILE_STANDARD_INFO,
+    };
+    let handle = open_for_read(root).ok()?;
+    let attrs = attributes(&handle).ok()?;
+    if classify(attrs.attributes) == EntryKind::Directory {
+        return None;
+    }
+    let mut info = FILE_STANDARD_INFO::default();
+    let sized = unsafe {
+        GetFileInformationByHandleEx(
+            handle.raw(),
+            FileStandardInfo,
+            &mut info as *mut _ as *mut _,
+            std::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    }
+    .is_ok();
+    Some((attrs.attributes, if sized { info.EndOfFile as u64 } else { 0 }))
+}
+
+/// Цель — один файл или одна ссылка: в плане ровно один объект.
+fn scan_leaf(root: &NtPath, attributes: u32, size: u64, options: &ScanOptions) -> (Vec<Entry>, ScanSummary) {
+    let name = root
+        .to_path()
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.to_string_lossy());
+    let entry = make_entry(root.clone(), name, 0, attributes, size, options);
+    let mut summary = ScanSummary::default();
+    match entry.kind {
+        EntryKind::File => summary.files = 1,
+        EntryKind::Directory => summary.directories = 1,
+        EntryKind::Link => summary.links = 1,
+    }
+    summary.bytes = entry.size;
+    summary.troubled = usize::from(entry.has_trouble());
+    (vec![entry], summary)
 }
 
 /// Достраивает запись реальными атрибутами из дескриптора и, если попросили,
@@ -436,6 +501,27 @@ mod tests {
                 }
             });
         }
+    }
+
+    #[test]
+    fn a_single_file_target_is_one_file_not_an_unreadable_folder() {
+        let dir = std::env::temp_dir().join(format!("raze-scan-leaf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("one.txt");
+        std::fs::write(&file, b"hello").unwrap();
+
+        let (entries, summary) = scan(&NtPath::new(&file).unwrap(), &ScanOptions::default());
+        assert_eq!((summary.files, summary.directories, summary.links), (1, 0, 0));
+        assert_eq!(summary.bytes, 5);
+        assert!(!summary.truncated);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "one.txt");
+        assert!(!entries[0]
+            .blockers
+            .iter()
+            .any(|b| matches!(b, Blocker::Unreadable { .. })));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

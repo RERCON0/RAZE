@@ -341,6 +341,31 @@ mod tests {
     }
 
     #[test]
+    fn a_single_file_target_is_planned_and_removed() {
+        // Регрессия: файл-цель читался как «нечитаемая папка» из нуля
+        // объектов, `has_work` был ложным, и удаление не запускалось.
+        let base = scratch("single-file");
+        let file = base.join("one.bin");
+        std::fs::write(&file, b"hello").unwrap();
+        let options = Options {
+            permanent: true,
+            ..Default::default()
+        };
+
+        let targets = plan(&[file.clone()], &options);
+        assert_eq!(targets[0].summary.files, 1);
+        assert_eq!(targets[0].summary.directories, 0);
+        assert_eq!(targets[0].summary.bytes, 5);
+        assert!(has_work(&targets));
+
+        let report = execute(&targets, &options);
+        assert!(!report.failed(), "{:?}", report.targets);
+        assert!(!file.exists());
+        assert!(base.exists(), "удаляется файл, а не его папка");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn summary_lists_problems_by_name() {
         let base = scratch("problems");
         std::fs::create_dir_all(base.join("sub")).unwrap();
