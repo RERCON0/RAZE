@@ -393,9 +393,21 @@ fn spawn_raze(paths: &[PathBuf]) {
     let Some(exe) = module_path().map(|dll| dll.with_file_name(RAZE_EXE)) else {
         return;
     };
+    // Командная строка `CreateProcessW` ограничена 32 767 символами. Все пути
+    // выделения в одной строке при большом выделении не помещаются, и клик по
+    // пункту меню молча ничего не запускал. Пути делятся на пакеты; каждый пакет
+    // — отдельный `raze.exe`.
+    for batch in batches(&exe, paths) {
+        launch(&command_line(&exe, batch));
+    }
+}
 
+/// Запас под предел `CreateProcessW` (32 767 символов с завершающим нулём).
+const MAX_COMMAND_UNITS: usize = 30_000;
+
+fn command_line(exe: &Path, paths: &[PathBuf]) -> Vec<u16> {
     let mut command: Vec<u16> = Vec::new();
-    push_quoted(&mut command, &exe);
+    push_quoted(&mut command, exe);
     for unit in " --from-shell".encode_utf16() {
         command.push(unit);
     }
@@ -406,7 +418,35 @@ fn spawn_raze(paths: &[PathBuf]) {
         push_quoted(&mut command, path);
     }
     command.push(0);
+    command
+}
 
+/// Делит пути на пакеты, каждый из которых помещается в командную строку.
+/// Один путь, который не помещается и сам по себе, получает свой пакет:
+/// длиннее предела NTFS (32 767) он быть не может.
+fn batches<'a>(exe: &Path, paths: &'a [PathBuf]) -> Vec<&'a [PathBuf]> {
+    let base = command_line(exe, &[]).len();
+    let mut out = Vec::new();
+    let (mut start, mut used) = (0usize, base);
+    for (index, path) in paths.iter().enumerate() {
+        let mut one = Vec::new();
+        push_quoted(&mut one, path);
+        let cost = " --mode ".len() + one.len();
+        if index > start && used + cost > MAX_COMMAND_UNITS {
+            out.push(&paths[start..index]);
+            start = index;
+            used = base;
+        }
+        used += cost;
+    }
+    if start < paths.len() {
+        out.push(&paths[start..]);
+    }
+    out
+}
+
+fn launch(command: &[u16]) {
+    let mut command = command.to_vec();
     let startup = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
         ..Default::default()
@@ -505,6 +545,26 @@ mod tests {
         let mut command = Vec::new();
         push_quoted(&mut command, Path::new(r"C:\we\"));
         assert_eq!(String::from_utf16_lossy(&command), r#""C:\we\\""#);
+    }
+
+    #[test]
+    fn a_large_selection_is_split_into_command_lines_that_fit() {
+        let exe = PathBuf::from(r"C:\Program Files\RAZE\raze.exe");
+        let paths: Vec<PathBuf> = (0..2000)
+            .map(|i| PathBuf::from(format!(r"C:\Users\name\Downloads\a long folder name {i}\{}", "x".repeat(60))))
+            .collect();
+        let parts = batches(&exe, &paths);
+        assert!(parts.len() > 1, "2000 long paths cannot fit one command line");
+        for part in &parts {
+            assert!(command_line(&exe, part).len() < 32_767);
+        }
+        // Ничего не потеряно и порядок сохранён.
+        let joined: Vec<&PathBuf> = parts.iter().flat_map(|p| p.iter()).collect();
+        assert_eq!(joined.len(), paths.len());
+        assert!(joined.iter().zip(&paths).all(|(a, b)| *a == b));
+        // Малое выделение — один процесс, пустое — ни одного.
+        assert_eq!(batches(&exe, &paths[..3]).len(), 1);
+        assert!(batches(&exe, &[]).is_empty());
     }
 
     #[test]

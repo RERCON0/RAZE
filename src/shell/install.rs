@@ -297,13 +297,70 @@ fn remove_modern(report: &mut InstallReport) {
     let dir = default_install_dir();
     // Каталог удаляем только если он действительно наш и там нечего терять.
     if dir.join("raze.exe").exists() {
-        match std::fs::remove_dir_all(&dir) {
-            Ok(()) => report.done(format!("removed {}", dir.display())),
-            Err(error) => report.failed(format!("remove {}", dir.display()), error.to_string()),
-        }
+        remove_install_dir(&dir, report);
     } else {
         report.skipped(format!("nothing to remove in {}", dir.display()));
     }
+}
+
+/// Удаляет каталог установки. Если снятие запущено из самой установленной
+/// копии, её `raze.exe` занят: удалить его нельзя, а остальные файлы уже ушли бы,
+/// оставив каталог с одним exe. Тогда остаток убирает отсоединённый `cmd` после
+/// завершения процесса.
+fn remove_install_dir(dir: &Path, report: &mut InstallReport) {
+    let own = std::env::current_exe().ok();
+    let running_from_here = own
+        .as_deref()
+        .and_then(Path::parent)
+        .is_some_and(|parent| parent.as_os_str().eq_ignore_ascii_case(dir.as_os_str()));
+    if !running_from_here {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => report.done(format!("removed {}", dir.display())),
+            Err(error) => report.failed(format!("remove {}", dir.display()), error.to_string()),
+        }
+        return;
+    }
+
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if Some(entry.path()) != own {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+    match spawn_delayed_removal(dir) {
+        Ok(()) => report.done(format!("{} will be removed as soon as this program exits", dir.display())),
+        Err(error) => report.skipped(format!(
+            "{} holds the running raze.exe and was not removed ({error}); delete the folder by hand",
+            dir.display()
+        )),
+    }
+}
+
+/// Отсоединённый `cmd` ждёт несколько секунд и удаляет каталог, когда процесс
+/// снятия уже завершился. Путь запрещённых кавычек не содержит (это Program Files).
+fn spawn_delayed_removal(dir: &Path) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    let text = dir.to_string_lossy();
+    if text.contains('"') || text.contains('&') {
+        return Err("unexpected characters in the install path".into());
+    }
+    let system = powershell_exe()
+        .ancestors()
+        .nth(3)
+        .map(Path::to_path_buf)
+        .ok_or("cannot locate the system folder")?;
+    // Строка идёт как есть (`raw_arg`): обычный `arg` заключил бы её в кавычки и
+    // экранировал внутренние как `\"`, а `cmd` такого не понимает и не запускался.
+    // `/S` велит снять внешние кавычки, внутренние остаются у пути.
+    Command::new(system.join("cmd.exe"))
+        .raw_arg(format!("/D /S /C \"ping -n 4 127.0.0.1 >nul & rmdir /S /Q \"{text}\"\""))
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 fn label() -> &'static str {
@@ -386,8 +443,23 @@ fn ensure_certificate_trusted(cert: &Path) -> Result<(), String> {
     }
 }
 
+/// Полный путь к Windows PowerShell из системного каталога. По имени
+/// `powershell` его искали бы по `PATH` и рабочему каталогу, а запускается он
+/// с правами администратора: чужой `powershell.exe` в начале `PATH` получил бы
+/// эти права.
+fn powershell_exe() -> PathBuf {
+    use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+    let mut buffer = [0u16; 260];
+    let length = unsafe { GetSystemDirectoryW(Some(&mut buffer)) } as usize;
+    if length == 0 || length >= buffer.len() {
+        return PathBuf::from("powershell");
+    }
+    PathBuf::from(String::from_utf16_lossy(&buffer[..length]))
+        .join(r"WindowsPowerShell\v1.0\powershell.exe")
+}
+
 fn run_powershell(script: &str) -> Result<String, String> {
-    let output = Command::new("powershell")
+    let output = Command::new(powershell_exe())
         .args(["-NoProfile", "-NonInteractive", "-Command", script])
         .output()
         .map_err(|e| e.to_string())?;
@@ -415,8 +487,9 @@ fn run_privileged_powershell(script: &str) -> Result<(), String> {
 fn run_elevated_powershell(script: &str) -> Result<(), String> {
     let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let launcher = format!(
-        "Start-Process -FilePath powershell.exe -Verb RunAs -Wait -WindowStyle Hidden \
+        "Start-Process -FilePath {} -Verb RunAs -Wait -WindowStyle Hidden \
          -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','{}'",
+        ps_quote(&powershell_exe()),
         base64(&utf16)
     );
     run_powershell(&launcher).map(|_| ())

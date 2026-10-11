@@ -262,7 +262,10 @@ fn dedupe(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 /// (один запрос на всё, включая доверие сертификату) и печатает отчёт
 /// повышенной копии, которая пишет его в файл.
 fn shell_install(cli: &Cli, uninstall: bool) -> i32 {
-    if needs_elevation() && cli.report_file.is_none() {
+    // `--report-file` ничего не отменяет: без прав процесс в любом случае
+    // перезапускается через UAC. Иначе вызов с этим параметром без повышения
+    // выполнял бы запись в Program Files и реестр на полпути и без отчёта.
+    if needs_elevation() {
         return install_elevated(uninstall);
     }
     let exe_dir = std::env::current_exe()
@@ -273,7 +276,12 @@ fn shell_install(cli: &Cli, uninstall: bool) -> i32 {
     let (lines, code) = install_summary(&report, uninstall);
     match &cli.report_file {
         Some(path) => {
-            let _ = std::fs::write(path, lines.join("\n"));
+            // Только в новый файл: `create_new` не пишет в уже существующее имя,
+            // в том числе в символическую ссылку, заранее положенную процессом
+            // пользователя, — повышенная запись иначе перезаписала бы любой файл.
+            if let Ok(mut file) = std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+                let _ = file.write_all(lines.join("\n").as_bytes());
+            }
         }
         None => {
             for line in lines {
@@ -289,8 +297,7 @@ fn install_elevated(uninstall: bool) -> i32 {
         eprintln!("{}", tr!("Cannot find this program.", "Не удалось определить путь программы."));
         return 1;
     };
-    let report_file = std::env::temp_dir().join(format!("raze-install-{}.txt", std::process::id()));
-    let _ = std::fs::remove_file(&report_file);
+    let report_file = std::env::temp_dir().join(format!("raze-install-{}.txt", unpredictable_name()));
     let line = build_arguments(&[
         (if uninstall { "--uninstall" } else { "--install" }).to_string(),
         "--lang".to_string(),
@@ -332,6 +339,18 @@ fn install_elevated(uninstall: bool) -> i32 {
             1
         }
     }
+}
+
+/// 128 бит из случайного ключа `RandomState`: имя файла отчёта нельзя угадать
+/// и занять заранее. (Новый файл `create_new` защищает и от занятого имени.)
+fn unpredictable_name() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let part = |salt: u64| {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u64(salt ^ u64::from(std::process::id()));
+        hasher.finish()
+    };
+    format!("{:016x}{:016x}", part(1), part(2))
 }
 
 /// Строки отчёта об установке и код выхода.
@@ -610,6 +629,18 @@ mod tests {
         assert_eq!(cli.report_file, Some(PathBuf::from("C:\\tmp\\r.txt")));
         let cli = Cli::parse_from(["raze", "--uninstall", "--report-file", "r.txt"]);
         assert!(cli.uninstall);
+    }
+
+    #[test]
+    fn the_report_file_name_is_unpredictable_and_never_overwrites() {
+        assert_ne!(unpredictable_name(), unpredictable_name());
+        assert_eq!(unpredictable_name().len(), 32);
+        // Занятое имя (файл или ссылка) не перезаписывается: create_new откажет.
+        let taken = std::env::temp_dir().join(format!("raze-report-test-{}.txt", unpredictable_name()));
+        std::fs::write(&taken, b"keep").unwrap();
+        assert!(std::fs::OpenOptions::new().write(true).create_new(true).open(&taken).is_err());
+        assert_eq!(std::fs::read(&taken).unwrap(), b"keep");
+        let _ = std::fs::remove_file(&taken);
     }
 
     #[test]
