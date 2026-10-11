@@ -221,7 +221,13 @@ impl RazeApp {
                         if target.summary.truncated {
                             ui.colored_label(ui.visuals().warn_fg_color, tr!("Scan is incomplete; counts are partial.", "Обход неполный; счётчики предварительные."));
                         }
-                        if row.expanded { ui.add_space(8.0); style::rule(ui); render_entries(ui, target, index); }
+                        if row.expanded {
+                            ui.add_space(8.0); style::rule(ui); render_entries(ui, target, index);
+                            if target.summary.unlisted > 0 {
+                                ui.weak(RichText::new(tr_format!("… and {n} more not listed", "… и ещё {n} не показано",
+                                    n = target.summary.unlisted)).size(11.5));
+                            }
+                        }
                     }
                 });
             ui.painter().vline(card.response.rect.left() + 0.5, card.response.rect.y_range(), Stroke::new(2.0, color));

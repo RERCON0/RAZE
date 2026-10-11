@@ -131,6 +131,11 @@ pub struct ScanOptions {
     pub max_depth: usize,
     /// Ограничение на число объектов, чтобы GUI не завис на «syscall`-дереве».
     pub max_entries: usize,
+    /// Сколько объектов цели хранить в списке (для показа в окне). Считаются
+    /// все, а список ограничен: запись весит около килобайта, и без предела
+    /// несколько больших целей в окне съедали гигабайты. Объекты с проблемами
+    /// сохраняются сверх этого предела, но тоже не безгранично.
+    pub max_listed: usize,
     /// Проверять доступность удаления (открыть дескриптор на каждый объект).
     pub probe_access: bool,
     /// Искать держателей файлов через Restart Manager. Дорого: открывает
@@ -143,6 +148,7 @@ impl Default for ScanOptions {
         Self {
             max_depth: 256,
             max_entries: 200_000,
+            max_listed: 5_000,
             probe_access: true,
             probe_locks: false,
         }
@@ -158,6 +164,8 @@ pub struct ScanSummary {
     pub troubled: usize,
     /// Обход остановился: упёрся в лимит или в нечитаемый каталог.
     pub truncated: bool,
+    /// Сколько объектов посчитано, но не попало в список (`max_listed`).
+    pub unlisted: usize,
 }
 
 /// Рекурсивный обход без рекурсии в стеке: глубина в Windows ограничена
@@ -172,6 +180,7 @@ pub fn scan(root: &NtPath, options: &ScanOptions) -> (Vec<Entry>, ScanSummary) {
     let mut entries = Vec::new();
     let mut summary = ScanSummary::default();
     let mut stack = vec![(root.clone(), 0usize)];
+    let (mut visited, mut listed_trouble) = (0usize, 0usize);
 
     while let Some((dir, depth)) = stack.pop() {
         if depth > options.max_depth {
@@ -212,9 +221,16 @@ pub fn scan(root: &NtPath, options: &ScanOptions) -> (Vec<Entry>, ScanSummary) {
             if entry.has_trouble() {
                 summary.troubled += 1;
             }
-            entries.push(entry);
+            visited += 1;
+            let trouble = entry.has_trouble();
+            if entries.len() < options.max_listed || (trouble && listed_trouble < options.max_listed) {
+                listed_trouble += usize::from(trouble);
+                entries.push(entry);
+            } else {
+                summary.unlisted += 1;
+            }
 
-            if entries.len() >= options.max_entries {
+            if visited >= options.max_entries {
                 summary.truncated = true;
                 break;
             }
@@ -223,7 +239,7 @@ pub fn scan(root: &NtPath, options: &ScanOptions) -> (Vec<Entry>, ScanSummary) {
                 stack.push((path, depth + 1));
             }
         }
-        if entries.len() >= options.max_entries {
+        if visited >= options.max_entries {
             break;
         }
     }
@@ -501,6 +517,27 @@ mod tests {
                 }
             });
         }
+    }
+
+    #[test]
+    fn the_list_is_capped_but_every_object_is_counted() {
+        let dir = std::env::temp_dir().join(format!("raze-scan-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..40 {
+            std::fs::write(dir.join(format!("f{i}.txt")), b"x").unwrap();
+        }
+        let options = ScanOptions {
+            max_listed: 10,
+            probe_access: false,
+            ..ScanOptions::default()
+        };
+        let (entries, summary) = scan(&NtPath::new(&dir).unwrap(), &options);
+        assert_eq!(summary.files, 40, "счётчики полные");
+        assert_eq!(entries.len(), 10, "список ограничен");
+        assert_eq!(summary.unlisted, 30);
+        assert!(!summary.truncated);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

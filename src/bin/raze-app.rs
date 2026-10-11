@@ -7,6 +7,7 @@ use std::thread;
 
 use eframe::egui;
 use raze_rs::engine::elevation::{build_arguments, is_elevated, relaunch_elevated};
+use raze_rs::engine::path::NtPath;
 use raze_rs::engine::recycle::Disposition;
 use raze_rs::job::{self, Options, Target};
 use raze_rs::report::{human_bytes, Report};
@@ -165,9 +166,14 @@ impl RazeApp {
         }
         let mut fresh = Vec::new();
         for path in paths {
-            let display = path.to_string_lossy();
+            // Сравнение по разобранному пути, как в плане: `C:\a\` и `c:/a` — одна
+            // цель. По набранному тексту она добавлялась бы второй раз.
+            let normalize = |p: &PathBuf| {
+                NtPath::new(p).map(|n| n.to_string_lossy()).unwrap_or_else(|_| p.to_string_lossy().into_owned())
+            };
+            let display = normalize(&path);
             if self.plan.iter().any(|t| t.display.eq_ignore_ascii_case(&display))
-                || fresh.iter().any(|p: &PathBuf| p == &path)
+                || fresh.iter().any(|p: &PathBuf| normalize(p).eq_ignore_ascii_case(&display))
             {
                 continue;
             }
