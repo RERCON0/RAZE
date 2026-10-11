@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="icons/icon-app.png" width="112" alt="Логотип RAZE">
+  <img src="icons/icon.png" width="112" alt="Логотип RAZE">
 </p>
 
 <h1 align="center">RAZE</h1>

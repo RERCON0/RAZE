@@ -1,6 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-changed=../icons/icon-shell.rc");
-    println!("cargo:rerun-if-changed=../icons/icon-shell.ico");
+    println!("cargo:rerun-if-changed=../icons/icon.ico");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         // Иконка нужна самому меню: IExplorerCommand::GetIcon отдаёт
         // Проводнику ссылку на ресурс из этой DLL (точнее — на

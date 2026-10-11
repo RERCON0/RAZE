@@ -60,7 +60,7 @@ New-Item -ItemType Directory -Force $stage | Out-Null
   Set-Content (Join-Path $stage 'AppxManifest.xml') -Encoding UTF8
 
 Add-Type -AssemblyName System.Drawing
-$source = [System.Drawing.Image]::FromFile((Join-Path $root 'icons\icon-app.png'))
+$source = [System.Drawing.Image]::FromFile((Join-Path $root 'icons\icon.png'))
 $logo = New-Object System.Drawing.Bitmap 150, 150
 $g = [System.Drawing.Graphics]::FromImage($logo)
 $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic

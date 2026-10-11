@@ -22,7 +22,7 @@ mod preview;
 
 const MAX_LOG_LINES: usize = 500;
 const MAX_TARGETS: usize = 512;
-const ICON_PNG: &[u8] = include_bytes!("../../icons/icon-app.png");
+const ICON_PNG: &[u8] = include_bytes!("../../icons/icon.png");
 
 fn app_icon() -> Option<egui::IconData> {
     use image::GenericImageView;
