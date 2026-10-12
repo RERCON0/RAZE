@@ -27,10 +27,10 @@
     <th>Контекстное меню Windows 11</th>
   </tr>
   <tr>
-    <td width="50%" align="center">
+    <td width="50%" align="center" valign="top">
       <a href="docs/screenshot.png"><img src="docs/screenshot.png" width="420" alt="Приложение RAZE с английским интерфейсом и искусственными демонстрационными файлами"></a>
     </td>
-    <td width="50%" align="center">
+    <td width="50%" align="center" valign="top">
       <a href="docs/context-menu.png"><img src="docs/context-menu.png" width="420" alt="Современное контекстное COM-меню Windows 11 для demo-file.txt с пунктом Delete with RAZE (Удалить с помощью RAZE)"></a>
     </td>
   </tr>

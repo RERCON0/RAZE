@@ -27,10 +27,10 @@
     <th>Windows 11 context menu</th>
   </tr>
   <tr>
-    <td width="50%" align="center">
+    <td width="50%" align="center" valign="top">
       <a href="docs/screenshot.png"><img src="docs/screenshot.png" width="420" alt="RAZE application with its English interface and synthetic demo files"></a>
     </td>
-    <td width="50%" align="center">
+    <td width="50%" align="center" valign="top">
       <a href="docs/context-menu.png"><img src="docs/context-menu.png" width="420" alt="Modern Windows 11 COM context menu for demo-file.txt with Delete with RAZE"></a>
     </td>
   </tr>
