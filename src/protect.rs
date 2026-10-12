@@ -381,6 +381,20 @@ mod tests {
     }
 
     #[test]
+    fn no_spelling_of_a_volume_root_gets_past_the_ban() {
+        // Диска `Z:` может не быть: запрет корня срабатывает по тексту пути,
+        // раньше любых обращений к диску. `Z:\.` и `Z:\a\..` раньше сворачивались
+        // в голый `Z:`, который запрет не узнавал, а обход читал как корень.
+        for spelling in ["Z:", r"Z:\", r"Z:\.", r"Z:\a\..", r"Z:\..\.."] {
+            assert_eq!(
+                check(&NtPath::new(Path::new(spelling)).unwrap()).unwrap_err(),
+                Reason::VolumeRoot,
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
     fn windows_directory_and_its_ancestors_are_refused() {
         let windows = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
         let windows = PathBuf::from(windows);

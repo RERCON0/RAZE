@@ -7,6 +7,7 @@
 
 use serde::Serialize;
 
+use crate::engine::error::NtError;
 use crate::engine::recycle::Disposition;
 use crate::engine::remove::{Failure, Note};
 
@@ -78,6 +79,17 @@ impl Report {
 
     pub fn failed(&self) -> bool {
         self.cancelled || self.failures() > 0 || !self.refused.is_empty()
+    }
+
+    /// Пересчитывает `needs_elevation` по ошибкам в отчёте: после того как
+    /// состав целей изменился (повтор отказавших), старое значение врёт.
+    pub fn refresh_needs_elevation(&mut self) {
+        self.needs_elevation = self.targets.iter().any(|target| {
+            target
+                .failures
+                .iter()
+                .any(|failure| NtError(failure.code).needs_elevation())
+        });
     }
 
     /// Одна строка итогов — и для GUI, и для CLI.

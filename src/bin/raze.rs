@@ -10,10 +10,12 @@ use std::path::PathBuf;
 
 use clap::{ArgAction, Parser};
 
+use raze_rs::dialog;
 use raze_rs::engine::elevation::{
     build_arguments, is_elevated, needs_elevation, relaunch_elevated, run_elevated_and_wait,
 };
-use raze_rs::engine::path::NtPath;
+use raze_rs::engine::error::NtError;
+use raze_rs::engine::path::{comparison_key, eq_ignore_case};
 use raze_rs::engine::recycle::Disposition;
 use raze_rs::engine::scan::ScanOptions;
 use raze_rs::job::{self, Options, RecycleFallback};
@@ -222,6 +224,13 @@ fn run(cli: Cli) -> i32 {
                 eprintln!("{error}");
                 return 1;
             }
+        } else if cli.from_shell {
+            // Цель отклонена (системная папка, корень диска): из меню об этом
+            // иначе не узнать.
+            let report = job::execute(&planned, &options);
+            if let Some(spec) = failure_spec(&report, false) {
+                ask(&spec);
+            }
         }
         return if summary.refused.is_empty() { 0 } else { 3 };
     }
@@ -245,7 +254,13 @@ fn run(cli: Cli) -> i32 {
         return 1;
     }
 
-    let report = job::execute(&planned, &options);
+    let mut report = job::execute(&planned, &options);
+    // У процесса из контекстного меню нет ни консоли, ни окна: что не вышло,
+    // человек узнает только из диалога.
+    let mut declined = false;
+    if cli.from_shell && !cli.dry_run {
+        declined = settle_bin_refusals(&mut report, &planned, &options);
+    }
 
     // A ShellExecute handoff has separate stdout and cannot return a report
     // to a script. JSON mode reports this attempt; run it elevated explicitly.
@@ -253,6 +268,12 @@ fn run(cli: Cli) -> i32 {
         print_report(&report);
         if let Some(code) = relaunch_as_admin(&cli, &planned, &report) {
             return code;
+        }
+    }
+
+    if cli.from_shell && !report.cancelled {
+        if let Some(spec) = failure_spec(&report, declined) {
+            ask(&spec);
         }
     }
 
@@ -297,18 +318,11 @@ fn drop_empty_placeholders(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 }
 
 fn dedupe(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL};
     let mut seen: Vec<Vec<u16>> = Vec::new();
     let mut out = Vec::new();
     for path in paths {
-        // Сравниваем по разобранному пути: `C:\a\` и `C:\a` — одно и то же.
-        let key = NtPath::new(&path)
-            .map(|p| p.plain().as_slice().to_vec())
-            .unwrap_or_else(|_| path.as_os_str().encode_wide().collect());
-        if seen.iter().any(|previous| {
-            previous == &key || unsafe { CompareStringOrdinal(previous, &key, true) == CSTR_EQUAL }
-        }) {
+        let key = comparison_key(&path);
+        if seen.iter().any(|previous| eq_ignore_case(previous, &key)) {
             continue;
         }
         seen.push(key);
@@ -499,9 +513,9 @@ fn relaunch_as_admin(cli: &Cli, planned: &[job::Target], report: &Report) -> Opt
                     .path
                     .as_ref()
                     .is_some_and(|path| path.to_path() == r.native_path)
-                    && r.failures.iter().any(|failure| {
-                        raze_rs::engine::error::NtError(failure.code).needs_elevation()
-                    })
+                    && r.failures
+                        .iter()
+                        .any(|failure| NtError(failure.code).needs_elevation())
             })
         })
         .collect();
@@ -672,7 +686,7 @@ fn print_report(report: &Report) {
             )
         );
         for note in &target.notes {
-            println!("  + {note:?}");
+            println!("  + {}", note.describe());
         }
         for failure in &target.failures {
             println!(
@@ -713,47 +727,224 @@ fn confirm_before(cli: &Cli, targets: &[job::Target]) -> bool {
         if irreversible.is_empty() {
             return true;
         }
-        return message_box_confirm(&irreversible);
+        return ask(&confirm_spec(&irreversible));
     }
     confirm(targets)
 }
 
-/// Диалог подтверждения для безвозвратных целей из контекстного меню:
-/// у отсоединённого процесса нет консоли, поэтому вопрос задаётся окном.
-fn message_box_confirm(targets: &[&job::Target]) -> bool {
-    use windows::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
-    };
-
-    // Показываем первые несколько путей: остальное — счётчиком.
-    let listed = 6;
-    let mut list = String::new();
-    for target in targets.iter().take(listed) {
-        list.push_str(&target.display);
-        list.push('\n');
+/// Подтверждение для объектов, которые нельзя вернуть из Корзины, из
+/// контекстного меню: у отсоединённого процесса нет консоли, вопрос задаётся
+/// окном. Слова — те же, что в окне приложения.
+fn confirm_spec(targets: &[&job::Target]) -> dialog::Spec {
+    let items = limited(targets.iter().map(|target| target.display.clone()));
+    // Отложенное и безвозвратное не смешиваются: режим один на весь запуск.
+    if targets
+        .iter()
+        .all(|target| target.mode == Disposition::Reboot)
+    {
+        return dialog::Spec {
+            head: tr!(
+                "Objects will be deleted at the next Windows restart. Until then nothing changes.",
+                "Объекты будут удалены при следующей перезагрузке Windows. До неё ничего не меняется."
+            )
+            .to_string(),
+            items,
+            foot: String::new(),
+            yes: tr!("delete", "удалить").to_string(),
+            no: Some(tr!("cancel", "отмена").to_string()),
+            tone: dialog::Tone::Warning,
+        };
     }
-    if targets.len() > listed {
-        list.push_str(&tr_format!(
-            "… and {n} more\n",
-            "… и ещё {n}\n",
-            n = targets.len() - listed
+    dialog::Spec {
+        head: tr!(
+            "These objects cannot go to the Recycle Bin and will be deleted permanently:",
+            "Эти объекты нельзя отправить в Корзину: они будут удалены безвозвратно:"
+        )
+        .to_string(),
+        items,
+        foot: tr!(
+            "Permanently deleted objects cannot be restored from the Recycle Bin.",
+            "Удалённые навсегда объекты нельзя восстановить из Корзины."
+        )
+        .to_string(),
+        yes: tr!("delete", "удалить").to_string(),
+        no: Some(tr!("cancel", "отмена").to_string()),
+        tone: dialog::Tone::Error,
+    }
+}
+
+/// Корзина отказала, а согласия на безвозвратное удаление не было: ничего не
+/// тронуто. Спрашиваем так же, как окно приложения, и теми же словами.
+fn fallback_spec(targets: &[&job::Target]) -> dialog::Spec {
+    dialog::Spec {
+        head: tr_format!(
+            "{n} target(s) could not be sent to the Recycle Bin. Nothing has been deleted.",
+            "{n} целей не удалось отправить в Корзину. Ничего не удалено.",
+            n = targets.len()
+        ),
+        items: limited(targets.iter().map(|target| target.display.clone())),
+        foot: tr!(
+            "Deleting them permanently cannot be undone.",
+            "Безвозвратное удаление отменить нельзя."
+        )
+        .to_string(),
+        yes: tr!("delete permanently", "удалить безвозвратно").to_string(),
+        no: Some(tr!("leave as is", "оставить как есть").to_string()),
+        tone: dialog::Tone::Error,
+    }
+}
+
+/// Корзина отказала целям из контекстного меню. Без согласия они остаются на
+/// месте — иначе отказ прошёл бы молча; с согласием отказавшие цели удаляются
+/// безвозвратно, остальные результаты не меняются. `true` — человек отказался.
+fn settle_bin_refusals(report: &mut Report, planned: &[job::Target], options: &Options) -> bool {
+    let refused: Vec<&job::Target> = planned
+        .iter()
+        .filter(|target| bin_refused(report, target))
+        .collect();
+    if refused.is_empty() {
+        return false;
+    }
+    if !ask(&fallback_spec(&refused)) {
+        return true;
+    }
+    let retry: Vec<job::Target> = refused.into_iter().cloned().collect();
+    let again = job::execute(
+        &retry,
+        &Options {
+            permanent: true,
+            ..options.clone()
+        },
+    );
+    report.targets.retain(|target| target.bin_refused.is_none());
+    report.targets.extend(again.targets);
+    report.refused.extend(again.refused);
+    report.cancelled |= again.cancelled;
+    report.refresh_needs_elevation();
+    false
+}
+
+/// Отказала ли Корзина именно этой цели (цели сопоставляются по настоящему
+/// пути: показанный текст у разных имён может совпасть).
+fn bin_refused(report: &Report, target: &job::Target) -> bool {
+    target.path.as_ref().is_some_and(|path| {
+        let native = path.to_path();
+        report
+            .targets
+            .iter()
+            .any(|done| done.bin_refused.is_some() && done.native_path == native)
+    })
+}
+
+/// Окно с тем, что не удалось. `skip_bin_refused` — человек уже отказался от
+/// безвозвратного удаления тех целей, и повторять им это окно незачем.
+fn failure_spec(report: &Report, skip_bin_refused: bool) -> Option<dialog::Spec> {
+    let mut lines: Vec<String> = report
+        .refused
+        .iter()
+        .map(|refused| format!("{}: {}", refused.path, refused.reason))
+        .collect();
+    for target in &report.targets {
+        if skip_bin_refused && target.bin_refused.is_some() {
+            continue;
+        }
+        lines.extend(
+            target
+                .failures
+                .iter()
+                .map(|failure| format!("{}: {}", failure.path, failure.message)),
+        );
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(dialog::Spec {
+        head: report.summary_line(),
+        items: limited(lines.into_iter()),
+        foot: String::new(),
+        yes: tr!("ok", "ок").to_string(),
+        no: None,
+        tone: dialog::Tone::Error,
+    })
+}
+
+/// Первые несколько строк списка, остальное — счётчиком: окно не прокручивается.
+fn limited(items: impl ExactSizeIterator<Item = String>) -> Vec<String> {
+    const LISTED: usize = 6;
+    let total = items.len();
+    let mut list: Vec<String> = items.take(LISTED).collect();
+    if total > LISTED {
+        list.push(tr_format!(
+            "… and {n} more",
+            "… и ещё {n}",
+            n = total - LISTED
         ));
     }
-    let text = tr_format!(
-        "These objects cannot go to the Recycle Bin and will be deleted permanently:\n\n{list}\nDelete them?",
-        "Эти объекты нельзя отправить в Корзину: они будут удалены безвозвратно:\n\n{list}\nУдалить?",
-        list = list
-    );
+    list
+}
+
+/// Задаёт вопрос (или сообщает, если кнопка одна): окном в стиле приложения,
+/// а если оно не открылось — системным. `true` — главная кнопка.
+fn ask(spec: &dialog::Spec) -> bool {
+    show_styled(spec).unwrap_or_else(|| native_box(spec))
+}
+
+/// Окно рисует `raze-app.exe` рядом с этой программой. `None` — окно не
+/// открылось (нет файла, нет OpenGL): ответа нет, и молчание отказом не считается.
+fn show_styled(spec: &dialog::Spec) -> Option<bool> {
+    use std::process::{Command, Stdio};
+    let app = std::env::current_exe().ok()?.with_file_name("raze-app.exe");
+    let status = Command::new(app)
+        .args(spec.to_args())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?;
+    match status.code()? {
+        dialog::EXIT_YES => Some(true),
+        dialog::EXIT_NO => Some(false),
+        _ => None,
+    }
+}
+
+/// Запасное окно: системное, поверх всех. Подписи кнопок ему недоступны,
+/// поэтому вопрос договаривается в тексте.
+fn native_box(spec: &dialog::Spec) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND,
+        MB_TOPMOST, MB_YESNO,
+    };
+    let mut text = spec.head.clone();
+    if !spec.items.is_empty() {
+        text.push_str("\n\n");
+        text.push_str(&spec.items.join("\n"));
+    }
+    if !spec.foot.is_empty() {
+        text.push_str("\n\n");
+        text.push_str(&spec.foot);
+    }
+    let icon = match spec.tone {
+        dialog::Tone::Warning => MB_ICONWARNING,
+        dialog::Tone::Error => MB_ICONERROR,
+    };
+    let style = if spec.no.is_some() {
+        text.push_str(&format!("\n\n{}?", spec.yes));
+        MB_YESNO | icon | MB_DEFBUTTON2
+    } else {
+        MB_OK | icon
+    };
     let text = wide(&text);
     let title = wide("RAZE");
-    unsafe {
+    let answer = unsafe {
         MessageBoxW(
             None,
             windows::core::PCWSTR(text.as_ptr()),
             windows::core::PCWSTR(title.as_ptr()),
-            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND | MB_TOPMOST,
-        ) == IDYES
-    }
+            style | MB_SETFOREGROUND | MB_TOPMOST,
+        )
+    };
+    spec.no.is_none() || answer == IDYES
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -823,6 +1014,7 @@ fn print_usage() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use raze_rs::engine::path::NtPath;
 
     #[test]
     fn paths_are_deduplicated_case_insensitively() {
@@ -962,6 +1154,132 @@ mod tests {
         assert_eq!(code, 1);
         assert!(lines.iter().any(|l| l == "[fail] copy x: boom"));
         assert_eq!(install_summary(&report, true).1, 1);
+    }
+
+    fn target_at(path: &str) -> job::Target {
+        let path = NtPath::new(std::path::Path::new(path)).unwrap();
+        job::Target {
+            display: path.to_string_lossy(),
+            path: Some(path),
+            entries: Vec::new(),
+            summary: Default::default(),
+            verdict: raze_rs::engine::recycle::RecycleVerdict {
+                reusable: true,
+                reason: String::new(),
+            },
+            mode: Disposition::RecycleBin,
+            refused: None,
+        }
+    }
+
+    fn outcome_for(
+        target: &job::Target,
+        bin_refused: bool,
+        failures: &[(u32, &str)],
+    ) -> raze_rs::report::TargetReport {
+        let path = target.path.as_ref().unwrap();
+        raze_rs::report::TargetReport {
+            path: target.display.clone(),
+            native_path: path.to_path(),
+            disposition: Disposition::RecycleBin,
+            reason: String::new(),
+            bin_refused: bin_refused.then(|| "denied".to_string()),
+            removed_files: 0,
+            removed_directories: 0,
+            removed_links: 0,
+            freed_bytes: 0,
+            notes: Vec::new(),
+            failures: failures
+                .iter()
+                .map(|(code, message)| raze_rs::engine::remove::Failure {
+                    path: target.display.clone(),
+                    code: *code,
+                    message: (*message).to_string(),
+                    holders: Vec::new(),
+                })
+                .collect(),
+            dry_run: false,
+        }
+    }
+
+    #[test]
+    fn a_bin_refusal_is_matched_to_its_own_target_only() {
+        let refused = target_at(r"C:\raze-cli-test\locked");
+        let fine = target_at(r"C:\raze-cli-test\fine");
+        let report = Report {
+            targets: vec![
+                outcome_for(&refused, true, &[(32, "in use")]),
+                outcome_for(&fine, false, &[]),
+            ],
+            ..Report::default()
+        };
+        assert!(bin_refused(&report, &refused));
+        assert!(!bin_refused(&report, &fine));
+    }
+
+    #[test]
+    fn the_failure_window_says_what_failed_and_stays_quiet_when_nothing_did() {
+        assert_eq!(failure_spec(&Report::default(), false), None);
+
+        let locked = target_at(r"C:\raze-cli-test\locked");
+        let mut report = Report {
+            targets: vec![outcome_for(&locked, true, &[(32, "in use")])],
+            refused: vec![raze_rs::report::Refused {
+                path: r"C:\Windows".into(),
+                reason: "system".into(),
+            }],
+            ..Report::default()
+        };
+        let spec = failure_spec(&report, false).unwrap();
+        assert_eq!(spec.head, report.summary_line());
+        assert_eq!(
+            spec.items,
+            [
+                r"C:\Windows: system".to_string(),
+                r"C:\raze-cli-test\locked: in use".to_string()
+            ]
+        );
+        assert!(spec.no.is_none(), "это сообщение, а не вопрос");
+
+        // Человек отказался стирать то, что не принял Корзина: об этом повторно
+        // не говорим, но остальное по-прежнему показываем.
+        let spec = failure_spec(&report, true).unwrap();
+        assert_eq!(spec.items, [r"C:\Windows: system".to_string()]);
+        report.refused.clear();
+        assert_eq!(failure_spec(&report, true), None);
+    }
+
+    #[test]
+    fn long_lists_are_cut_and_counted() {
+        let list = limited((0..9).map(|n| format!("item{n}")));
+        assert_eq!(list.len(), 7, "{list:?}");
+        assert_eq!(list[5], "item5");
+        assert!(list[6].contains('3'), "{list:?}");
+        assert_eq!(
+            limited(["a", "b"].map(String::from).into_iter()),
+            ["a", "b"]
+        );
+    }
+
+    #[test]
+    fn the_context_menu_questions_say_what_will_happen() {
+        let mut reboot = target_at(r"C:\raze-cli-test\later");
+        reboot.mode = Disposition::Reboot;
+        let mut permanent = target_at(r"C:\raze-cli-test\now");
+        permanent.mode = Disposition::Permanent;
+
+        let spec = confirm_spec(&[&reboot]);
+        assert_eq!(spec.tone, dialog::Tone::Warning);
+        assert_eq!(spec.items, [reboot.display.clone()]);
+
+        let spec = confirm_spec(&[&permanent]);
+        assert_eq!(spec.tone, dialog::Tone::Error);
+        assert!(!spec.foot.is_empty(), "необратимое предупреждает");
+        assert!(spec.no.is_some(), "по умолчанию — отказ, кнопка есть");
+
+        let spec = fallback_spec(&[&permanent, &reboot]);
+        assert!(spec.head.contains('2'), "{}", spec.head);
+        assert_eq!(spec.items.len(), 2);
     }
 
     #[test]

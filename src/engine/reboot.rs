@@ -176,6 +176,13 @@ fn collect(
         let Some(child) = stack[top].children.next() else {
             let finished = stack.pop().expect("the frame was just seen");
             let is_root = stack.is_empty();
+            // Неудача вложенной папки означает, что предок не опустеет:
+            // планировать и считать его удалённым нельзя.
+            if finished.failed {
+                if let Some(parent) = stack.last_mut() {
+                    parent.failed = true;
+                }
+            }
             if !finished.failed {
                 planned.push(Planned {
                     path: finished.dir,
@@ -341,6 +348,12 @@ fn parse_multi_sz(bytes: &[u8]) -> Result<Vec<Vec<u16>>, NtError> {
         return Err(NtError(ERROR_INVALID_DATA));
     }
     items.pop();
+    // Записи идут парами «источник, цель»: нечётное число строк — значение
+    // не того вида, и дописывание сдвинуло бы пары (чужой источник получил бы
+    // нашу цель и был бы переименован, а не удалён).
+    if items.len() % 2 != 0 {
+        return Err(NtError(ERROR_INVALID_DATA));
+    }
     Ok(items)
 }
 
@@ -446,6 +459,8 @@ mod tests {
         assert!(parsed[1].is_empty());
 
         assert!(parse_multi_sz(&[0x41, 0x00, 0x41]).is_err());
+        // Источник без пары: дописывать в такое значение нельзя.
+        assert!(parse_multi_sz(b"X\0\0\0\0\0").is_err());
     }
 
     #[test]

@@ -20,11 +20,6 @@ use super::handle::{attributes, open_for_delete, open_for_read};
 use super::locker::{self, Holder};
 use super::path::{is_reserved_component_wide, NtPath, LONG_PATH_WARN};
 
-/// Тег reparse-точки «точка монтирования» — обычный junction.
-pub const IO_REPARSE_TAG_MOUNT_POINT: u32 = 0xA0_00_00_03;
-/// Тег символической ссылки.
-pub const IO_REPARSE_TAG_SYMLINK: u32 = 0xA0_00_00_0C;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {
@@ -510,57 +505,10 @@ fn reserved_component(path: &NtPath) -> Option<String> {
         .map(String::from_utf16_lossy)
 }
 
-/// `cFileName` — буфер фиксированной длины без NUL в начале, но с NUL в
-/// конце; имя заканчивается на первом нуле.
-#[cfg(test)]
-#[allow(dead_code)]
-fn find_data_name(data: &windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW) -> &[u16] {
-    let end = data
-        .cFileName
-        .iter()
-        .position(|c| *c == 0)
-        .unwrap_or(data.cFileName.len());
-    &data.cFileName[..end]
-}
-
-/// Быстрая проверка одного пути без полного обхода — для контекстного меню и
-/// для проверки «а что вообще выбрано».
-pub fn probe_single(path: &NtPath, options: &ScanOptions) -> Option<Entry> {
-    let data = attributes(&open_for_delete(path).ok()?).unwrap_or_default();
-    let name = path
-        .to_string_lossy()
-        .rsplit('\\')
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    let mut blockers = Vec::new();
-    if let Some(component) = path.reserved_component() {
-        blockers.push(Blocker::ReservedName { component });
-    }
-    if path.plain_len() >= LONG_PATH_WARN {
-        blockers.push(Blocker::LongPath {
-            length: path.plain_len(),
-        });
-    }
-    let entry = Entry {
-        path: path.to_path(),
-        nt_path: path.clone(),
-        name,
-        depth: 0,
-        kind: classify(data.attributes),
-        size: 0,
-        attributes: data.attributes,
-        reparse_tag: data.reparse_tag,
-        blockers,
-    };
-    Some(probe(entry, options))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::path::Wide;
-    use windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW;
 
     #[test]
     fn classification_prefers_link_over_directory() {
@@ -684,18 +632,6 @@ mod tests {
             .iter()
             .any(|b| matches!(b, Blocker::Unreadable { .. })));
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn find_data_name_stops_at_nul() {
-        let mut data = WIN32_FIND_DATAW::default();
-        data.cFileName[0] = b'N' as u16;
-        data.cFileName[1] = b'U' as u16;
-        data.cFileName[2] = b'L' as u16;
-        assert_eq!(
-            find_data_name(&data),
-            &[b'N' as u16, b'U' as u16, b'L' as u16]
-        );
     }
 
     #[test]

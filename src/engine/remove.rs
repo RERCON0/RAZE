@@ -12,6 +12,7 @@
 
 use std::time::Duration;
 
+use crate::tr_format;
 use serde::Serialize;
 use windows::Win32::Storage::FileSystem::{
     FileDispositionInfo, FileDispositionInfoEx, SetFileInformationByHandle,
@@ -93,6 +94,42 @@ pub enum Note {
     },
 }
 
+impl Note {
+    /// Одна строка для людей. CLI и окно описывают эти действия одинаково;
+    /// машинный вид — это сериализация (`--json`).
+    pub fn describe(&self) -> String {
+        match self {
+            Self::ReadOnlyCleared { path } => {
+                tr_format!("Read-only cleared: {path}", "Снят атрибут чтения: {path}")
+            }
+            Self::OwnershipTaken { path } => {
+                tr_format!("Ownership taken: {path}", "Сменён владелец: {path}")
+            }
+            Self::AccessGranted { path } => {
+                tr_format!("Access granted: {path}", "Выданы права: {path}")
+            }
+            Self::ProcessCloseRequested { pid, name } => tr_format!(
+                "Close requested: {name} ({pid})",
+                "Запрошено закрытие: {name} ({pid})"
+            ),
+            Self::Vanished { path } => {
+                tr_format!("Already gone: {path}", "Уже отсутствует: {path}")
+            }
+            Self::DeletePending { path } => {
+                tr_format!("Delete pending: {path}", "Ожидает удаления: {path}")
+            }
+            Self::RecycleRefused { reason } => tr_format!(
+                "Recycle Bin refused: {reason}",
+                "Корзина отказала: {reason}"
+            ),
+            Self::DeleteViaParent { path } => tr_format!(
+                "Deletion allowed via the parent folder: {path}",
+                "Удаление разрешено через папку: {path}"
+            ),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Failure {
     pub path: String,
@@ -110,8 +147,6 @@ pub struct Outcome {
     pub freed_bytes: u64,
     pub notes: Vec<Note>,
     pub failures: Vec<Failure>,
-    /// Хоть раз пришлось упереться в права — значит, нужен UAC-перезапуск.
-    pub needs_elevation: bool,
     pub dry_run: bool,
 }
 
@@ -136,9 +171,6 @@ impl Outcome {
     }
 
     pub(crate) fn fail(&mut self, path: &NtPath, error: NtError, holders: Vec<Holder>) {
-        if error.needs_elevation() {
-            self.needs_elevation = true;
-        }
         self.failures.push(Failure {
             path: path.to_string_lossy(),
             code: error.code(),
@@ -334,35 +366,6 @@ impl Frame {
             }
         }
     }
-}
-
-/// Удаляет уже перечисленные объекты — так работает «точечный» режим GUI,
-/// где пользователь отметил конкретные файлы и папки.
-pub fn remove_selected(targets: &[(NtPath, EntryKind, u64)], options: &RemoveOptions) -> Outcome {
-    let mut outcome = Outcome {
-        dry_run: options.dry_run,
-        ..Default::default()
-    };
-    if !options.dry_run {
-        privs::enable_backup_restore();
-    }
-    for (path, kind, size) in targets {
-        if matches!(kind, EntryKind::Directory) && !options.dry_run {
-            // Выбранную папку чистим целиком, иначе «удалить папку» означало бы
-            // «оставить её содержимое».
-            let inner = remove_tree(path, options);
-            outcome.removed_files += inner.removed_files;
-            outcome.removed_directories += inner.removed_directories;
-            outcome.removed_links += inner.removed_links;
-            outcome.freed_bytes += inner.freed_bytes;
-            outcome.needs_elevation |= inner.needs_elevation;
-            outcome.notes.extend(inner.notes);
-            outcome.failures.extend(inner.failures);
-        } else {
-            remove_leaf(path, *kind, *size, options, None, &mut outcome, true);
-        }
-    }
-    outcome
 }
 
 /// Тип и размер корня: файл и ссылка удаляются без обхода,

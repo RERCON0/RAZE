@@ -8,12 +8,14 @@ use std::thread;
 
 use eframe::egui;
 use raze_rs::engine::elevation::{build_arguments, is_elevated, relaunch_elevated};
-use raze_rs::engine::path::NtPath;
+use raze_rs::engine::path::{comparison_key, eq_ignore_case};
 use raze_rs::engine::recycle::Disposition;
 use raze_rs::job::{self, Options, RecycleFallback, Target};
 use raze_rs::report::{human_bytes, Report};
 use raze_rs::{i18n, tr, tr_format, TELEGRAM_URL, VERSION};
 
+#[path = "raze-app/dialog.rs"]
+mod dialog;
 #[path = "raze-app/style.rs"]
 mod style;
 #[path = "raze-app/view.rs"]
@@ -164,25 +166,25 @@ impl RazeApp {
     }
 
     fn add_paths(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
-        if self.phase != Phase::Idle {
+        // Вызывается на каждом кадре: без перетаскивания разбирать план не нужно.
+        if paths.is_empty() || self.phase != Phase::Idle {
             return;
         }
         let mut fresh = Vec::new();
-        let mut seen: std::collections::HashSet<OsString> = self
+        let mut seen: Vec<Vec<u16>> = self
             .plan
             .iter()
             .filter_map(|target| target.path.as_ref())
-            .map(|path| path.to_path().into_os_string().to_ascii_lowercase())
+            .map(|path| comparison_key(&path.to_path()))
             .collect();
         for path in paths {
-            // Сравнение по разобранному пути, как в плане: `C:\a\` и `c:/a` — одна
-            // цель. По набранному тексту она добавлялась бы второй раз.
-            let key = NtPath::new(&path)
-                .map(|path| path.to_path().into_os_string().to_ascii_lowercase())
-                .unwrap_or_else(|_| path.as_os_str().to_ascii_lowercase());
-            if !seen.insert(key) {
+            // Сравнение по разобранному пути и по правилам Windows, как в CLI:
+            // `C:\a\` и `c:/a` — одна цель, как и `C:\Данные` с `c:\данные`.
+            let key = comparison_key(&path);
+            if seen.iter().any(|previous| eq_ignore_case(previous, &key)) {
                 continue;
             }
+            seen.push(key);
             if self.plan.len() + fresh.len() >= MAX_TARGETS {
                 self.log(tr_format!(
                     "Target limit: {max}. Use the CLI for larger batches.",
@@ -331,7 +333,7 @@ impl RazeApp {
                 ));
             }
             for note in &target.notes {
-                self.log(format!("  {}", note_display(note)));
+                self.log(format!("  {}", note.describe()));
             }
         }
         for refused in &report.refused {
@@ -523,37 +525,6 @@ fn clone_target(target: &Target) -> Target {
     }
 }
 
-fn note_display(note: &raze_rs::engine::remove::Note) -> String {
-    use raze_rs::engine::remove::Note;
-    match note {
-        Note::ReadOnlyCleared { path } => {
-            tr_format!("Read-only cleared: {path}", "Снят атрибут чтения: {path}")
-        }
-        Note::OwnershipTaken { path } => {
-            tr_format!("Ownership taken: {path}", "Сменён владелец: {path}")
-        }
-        Note::AccessGranted { path } => {
-            tr_format!("Access granted: {path}", "Выданы права: {path}")
-        }
-        Note::ProcessCloseRequested { pid, name } => tr_format!(
-            "Close requested: {name} ({pid})",
-            "Запрошено закрытие: {name} ({pid})"
-        ),
-        Note::Vanished { path } => tr_format!("Already gone: {path}", "Уже отсутствует: {path}"),
-        Note::DeletePending { path } => {
-            tr_format!("Delete pending: {path}", "Ожидает удаления: {path}")
-        }
-        Note::RecycleRefused { reason } => tr_format!(
-            "Recycle Bin refused: {reason}",
-            "Корзина отказала: {reason}"
-        ),
-        Note::DeleteViaParent { path } => tr_format!(
-            "Deletion allowed via the parent folder: {path}",
-            "Удаление разрешено через папку: {path}"
-        ),
-    }
-}
-
 impl eframe::App for RazeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // eframe re-applies the OS scale factor on DPI/monitor changes, so the
@@ -576,6 +547,15 @@ impl eframe::App for RazeApp {
 }
 
 fn main() -> eframe::Result {
+    // Режим окна-вопроса для `raze.exe` из контекстного меню: без главного окна
+    // и без диалога о внутренней ошибке — вызывающий сам спросит иначе.
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if args.first().is_some_and(|mode| mode == "--dialog") {
+        std::process::exit(
+            raze_rs::dialog::Spec::parse(&args)
+                .map_or(raze_rs::dialog::EXIT_UNAVAILABLE, dialog::run),
+        );
+    }
     std::panic::set_hook(Box::new(|info| {
         fatal_dialog(
             tr!("RAZE — internal error", "RAZE — внутренняя ошибка"),
@@ -617,6 +597,7 @@ fn main() -> eframe::Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use raze_rs::engine::path::NtPath;
     use raze_rs::engine::recycle::RecycleVerdict;
     use raze_rs::report::TargetReport;
 

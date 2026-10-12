@@ -81,8 +81,8 @@ happened.
 The shell's completion callbacks determine the actual disposition; merely
 queueing an operation is not success. A Recycle Bin refusal — cancellation or
 any other shell error — leaves the target in place: without explicit consent
-(`--permanent-on-bin-failure`, or the dialog in the GUI) nothing is deleted
-permanently in its stead. Moving to the bin does not count as freed space;
+(`--permanent-on-bin-failure`, or the dialog in the GUI or the Explorer menu)
+nothing is deleted permanently in its stead. Moving to the bin does not count as freed space;
 permanent-delete byte counts are logical-size estimates, not measurements of
 filesystem allocation.
 

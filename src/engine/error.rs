@@ -63,10 +63,6 @@ impl NtError {
         self.0 == ERROR_FILE_NOT_FOUND || self.0 == ERROR_PATH_NOT_FOUND
     }
 
-    pub fn directory_not_empty(self) -> bool {
-        self.0 == ERROR_DIR_NOT_EMPTY
-    }
-
     /// Файловая система не знает нужной операции (старое NTFS, FAT, сетевая
     /// шара через драйвер) — пробуем запасной путь.
     pub fn unsupported(self) -> bool {
@@ -75,18 +71,9 @@ impl NtError {
             || self.0 == ERROR_INVALID_FUNCTION
     }
 
-    pub fn offline(self) -> bool {
-        self.0 == ERROR_FILE_IS_OFFLINE
-    }
-
     /// Нужен ли для этой ошибки UAC-перезапуск.
     pub fn needs_elevation(self) -> bool {
         self.0 == ERROR_ACCESS_DENIED || self.0 == ERROR_PRIVILEGE_NOT_HELD
-    }
-
-    /// Можно ли вообще что-то сделать без вмешательства пользователя.
-    pub fn retryable(self) -> bool {
-        self.sharing_violation() || self.pending() || self.0 == ERROR_BUSY
     }
 
     /// Понятная человеку формулировка. Сначала наш собственный словарь —
@@ -202,15 +189,14 @@ mod tests {
     fn classification_matches_the_codes_we_act_on() {
         assert!(NtError(ERROR_ACCESS_DENIED).access_denied());
         assert!(NtError(ERROR_SHARING_VIOLATION).sharing_violation());
-        assert!(NtError(ERROR_LOCK_VIOLATION).retryable());
+        assert!(NtError(ERROR_LOCK_VIOLATION).sharing_violation());
         assert!(NtError(ERROR_NOT_SUPPORTED).unsupported());
-        assert!(NtError(ERROR_DIR_NOT_EMPTY).directory_not_empty());
         assert!(NtError(ERROR_ACCESS_DENIED).needs_elevation());
         assert!(!NtError(ERROR_SHARING_VIOLATION).needs_elevation());
         assert!(!NtError(ERROR_FILE_NOT_FOUND).access_denied());
         assert!(NtError(windows::Win32::Foundation::ERROR_DELETE_PENDING.0).pending());
-        assert!(NtError(windows::Win32::Foundation::ERROR_IO_PENDING.0).retryable());
-        assert!(!NtError(windows::Win32::Foundation::ERROR_BAD_PATHNAME.0).retryable());
+        assert!(NtError(windows::Win32::Foundation::ERROR_IO_PENDING.0).pending());
+        assert!(!NtError(windows::Win32::Foundation::ERROR_BAD_PATHNAME.0).pending());
     }
 
     #[test]

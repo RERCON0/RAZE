@@ -40,11 +40,38 @@ const CERT_FILE: &str = "RAZE.cer";
 /// `TrustedPeople` выдаётся только сертификату с этим отпечатком: подменённый
 /// или повреждённый `RAZE.cer` в хранилище не попадёт. Значение вшивается в
 /// `raze.exe` при сборке из `packaging/cert-thumbprint.txt` (ровно 40 символов,
-/// без перевода строки; тест это проверяет). Отпечаток публичного сертификата
+/// без перевода строки; сборка без этого не пройдёт). Отпечаток публичного сертификата
 /// не секрет, закрытый ключ остаётся только в хранилище того, кто собирает.
 /// Чужая сборка пересоздаёт сертификат через `packaging\build-package.ps1`: он
 /// обновляет этот файл, после чего `raze.exe` пересобирается.
-pub const PINNED_CERT_THUMBPRINT: &str = include_str!("../../packaging/cert-thumbprint.txt");
+pub const PINNED_CERT_THUMBPRINT: &str =
+    pinned(include_str!("../../packaging/cert-thumbprint.txt"));
+
+// Отпечаток подставляется в сценарии PowerShell, которые идут с правами
+// администратора. Лишний перевод строки или кавычка в файле ломали бы их (или
+// хуже), поэтому формат проверяется при сборке, а не обещается в комментарии.
+const fn pinned(text: &'static str) -> &'static str {
+    assert!(
+        is_thumbprint(text),
+        "packaging/cert-thumbprint.txt must hold exactly 40 hex digits, no newline"
+    );
+    text
+}
+
+const fn is_thumbprint(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() != 40 {
+        return false;
+    }
+    let mut index = 0;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_hexdigit() {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
 
 /// Куда всё ставится: `%ProgramFiles%\RAZE`. Писать туда могут только
 /// администраторы, и это не мелочь: запрос UAC поднимает права у `raze.exe`, а
@@ -681,6 +708,24 @@ fn base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_bare_sha1_thumbprint_may_reach_an_elevated_script() {
+        assert!(is_thumbprint(PINNED_CERT_THUMBPRINT));
+        let good = "1CDEBA01251B61E3E40F7465A8253BA276ED204F";
+        assert!(is_thumbprint(good));
+        assert!(is_thumbprint(&good.to_lowercase()));
+        for bad in [
+            "",
+            &good[1..],
+            &format!("{good}\n"),
+            &format!("{good}0"),
+            "1CDEBA01251B61E3E40F7465A8253BA276ED204G",
+            "1CDEBA01251B61E3E40F7465A8253BA276ED20'F",
+        ] {
+            assert!(!is_thumbprint(bad), "{bad:?}");
+        }
+    }
 
     #[test]
     fn base64_matches_the_standard_vectors() {

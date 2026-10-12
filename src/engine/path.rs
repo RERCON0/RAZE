@@ -271,7 +271,7 @@ impl NtPath {
                 reject_invalid_characters(rest)?;
                 // Для показа и сравнения это обычный UNC-путь: `\\server\share`.
                 return Ok(Self {
-                    plain: normalize_absolute(&Wide::prefixed(r"\\", &slice[8..])),
+                    plain: normalize_absolute(&Wide::prefixed(r"\\", &slice[8..]), false),
                     ext: raw.clone(),
                 });
             }
@@ -284,7 +284,7 @@ impl NtPath {
             }
             reject_invalid_characters(&body[2..])?;
             return Ok(Self {
-                plain: normalize_absolute(&Wide::from_units(&slice[4..])),
+                plain: normalize_absolute(&Wide::from_units(&slice[4..]), false),
                 ext: raw.clone(),
             });
         }
@@ -303,7 +303,7 @@ impl NtPath {
             if !has_share {
                 return Err(PathError::IncompleteUnc);
             }
-            let plain = normalize_absolute(raw);
+            let plain = normalize_absolute(raw, true);
             // `plain` уже начинается с `\\`, а расширенная форма
             // UNC — `\\?\UNC\server\share`: разделители не дублируем.
             return Ok(Self {
@@ -317,25 +317,27 @@ impl NtPath {
         {
             reject_invalid_characters(&text[2..])?;
             if text.len() >= 3 && text.as_bytes()[2] == b'\\' {
-                let plain = normalize_absolute(raw);
+                let plain = normalize_absolute(raw, true);
                 return Ok(Self {
                     ext: Wide::prefixed(r"\\?\", plain.as_slice()),
                     plain,
                 });
             }
             if text.len() == 2 {
-                // Голый `C:` — спецификация диска, а не корень тома.
-                // GetFullPathNameW вернул бы `C:\` (текущий каталог
-                // диска), и путь стал бы корнем тома.
+                // Голый `C:` в Win32 — «текущая папка диска C», а после `\\?\`
+                // — сам том как устройство. Ни то ни другое не имеют в виду,
+                // поэтому читаем его как корень тома `C:\`: `protect` такую цель
+                // отклонит, а не отдаст дальше то, что случайно откроется.
+                let plain = normalize_absolute(&Wide::new(&format!("{text}\\")), true);
                 return Ok(Self {
-                    ext: Wide::prefixed(r"\\?\", slice),
-                    plain: raw.clone(),
+                    ext: Wide::prefixed(r"\\?\", plain.as_slice()),
+                    plain,
                 });
             }
             // `C:foo` — относительно текущей папки диска C. Тут нужен
             // GetFullPathNameW: он знает про per-drive current directory.
             let full = full_path_name(raw)?;
-            let plain = normalize_absolute(&Wide::from_path(&full));
+            let plain = normalize_absolute(&Wide::from_path(&full), true);
             return Ok(Self {
                 ext: Wide::prefixed(r"\\?\", plain.as_slice()),
                 plain,
@@ -352,7 +354,7 @@ impl NtPath {
         if !text.as_bytes().get(1).map(|b| *b == b':').unwrap_or(false) {
             return Err(PathError::NotAbsolute);
         }
-        let plain = normalize_absolute(&Wide::from_path(&full));
+        let plain = normalize_absolute(&Wide::from_path(&full), true);
         Ok(Self {
             ext: Wide::prefixed(r"\\?\", plain.as_slice()),
             plain,
@@ -426,16 +428,6 @@ impl NtPath {
         let child = self.ext.join(name);
         let plain = self.plain.join(name);
         Self { ext: child, plain }
-    }
-
-    /// Компоненты пути, как их видит NT (без префикса и буквы диска).
-    pub fn components(&self) -> Vec<String> {
-        let skip = self.ext.drive_prefix_len().unwrap_or(0);
-        self.ext.as_slice()[skip..]
-            .split(|c| *c == b'\\' as u16)
-            .filter(|c| !c.is_empty())
-            .map(String::from_utf16_lossy)
-            .collect()
     }
 
     /// Первый компонент с зарезервированным именем — тот, из-за которого
@@ -597,11 +589,18 @@ fn starts_with_ignore_case(text: &str, prefix: &str) -> bool {
 
 /// Лексическая нормализация: `/` приводится к `\`, повторные разделители
 /// схлопываются, компоненты `.` отбрасываются.
-/// `..` **не** трогаем: на уровне объектного менеджера NT он разрешается
-/// корректно, с учётом reparse-точек, а наше собственное склеивание было бы
-/// хуже. Хвостовые точки и пробелы внутри компонента сохраняются: с `\\?\`
+///
+/// `resolve_dots` включает разбор `..` так, как это делает `GetFullPathNameW`:
+/// компонент снимает предыдущий, но не корень (`C:\..` — это `C:\`). Это нужно
+/// для обычных путей: после `\\?\` система `..` не разбирает вовсе и отвечает
+/// «неверное имя», так что без разбора `C:\a\..\b` не открывался бы, а
+/// проверка запретных мест видела бы не тот путь, что уходит в Win32. Для
+/// явно расширенного пути (`\\?\...`) флаг выключен: показываемый путь обязан
+/// совпадать с тем, который уйдёт в Win32 дословно.
+///
+/// Хвостовые точки и пробелы внутри компонента сохраняются: с `\\?\`
 /// `foo ` и `foo` — это разные файлы.
-fn normalize_absolute(raw: &Wide) -> Wide {
+fn normalize_absolute(raw: &Wide, resolve_dots: bool) -> Wide {
     const BSLASH: u16 = b'\\' as u16;
     const DOT: u16 = b'.' as u16;
 
@@ -614,39 +613,72 @@ fn normalize_absolute(raw: &Wide) -> Wide {
     // UNC сохраняет ведущие `\\`: без них `\\server\share` превратился бы в
     // относительный путь.
     let unc = source.first() == Some(&BSLASH) && source.get(1) == Some(&BSLASH);
-    let mut out: Vec<u16> = Vec::with_capacity(source.len());
-    if unc {
-        out.push(BSLASH);
-        out.push(BSLASH);
+    let drive = !unc
+        && source.len() >= 2
+        && source[1] == b':' as u16
+        && (source[0] | 0x20).wrapping_sub(b'a' as u16) < 26;
+    // Корень, выше которого `..` не поднимается: `C:` либо `server` и `share`.
+    let root_segments = if unc { 2 } else { usize::from(drive) };
+
+    let mut segments: Vec<&[u16]> = Vec::new();
+    for segment in source[if unc { 2 } else { 0 }..].split(|c| *c == BSLASH) {
+        // Пустой сегмент — повторный разделитель: иначе `C:\\dir` схлопнулся
+        // бы не в `C:\dir`.
+        if segment.is_empty() || segment == [DOT] {
+            continue;
+        }
+        if resolve_dots && segment == [DOT, DOT] {
+            if segments.len() > root_segments {
+                segments.pop();
+            }
+            continue;
+        }
+        segments.push(segment);
     }
 
-    let mut segment_start = if unc { 2 } else { 0 };
-    let mut first = true;
-    let mut index = segment_start;
-    while index <= source.len() {
-        let at_end = index == source.len();
-        if at_end || source[index] == BSLASH {
-            let segment = &source[segment_start..index];
-            let is_current_dir = segment.len() == 1 && segment[0] == DOT;
-            // Разделитель ставим только перед непустым значимым сегментом:
-            // иначе `C:\\dir` схлопнется не в `C:\dir`.
-            if !segment.is_empty() && !is_current_dir {
-                if !first {
-                    out.push(BSLASH);
-                }
-                first = false;
-                out.extend_from_slice(segment);
-            }
-            segment_start = index + 1;
-        }
-        index += 1;
+    let mut out: Vec<u16> = Vec::with_capacity(source.len() + 1);
+    if unc {
+        out.extend([BSLASH, BSLASH]);
     }
-    // Хвостовой разделитель у каталога — часть смысла пути, сохраняем.
-    if source.last() == Some(&BSLASH) && !out.is_empty() && out.last() != Some(&BSLASH) {
+    for (index, segment) in segments.iter().enumerate() {
+        if index > 0 {
+            out.push(BSLASH);
+        }
+        out.extend_from_slice(segment);
+    }
+    // Хвостовой разделитель у каталога — часть смысла пути, сохраняем. У
+    // одного лишь диска он обязателен: `C:` без него — «текущая папка диска C»,
+    // а не корень тома, и `C:\.` с `C:\a\..` проскакивали бы мимо запрета корня.
+    let bare_drive = drive && segments.len() == 1;
+    if (source.last() == Some(&BSLASH) || bare_drive)
+        && out.last().is_some_and(|last| *last != BSLASH)
+    {
         out.push(BSLASH);
     }
     out.push(0); // инвариант Wide: NUL на месте
     Wide(out)
+}
+
+/// Порядковое сравнение без учёта регистра — так сравнивает имена сама
+/// Windows. `to_lowercase` и ASCII-вариант путают кириллические пути:
+/// `C:\Данные` и `c:\данные` — один и тот же каталог.
+pub fn eq_ignore_case(a: &[u16], b: &[u16]) -> bool {
+    use windows::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL};
+    a == b || unsafe { CompareStringOrdinal(a, b, true) } == CSTR_EQUAL
+}
+
+/// Ключ для сравнения целей: разобранный путь без хвостового разделителя
+/// (`C:\a\` и `c:/a` — одна цель), а если разобрать нельзя — набранный как
+/// есть. Ключи сравниваются через [`eq_ignore_case`].
+pub fn comparison_key(path: &Path) -> Vec<u16> {
+    let mut key = match NtPath::new(path) {
+        Ok(parsed) => parsed.plain().as_slice().to_vec(),
+        Err(_) => path.as_os_str().encode_wide().collect(),
+    };
+    while key.len() > 3 && key.last() == Some(&(b'\\' as u16)) {
+        key.pop();
+    }
+    key
 }
 
 fn full_path_name(raw: &Wide) -> Result<PathBuf, PathError> {
@@ -852,11 +884,70 @@ mod tests {
     }
 
     #[test]
-    fn dot_segments_collapse_but_parent_is_kept() {
-        // `.` — мусор, `..` остаётся системе: объектный менеджер NT разрешает
-        // его с учётом reparse-точек, и наше склеивание было бы хуже.
-        let path = nt(r"C:\a\.\b\..\c\");
-        assert_eq!(path.to_string_lossy(), r"C:\a\b\..\c\");
+    fn dot_segments_are_resolved_like_win32_before_anything_is_checked() {
+        // После `\\?\` система `..` не разбирает (ERROR_INVALID_NAME), а
+        // проверка запретных мест читает именно этот путь: разбирать `..`
+        // приходится нам, до проверки и до открытия.
+        assert_eq!(nt(r"C:\a\.\b\..\c\").to_string_lossy(), r"C:\a\c\");
+        assert_eq!(nt(r"C:\a\b\..\..\..\x").to_string_lossy(), r"C:\x");
+        assert_eq!(nt(r"\\srv\shr\a\..\b").to_string_lossy(), r"\\srv\shr\b");
+        assert_eq!(
+            nt(r"C:\a\b\..").ext().to_string_lossy(),
+            r"\\?\C:\a",
+            "в Win32 уходит тот же путь, что показан"
+        );
+    }
+
+    #[test]
+    fn every_spelling_of_a_volume_root_is_the_volume_root() {
+        // Раньше `D:\.` превращалось в голый `D:`: запрет корня тома его не
+        // узнавал, а обход перечислял корень диска.
+        for spelling in [
+            r"C:",
+            r"C:\",
+            r"C:/",
+            r"C:\.",
+            r"C:\\.\.",
+            r"C:\a\..",
+            r"C:\..",
+            r"C:\a\..\..\b\..",
+            r"\\srv\shr\.",
+            r"\\srv\shr\x\..\",
+        ] {
+            assert!(nt(spelling).is_volume_root(), "{spelling}");
+        }
+        assert!(!nt(r"C:\a").is_volume_root());
+        assert!(!nt(r"C:\a\..\b").is_volume_root());
+    }
+
+    #[test]
+    fn explicitly_extended_paths_stay_verbatim_dots_included() {
+        // `\\?\` отключает разбор имён, и показываемый путь обязан совпадать с
+        // тем, что уйдёт в Win32: открыть его система всё равно не даст.
+        assert_eq!(nt(r"\\?\C:\a\..\b").to_string_lossy(), r"C:\a\..\b");
+    }
+
+    #[test]
+    fn names_are_compared_the_way_windows_compares_them() {
+        let wide = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
+        assert!(eq_ignore_case(
+            &wide(r"C:\Данные\Файл"),
+            &wide(r"c:\данные\файл")
+        ));
+        assert!(eq_ignore_case(&wide("A"), &wide("a")));
+        assert!(!eq_ignore_case(&wide(r"C:\a"), &wide(r"C:\ab")));
+    }
+
+    #[test]
+    fn spellings_of_one_target_share_a_comparison_key() {
+        let key = |text: &str| comparison_key(Path::new(text));
+        let same = |a: &str, b: &str| eq_ignore_case(&key(a), &key(b));
+        assert!(same(r"C:\a\", r"C:\a"));
+        assert!(same(r"C:/a", r"c:\A"));
+        assert!(same(r"C:\Данные\.", r"c:\данные"));
+        assert!(!same(r"C:\a", r"C:\b"));
+        // Корень тома не теряет разделитель и не сливается с соседями.
+        assert_eq!(key(r"C:\").len(), 3);
     }
 
     #[test]
@@ -871,8 +962,6 @@ mod tests {
         assert!(nt(r"C:\").is_volume_root());
         assert!(nt(r"\\server\share").is_volume_root());
         assert!(!nt(r"C:\dir").is_volume_root());
-        // `C:` без разделителя — не корень, а текущий каталог диска C.
-        assert!(!nt(r"C:").is_volume_root());
     }
 
     #[test]

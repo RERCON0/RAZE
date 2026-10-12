@@ -35,6 +35,15 @@ pub fn pin_pixel_scale(ctx: &egui::Context, resize_viewport: bool) {
     )));
 }
 
+/// Масштаб без смены размера окна: окну-вопросу размер задаёт его содержимое.
+pub fn pin_scale_only(ctx: &egui::Context) -> bool {
+    if ctx.pixels_per_point() == UI_SCALE {
+        return false;
+    }
+    ctx.set_pixels_per_point(UI_SCALE);
+    true
+}
+
 pub fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     for (name, offset) in [

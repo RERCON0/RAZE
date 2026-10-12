@@ -414,15 +414,12 @@ fn execute_with(
         };
 
         absorb(&mut target_report, outcome);
-        report.needs_elevation |= target_report
-            .failures
-            .iter()
-            .any(|f| crate::engine::error::NtError(f.code).needs_elevation());
         report.targets.push(target_report);
         if report.cancelled {
             break;
         }
     }
+    report.refresh_needs_elevation();
     report
 }
 
@@ -472,11 +469,13 @@ mod tests {
         assert!(has_work(&targets));
 
         paths.push(PathBuf::from("C:\\"));
+        paths.push(PathBuf::from("C:\\."));
         let targets = plan(&paths, &options);
         assert!(
             targets[1].refused.is_some(),
             "корень тома обязан быть отклонён"
         );
+        assert!(targets[2].refused.is_some(), "и в любой другой записи тоже");
         assert!(!has_work(&targets[1..]));
     }
 

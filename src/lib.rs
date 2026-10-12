@@ -6,6 +6,7 @@
 //! корзина такой файл уже не тронет. С префиксом `\\?\` разбор имени
 //! отключается — `NUL` становится обычным именем файла.
 
+pub mod dialog;
 pub mod engine;
 pub mod i18n;
 pub mod job;
@@ -52,11 +53,3 @@ pub const TELEGRAM_URL: &str = "https://t.me/rercon";
 /// Текущая версия приложения — из `CARGO_PKG_VERSION`, чтобы установщик
 /// меню Windows и `--version` не расходились.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-pub fn outln(s: impl AsRef<str>) {
-    println!("{}", s.as_ref());
-}
-
-pub fn errln(s: impl AsRef<str>) {
-    eprintln!("{}", s.as_ref());
-}
