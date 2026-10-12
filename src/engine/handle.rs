@@ -8,12 +8,12 @@ use std::ops::{Deref, DerefMut};
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, DELETE, FILE_ACCESS_RIGHTS, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY,
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo,
-    FileBasicInfo, FILE_FLAGS_AND_ATTRIBUTES, GetFileInformationByHandleEx, OPEN_EXISTING,
-    SetFileInformationByHandle, FILE_ATTRIBUTE_TAG_INFO,
-    FILE_BASIC_INFO,
+    CreateFileW, FileAttributeTagInfo, FileBasicInfo, GetFileInformationByHandleEx,
+    SetFileInformationByHandle, DELETE, FILE_ACCESS_RIGHTS, FILE_ATTRIBUTE_DIRECTORY,
+    FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO,
+    FILE_BASIC_INFO, FILE_FLAGS_AND_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 
 /// Флаги, без которых нельзя ни удалить, ни безопасно открыть каталог:
@@ -23,14 +23,13 @@ pub fn object_flags() -> FILE_FLAGS_AND_ATTRIBUTES {
     FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
 }
 
-use super::error::{NtError, nt};
+use super::error::{nt, NtError};
 use super::path::NtPath;
 
 /// Права, достаточные для удаления и для чтения атрибутов.
 pub fn delete_access() -> FILE_ACCESS_RIGHTS {
     DELETE | FILE_READ_ATTRIBUTES
 }
-
 
 /// Открывает объект для удаления. `open_reparse` обязателен: без него
 /// junction откроется как каталог и обход уйдёт внутрь чужого дерева.
@@ -47,18 +46,19 @@ pub fn open_with(
     access: FILE_ACCESS_RIGHTS,
     options: FILE_FLAGS_AND_ATTRIBUTES,
 ) -> Result<OwnedHandle, NtError> {
-    nt(unsafe { CreateFileW(
-        path.ext().pc(),
-        access.0,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        None,
-        OPEN_EXISTING,
-        options,
-        None,
-    ) })
+    nt(unsafe {
+        CreateFileW(
+            path.ext().pc(),
+            access.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            options,
+            None,
+        )
+    })
     .map(OwnedHandle)
 }
-
 
 /// Дескриптор, который закрывается сам.
 pub struct OwnedHandle(HANDLE);
@@ -137,7 +137,9 @@ pub fn final_path(handle: &OwnedHandle) -> Option<Vec<u16>> {
     use windows::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, VOLUME_NAME_DOS};
     let mut buffer = vec![0u16; 1024];
     for _ in 0..2 {
-        let written = unsafe { GetFinalPathNameByHandleW(handle.raw(), &mut buffer, VOLUME_NAME_DOS) } as usize;
+        let written =
+            unsafe { GetFinalPathNameByHandleW(handle.raw(), &mut buffer, VOLUME_NAME_DOS) }
+                as usize;
         if written == 0 {
             return None;
         }
@@ -188,7 +190,9 @@ impl Containment {
         const BSLASH: u16 = b'\\' as u16;
         let root = self.root.as_slice();
         path.starts_with(root)
-            && (path.len() == root.len() || path[root.len()] == BSLASH || root.last() == Some(&BSLASH))
+            && (path.len() == root.len()
+                || path[root.len()] == BSLASH
+                || root.last() == Some(&BSLASH))
     }
 }
 
@@ -219,7 +223,6 @@ pub fn clear_read_only(handle: &OwnedHandle) -> Result<(), NtError> {
     })
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,10 +233,15 @@ mod tests {
 
     #[test]
     fn containment_respects_component_boundaries() {
-        let guard = Containment { root: wide(r"\\?\C:\a") };
+        let guard = Containment {
+            root: wide(r"\\?\C:\a"),
+        };
         assert!(guard.contains(&wide(r"\\?\C:\a")));
         assert!(guard.contains(&wide(r"\\?\C:\a\b\c")));
-        assert!(!guard.contains(&wide(r"\\?\C:\ab")), "похожий сосед не принадлежит дереву");
+        assert!(
+            !guard.contains(&wide(r"\\?\C:\ab")),
+            "похожий сосед не принадлежит дереву"
+        );
         assert!(!guard.contains(&wide(r"\\?\C:\")));
         assert!(!guard.contains(&wide(r"\\?\D:\a\b")));
     }
@@ -243,7 +251,10 @@ mod tests {
         let windows = std::env::var_os("SystemRoot").unwrap();
         let system = std::path::PathBuf::from(windows).join("System32");
         let result = Containment::new(&NtPath::new(&system).unwrap());
-        assert!(matches!(result, Err(NtError(super::super::error::ERROR_OUTSIDE_TREE))));
+        assert!(matches!(
+            result,
+            Err(NtError(super::super::error::ERROR_OUTSIDE_TREE))
+        ));
     }
 
     #[test]

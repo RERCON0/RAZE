@@ -150,7 +150,6 @@ impl RazeApp {
         }
     }
 
-
     fn log(&mut self, line: impl Into<String>) {
         self.log.push(line.into());
         if self.log.len() > MAX_LOG_LINES {
@@ -163,7 +162,9 @@ impl RazeApp {
             return;
         }
         let mut fresh = Vec::new();
-        let mut seen: std::collections::HashSet<OsString> = self.plan.iter()
+        let mut seen: std::collections::HashSet<OsString> = self
+            .plan
+            .iter()
             .filter_map(|target| target.path.as_ref())
             .map(|path| path.to_path().into_os_string().to_ascii_lowercase())
             .collect();
@@ -197,7 +198,10 @@ impl RazeApp {
         ));
         self.phase = Phase::Planning;
         let entry_budget = MAX_LISTED_ENTRIES.saturating_sub(
-            self.plan.iter().map(|target| target.entries.len()).sum::<usize>()
+            self.plan
+                .iter()
+                .map(|target| target.entries.len())
+                .sum::<usize>(),
         );
         let (ctx, tx) = (ctx.clone(), self.tx.clone());
         thread::spawn(move || {
@@ -216,7 +220,9 @@ impl RazeApp {
     }
 
     fn selected_targets(&self) -> Vec<Target> {
-        self.plan.iter().zip(&self.rows)
+        self.plan
+            .iter()
+            .zip(&self.rows)
             .filter(|(t, r)| r.selected && t.refused.is_none())
             .map(|(t, _)| Target {
                 display: t.display.clone(),
@@ -225,7 +231,8 @@ impl RazeApp {
                 summary: t.summary.clone(),
                 verdict: t.verdict.clone(),
                 refused: t.refused.clone(),
-            }).collect()
+            })
+            .collect()
     }
 
     fn totals(&self) -> Totals {
@@ -287,12 +294,17 @@ impl RazeApp {
             self.log(tr_format!(
                 "{path} — {mode}: {files} files, {dirs} folders, {size}",
                 "{path} — {mode}: файлов: {files}, папок: {dirs}, {size}",
-                path = target.path, mode = disposition,
-                files = target.removed_files, dirs = target.removed_directories,
+                path = target.path,
+                mode = disposition,
+                files = target.removed_files,
+                dirs = target.removed_directories,
                 size = human_bytes(target.freed_bytes)
             ));
             for failure in &target.failures {
-                self.log(format!("  {} [{}]: {}", failure.path, failure.code, failure.message));
+                self.log(format!(
+                    "  {} [{}]: {}",
+                    failure.path, failure.code, failure.message
+                ));
             }
             for note in &target.notes {
                 self.log(format!("  {}", note_display(note)));
@@ -300,8 +312,10 @@ impl RazeApp {
         }
         for refused in &report.refused {
             self.log(tr_format!(
-                "{path} — refused: {reason}", "{path} — отказано: {reason}",
-                path = refused.path, reason = refused.reason
+                "{path} — refused: {reason}",
+                "{path} — отказано: {reason}",
+                path = refused.path,
+                reason = refused.reason
             ));
         }
         self.phase = Phase::Idle;
@@ -311,19 +325,30 @@ impl RazeApp {
 
         // Keep the retry paths before removing completed cards from the view.
         if report.needs_elevation && !is_elevated() && !self.running_options.dry_run {
-            let paths: Vec<PathBuf> = report.targets.iter()
-                .filter(|t| t.failures.iter().any(|f| {
-                    raze_rs::engine::error::NtError(f.code).needs_elevation()
-                }))
-                .map(|t| t.native_path.clone()).collect();
+            let paths: Vec<PathBuf> = report
+                .targets
+                .iter()
+                .filter(|t| {
+                    t.failures
+                        .iter()
+                        .any(|f| raze_rs::engine::error::NtError(f.code).needs_elevation())
+                })
+                .map(|t| t.native_path.clone())
+                .collect();
             self.relaunch_as_admin(&paths);
         }
         if !self.running_options.dry_run && !report.cancelled {
             let mut kept = Vec::new();
             let mut rows = Vec::new();
             for (target, row) in self.plan.drain(..).zip(self.rows.drain(..)) {
-                let completed = row.selected && report.targets.iter()
-                    .any(|r| r.ok() && target.path.as_ref().is_some_and(|p| p.to_path() == r.native_path));
+                let completed = row.selected
+                    && report.targets.iter().any(|r| {
+                        r.ok()
+                            && target
+                                .path
+                                .as_ref()
+                                .is_some_and(|p| p.to_path() == r.native_path)
+                    });
                 if !completed {
                     kept.push(target);
                     rows.push(row);
@@ -338,7 +363,10 @@ impl RazeApp {
         if paths.is_empty() {
             return;
         }
-        let Some(exe) = std::env::current_exe().ok().map(|e| e.with_file_name("raze.exe")) else {
+        let Some(exe) = std::env::current_exe()
+            .ok()
+            .map(|e| e.with_file_name("raze.exe"))
+        else {
             return;
         };
         match relaunch_elevated(&exe, &elevation_arguments(paths, &self.running_options)) {
@@ -346,9 +374,13 @@ impl RazeApp {
                 "Handed off to the administrator CLI. Its report is separate.",
                 "Передано CLI с правами администратора. Его отчёт — отдельно."
             )),
-            Ok(false) => self.log(tr!("Administrator rights were not granted.", "Права администратора не выданы.")),
+            Ok(false) => self.log(tr!(
+                "Administrator rights were not granted.",
+                "Права администратора не выданы."
+            )),
             Err(error) => self.log(tr_format!(
-                "Cannot restart elevated: {error}", "Не удалось повысить права: {error}"
+                "Cannot restart elevated: {error}",
+                "Не удалось повысить права: {error}"
             )),
         }
     }
@@ -358,13 +390,17 @@ impl RazeApp {
             match message {
                 Msg::Plan(targets) => {
                     for target in targets {
-                        self.rows.push(RowState { selected: target.refused.is_none(), expanded: false });
+                        self.rows.push(RowState {
+                            selected: target.refused.is_none(),
+                            expanded: false,
+                        });
                         self.plan.push(target);
                     }
                     self.phase = Phase::Idle;
                     self.log(tr_format!(
                         "Scan complete. Targets: {count}.",
-                        "Сканирование закончено. Целей: {count}.", count = self.plan.len()
+                        "Сканирование закончено. Целей: {count}.",
+                        count = self.plan.len()
                     ));
                 }
                 Msg::Report(report) => self.handle_report(report),
@@ -381,9 +417,10 @@ fn plan_paths(paths: Vec<PathBuf>, mut entry_budget: usize) -> Vec<Target> {
         options.scan.max_listed = options.scan.max_listed.min(entry_budget / 2);
         for mut target in job::plan(std::slice::from_ref(&path), &options) {
             let retained = target.entries.len().min(entry_budget);
-            target.summary.unlisted = target.summary.unlisted.saturating_add(
-                target.entries.len() - retained
-            );
+            target.summary.unlisted = target
+                .summary
+                .unlisted
+                .saturating_add(target.entries.len() - retained);
             target.entries.truncate(retained);
             entry_budget -= retained;
             targets.push(target);
@@ -394,9 +431,15 @@ fn plan_paths(paths: Vec<PathBuf>, mut entry_budget: usize) -> Vec<Target> {
 
 fn elevation_arguments(paths: &[PathBuf], options: &Options) -> OsString {
     let mut args: Vec<OsString> = vec!["--elevated".into(), "--yes".into()];
-    if options.permanent { args.push("--permanent".into()); }
-    if options.close_locks { args.push("--close-locks".into()); }
-    if !options.take_ownership { args.push("--keep-owners".into()); }
+    if options.permanent {
+        args.push("--permanent".into());
+    }
+    if options.close_locks {
+        args.push("--close-locks".into());
+    }
+    if !options.take_ownership {
+        args.push("--keep-owners".into());
+    }
     args.extend(["--lang".into(), i18n::language().code().into(), "--".into()]);
     args.extend(paths.iter().map(|p| p.as_os_str().to_os_string()));
     build_arguments(&args)
@@ -405,12 +448,23 @@ fn elevation_arguments(paths: &[PathBuf], options: &Options) -> OsString {
 fn note_display(note: &raze_rs::engine::remove::Note) -> String {
     use raze_rs::engine::remove::Note;
     match note {
-        Note::ReadOnlyCleared { path } => tr_format!("Read-only cleared: {path}", "Снят атрибут чтения: {path}"),
-        Note::OwnershipTaken { path } => tr_format!("Ownership taken: {path}", "Сменён владелец: {path}"),
-        Note::AccessGranted { path } => tr_format!("Access granted: {path}", "Выданы права: {path}"),
-        Note::ProcessCloseRequested { pid, name } => tr_format!("Close requested: {name} ({pid})", "Запрошено закрытие: {name} ({pid})"),
+        Note::ReadOnlyCleared { path } => {
+            tr_format!("Read-only cleared: {path}", "Снят атрибут чтения: {path}")
+        }
+        Note::OwnershipTaken { path } => {
+            tr_format!("Ownership taken: {path}", "Сменён владелец: {path}")
+        }
+        Note::AccessGranted { path } => {
+            tr_format!("Access granted: {path}", "Выданы права: {path}")
+        }
+        Note::ProcessCloseRequested { pid, name } => tr_format!(
+            "Close requested: {name} ({pid})",
+            "Запрошено закрытие: {name} ({pid})"
+        ),
         Note::Vanished { path } => tr_format!("Already gone: {path}", "Уже отсутствует: {path}"),
-        Note::DeletePending { path } => tr_format!("Delete pending: {path}", "Ожидает удаления: {path}"),
+        Note::DeletePending { path } => {
+            tr_format!("Delete pending: {path}", "Ожидает удаления: {path}")
+        }
     }
 }
 
@@ -423,28 +477,47 @@ impl eframe::App for RazeApp {
         if ctx.input(|i| i.viewport().close_requested()) && self.phase.working() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
-        let dropped = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
+        let dropped = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
         self.add_paths(ctx, dropped);
         self.render(ctx);
     }
 }
 
 fn main() -> eframe::Result {
-    std::panic::set_hook(Box::new(|info| fatal_dialog(
-        tr!("RAZE — internal error", "RAZE — внутренняя ошибка"),
-        &tr_format!("RAZE could not continue.\n\n{info}", "RAZE не смог продолжить работу.\n\n{info}")
-    )));
+    std::panic::set_hook(Box::new(|info| {
+        fatal_dialog(
+            tr!("RAZE — internal error", "RAZE — внутренняя ошибка"),
+            &tr_format!(
+                "RAZE could not continue.\n\n{info}",
+                "RAZE не смог продолжить работу.\n\n{info}"
+            ),
+        )
+    }));
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size(style::WINDOW_SIZE)
         .with_min_inner_size(style::WINDOW_MIN_SIZE)
         .with_title("RAZE — by rercon prod.");
     #[cfg(windows)]
-    { viewport = viewport.with_decorations(false); }
-    if let Some(icon) = app_icon() { viewport = viewport.with_icon(icon); }
-    let result = eframe::run_native("RAZE", eframe::NativeOptions { viewport, ..Default::default() },
-        Box::new(|cc| {
-            Ok(Box::new(RazeApp::new(&cc.egui_ctx)))
-        }));
+    {
+        viewport = viewport.with_decorations(false);
+    }
+    if let Some(icon) = app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+    let result = eframe::run_native(
+        "RAZE",
+        eframe::NativeOptions {
+            viewport,
+            ..Default::default()
+        },
+        Box::new(|cc| Ok(Box::new(RazeApp::new(&cc.egui_ctx)))),
+    );
     if let Err(error) = &result {
         fatal_dialog(tr!("RAZE — could not open window", "RAZE — не удалось открыть окно"),
             &tr_format!(
@@ -454,7 +527,6 @@ fn main() -> eframe::Result {
     }
     result
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -469,7 +541,10 @@ mod tests {
             path: Some(path),
             entries: Vec::new(),
             summary: Default::default(),
-            verdict: RecycleVerdict { reusable: true, reason: String::new() },
+            verdict: RecycleVerdict {
+                reusable: true,
+                reason: String::new(),
+            },
             refused: None,
         }
     }
@@ -492,9 +567,13 @@ mod tests {
 
     #[test]
     fn list_budget_preserves_full_counts_and_every_requested_target() {
-        let scratch = std::env::temp_dir().join(format!("raze-gui-budget-{}-{}",
+        let scratch = std::env::temp_dir().join(format!(
+            "raze-gui-budget-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let folder = scratch.join("folder");
         std::fs::create_dir_all(&folder).unwrap();
@@ -507,17 +586,39 @@ mod tests {
         std::fs::remove_dir_all(scratch).unwrap();
         assert_eq!(plan.len(), 2);
         assert!(plan.iter().all(|target| target.refused.is_none()));
-        assert!(plan.iter().map(|target| target.entries.len()).sum::<usize>() <= 2);
-        assert_eq!(plan.iter().map(|target| target.summary.files).sum::<usize>(), 4);
-        assert_eq!(plan.iter().map(|target| target.summary.bytes).sum::<u64>(), 4);
-        assert_eq!(plan.iter().map(|target| target.entries.len() + target.summary.unlisted).sum::<usize>(), 4);
+        assert!(
+            plan.iter()
+                .map(|target| target.entries.len())
+                .sum::<usize>()
+                <= 2
+        );
+        assert_eq!(
+            plan.iter()
+                .map(|target| target.summary.files)
+                .sum::<usize>(),
+            4
+        );
+        assert_eq!(
+            plan.iter().map(|target| target.summary.bytes).sum::<u64>(),
+            4
+        );
+        assert_eq!(
+            plan.iter()
+                .map(|target| target.entries.len() + target.summary.unlisted)
+                .sum::<usize>(),
+            4
+        );
     }
 
     #[test]
     fn preview_keeps_the_targets_available_for_actual_removal() {
         let mut app = RazeApp::new(&egui::Context::default());
-        app.plan.push(target(PathBuf::from(r"C:\raze-ui-test\file")));
-        app.rows.push(RowState { selected: true, expanded: true });
+        app.plan
+            .push(target(PathBuf::from(r"C:\raze-ui-test\file")));
+        app.rows.push(RowState {
+            selected: true,
+            expanded: true,
+        });
         app.running_options.dry_run = true;
         let report = Report {
             targets: vec![completed(&app.plan[0], true)],
@@ -533,8 +634,12 @@ mod tests {
     fn only_completed_selected_targets_disappear() {
         let mut app = RazeApp::new(&egui::Context::default());
         for name in ["completed", "failed", "unselected"] {
-            app.plan.push(target(PathBuf::from(r"C:\raze-ui-test").join(name)));
-            app.rows.push(RowState { selected: name != "unselected", expanded: false });
+            app.plan
+                .push(target(PathBuf::from(r"C:\raze-ui-test").join(name)));
+            app.rows.push(RowState {
+                selected: name != "unselected",
+                expanded: false,
+            });
         }
         let successful = completed(&app.plan[0], false);
         let mut failed = completed(&app.plan[1], false);
@@ -544,7 +649,10 @@ mod tests {
             message: String::new(),
             holders: Vec::new(),
         });
-        app.handle_report(Report { targets: vec![successful, failed], ..Default::default() });
+        app.handle_report(Report {
+            targets: vec![successful, failed],
+            ..Default::default()
+        });
         assert_eq!(app.plan.len(), 2);
         assert!(app.plan[0].display.ends_with("failed"));
         assert!(app.plan[1].display.ends_with("unselected"));
@@ -562,8 +670,12 @@ mod tests {
         for name in [0xd800, 0xfffd] {
             let mut wide = prefix.clone();
             wide.push(name);
-            app.plan.push(target(PathBuf::from(OsString::from_wide(&wide))));
-            app.rows.push(RowState { selected: true, expanded: false });
+            app.plan
+                .push(target(PathBuf::from(OsString::from_wide(&wide))));
+            app.rows.push(RowState {
+                selected: true,
+                expanded: false,
+            });
         }
         assert_eq!(app.plan[0].display, app.plan[1].display);
         let native_unremoved = app.plan[0].path.as_ref().unwrap().to_path();
@@ -573,6 +685,9 @@ mod tests {
         };
         app.handle_report(report);
         assert_eq!(app.plan.len(), 1);
-        assert_eq!(app.plan[0].path.as_ref().unwrap().to_path(), native_unremoved);
+        assert_eq!(
+            app.plan[0].path.as_ref().unwrap().to_path(),
+            native_unremoved
+        );
     }
 }

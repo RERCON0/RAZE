@@ -6,11 +6,11 @@
 //! пробелами и точками, которые обычный API срезал бы.
 
 use windows::Win32::Storage::FileSystem::{
-    FIND_FIRST_EX_LARGE_FETCH, FindClose, FindExInfoBasic, FindExSearchNameMatch,
-    FindFirstFileExW, FindNextFileW, WIN32_FIND_DATAW,
+    FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW, FindNextFileW,
+    FIND_FIRST_EX_LARGE_FETCH, WIN32_FIND_DATAW,
 };
 
-use super::error::{NtError, nt};
+use super::error::{nt, NtError};
 use super::path::NtPath;
 
 #[derive(Clone, Debug)]
@@ -73,7 +73,11 @@ pub fn children_limited(dir: &NtPath, limit: usize) -> Result<(Vec<Child>, bool)
             // Нормальный конец списка — ERROR_NO_MORE_FILES. Всё остальное
             // (отказ посреди каталога, обрыв сети) раньше тоже означало «конец»,
             // и недочитанный каталог выдавался за полностью прочитанный.
-            return if error.code() == ERROR_NO_MORE_FILES { Ok((out, false)) } else { Err(error) };
+            return if error.code() == ERROR_NO_MORE_FILES {
+                Ok((out, false))
+            } else {
+                Err(error)
+            };
         }
     }
 }

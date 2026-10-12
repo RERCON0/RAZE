@@ -87,7 +87,12 @@ impl Report {
             crate::tr!("Removed", "Удалено")
         };
         if failed == 0 {
-            crate::tr_format!("{verb}: {items}", "{verb}: {items}", verb = verb, items = self.removed_total())
+            crate::tr_format!(
+                "{verb}: {items}",
+                "{verb}: {items}",
+                verb = verb,
+                items = self.removed_total()
+            )
         } else {
             crate::tr_format!(
                 "{verb}: {items}, failed: {failed}",
@@ -133,14 +138,18 @@ pub fn human_bytes(bytes: u64) -> String {
     if unit == 0 {
         crate::tr_format!("{bytes} B", "{bytes} Б")
     } else {
-        crate::tr_format!("{value:.1} {unit}", "{value:.1} {unit}", value = value, unit = UNITS[unit])
+        crate::tr_format!(
+            "{value:.1} {unit}",
+            "{value:.1} {unit}",
+            value = value,
+            unit = UNITS[unit]
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn totals_add_up() {
@@ -163,9 +172,11 @@ mod tests {
 
     #[test]
     fn cancellation_is_not_success() {
-        let report = Report { cancelled: true, ..Report::default() };
+        let report = Report {
+            cancelled: true,
+            ..Report::default()
+        };
         assert!(report.failed());
         assert_eq!(report.removed_total(), 0);
     }
-
 }

@@ -21,6 +21,23 @@
   <a href="SECURITY.md">Security</a>
 </p>
 
+<table>
+  <tr>
+    <th>RAZE application (English)</th>
+    <th>Windows 11 context menu</th>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <a href="docs/screenshot.png"><img src="docs/screenshot.png" width="420" alt="RAZE application with its English interface and synthetic demo files"></a>
+    </td>
+    <td width="50%" align="center">
+      <a href="docs/context-menu.png"><img src="docs/context-menu.png" width="420" alt="Modern Windows 11 COM context menu for demo-file.txt with Delete with RAZE"></a>
+    </td>
+  </tr>
+</table>
+
+<p align="center"><em>Screenshots use synthetic demo data only. Click an image to view it at full size.</em></p>
+
 > [!TIP]
 > **One click in Explorer, done.** Install the context-menu integration
 > (`raze --install`), right-click any stubborn folder or file, and choose

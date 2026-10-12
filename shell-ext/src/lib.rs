@@ -27,10 +27,10 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use windows::core::{implement, BOOL, GUID, HRESULT, Interface, PCWSTR, PWSTR, Ref};
+use windows::core::{implement, Interface, Ref, BOOL, GUID, HRESULT, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_INVALIDARG, E_NOTIMPL,
-    E_NOINTERFACE, E_OUTOFMEMORY, E_POINTER, HMODULE,
+    CloseHandle, CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_INVALIDARG, E_NOINTERFACE,
+    E_NOTIMPL, E_OUTOFMEMORY, E_POINTER, HMODULE,
 };
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 use windows::Win32::System::Com::{
@@ -41,12 +41,10 @@ use windows::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
 };
 use windows::Win32::System::Ole::{IObjectWithSite, IObjectWithSite_Impl};
-use windows::Win32::System::Threading::{
-    CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW,
-};
+use windows::Win32::System::Threading::{CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW};
 use windows::Win32::UI::Shell::{
-    IEnumExplorerCommand, IExplorerCommand, IExplorerCommand_Impl, IShellItemArray,
-    ECF_DEFAULT, ECS_ENABLED, SIGDN_FILESYSPATH,
+    IEnumExplorerCommand, IExplorerCommand, IExplorerCommand_Impl, IShellItemArray, ECF_DEFAULT,
+    ECS_ENABLED, SIGDN_FILESYSPATH,
 };
 
 /// Тот же CLSID, что в `src/shell/install.rs` и в AppxManifest.xml.
@@ -181,11 +179,7 @@ impl IObjectWithSite_Impl for RazeCommand_Impl {
         Ok(())
     }
 
-    fn GetSite(
-        &self,
-        _riid: *const GUID,
-        _site: *mut *mut c_void,
-    ) -> windows::core::Result<()> {
+    fn GetSite(&self, _riid: *const GUID, _site: *mut *mut c_void) -> windows::core::Result<()> {
         Err(E_NOTIMPL.into())
     }
 }
@@ -567,7 +561,7 @@ mod tests {
 
     #[test]
     fn backslashes_before_quotes_round_trip_through_windows() {
-        use windows::Win32::Foundation::{HLOCAL, LocalFree};
+        use windows::Win32::Foundation::{LocalFree, HLOCAL};
         use windows::Win32::UI::Shell::CommandLineToArgvW;
         let argument = PathBuf::from(r#"C:\tmp\a\\"b\"#);
         let mut command: Vec<u16> = "raze.exe ".encode_utf16().collect();
@@ -604,10 +598,18 @@ mod tests {
     fn a_large_selection_is_split_into_command_lines_that_fit() {
         let exe = PathBuf::from(r"C:\Program Files\RAZE\raze.exe");
         let paths: Vec<PathBuf> = (0..2000)
-            .map(|i| PathBuf::from(format!(r"C:\Users\name\Downloads\a long folder name {i}\{}", "x".repeat(60))))
+            .map(|i| {
+                PathBuf::from(format!(
+                    r"C:\Users\name\Downloads\a long folder name {i}\{}",
+                    "x".repeat(60)
+                ))
+            })
             .collect();
         let parts = batches(&exe, &paths);
-        assert!(parts.len() > 1, "2000 long paths cannot fit one command line");
+        assert!(
+            parts.len() > 1,
+            "2000 long paths cannot fit one command line"
+        );
         for part in &parts {
             assert!(command_line(&exe, part).len() < 32_767);
         }

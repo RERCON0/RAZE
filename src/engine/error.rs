@@ -153,7 +153,7 @@ pub fn nt<T>(result: windows::core::Result<T>) -> Result<T, NtError> {
 
 fn system_message(code: u32) -> String {
     use windows::Win32::System::Diagnostics::Debug::{
-        FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS, FormatMessageW,
+        FormatMessageW, FORMAT_MESSAGE_FROM_SYSTEM, FORMAT_MESSAGE_IGNORE_INSERTS,
     };
     let mut buffer = [0u16; 512];
     let written = unsafe {
@@ -200,11 +200,14 @@ mod tests {
 
     #[test]
     fn captured_errors_do_not_depend_on_last_error() {
-        unsafe { windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::WIN32_ERROR(0)) };
-        let error = windows::core::Error::from_hresult(windows::core::HRESULT(0x80070005u32 as i32));
+        unsafe {
+            windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::WIN32_ERROR(0))
+        };
+        let error =
+            windows::core::Error::from_hresult(windows::core::HRESULT(0x80070005u32 as i32));
         assert_eq!(nt::<()>(Err(error)), Err(NtError(ERROR_ACCESS_DENIED)));
-        let error = windows::core::Error::from_hresult(windows::core::HRESULT(0x80004005u32 as i32));
+        let error =
+            windows::core::Error::from_hresult(windows::core::HRESULT(0x80004005u32 as i32));
         assert_eq!(NtError::from(error).code(), 0x80004005);
     }
-
 }

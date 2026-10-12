@@ -21,6 +21,23 @@
   <a href="SECURITY.md">Безопасность</a>
 </p>
 
+<table>
+  <tr>
+    <th>Приложение RAZE (на английском)</th>
+    <th>Контекстное меню Windows 11</th>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <a href="docs/screenshot.png"><img src="docs/screenshot.png" width="420" alt="Приложение RAZE с английским интерфейсом и искусственными демонстрационными файлами"></a>
+    </td>
+    <td width="50%" align="center">
+      <a href="docs/context-menu.png"><img src="docs/context-menu.png" width="420" alt="Современное контекстное COM-меню Windows 11 для demo-file.txt с пунктом Delete with RAZE (Удалить с помощью RAZE)"></a>
+    </td>
+  </tr>
+</table>
+
+<p align="center"><em>На скриншотах — только искусственные демонстрационные данные. Нажмите на изображение, чтобы открыть его в полном размере.</em></p>
+
 > [!TIP]
 > **Один клик в Проводнике — и готово.** Установите интеграцию с контекстным
 > меню (`raze --install`), щёлкните правой кнопкой по упрямой папке или файлу и

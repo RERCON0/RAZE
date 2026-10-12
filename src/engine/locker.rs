@@ -10,8 +10,8 @@ use std::time::Duration;
 use serde::Serialize;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::RestartManager::{
-    RM_PROCESS_INFO, RmConsole, RmEndSession, RmGetList, RmMainWindow, RmOtherWindow, RmRegisterResources,
-    RmService, RmStartSession,
+    RmConsole, RmEndSession, RmGetList, RmMainWindow, RmOtherWindow, RmRegisterResources,
+    RmService, RmStartSession, RM_PROCESS_INFO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
@@ -77,7 +77,8 @@ pub fn processes_using(paths: &[std::path::PathBuf]) -> Vec<Holder> {
                                 pid: info.Process.dwProcessId,
                                 name: wide_string(&info.strAppName),
                                 is_service: info.ApplicationType == RmService,
-                                can_close: [RmMainWindow, RmOtherWindow, RmConsole].contains(&info.ApplicationType),
+                                can_close: [RmMainWindow, RmOtherWindow, RmConsole]
+                                    .contains(&info.ApplicationType),
                             })
                             .collect();
                         break;
@@ -113,27 +114,52 @@ thread_local! {
 pub fn request_close(pid: u32) -> usize {
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::System::Threading::{
-        IsProcessCritical, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-        QueryFullProcessImageNameW,
+        IsProcessCritical, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
     };
-    if pid <= 4 || pid == std::process::id() { return 0; }
-    let Ok(handle) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else { return 0; };
+    if pid <= 4 || pid == std::process::id() {
+        return 0;
+    }
+    let Ok(handle) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
+        return 0;
+    };
     struct Process(HANDLE);
     impl Drop for Process {
-        fn drop(&mut self) { unsafe { let _ = CloseHandle(self.0); } }
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
     }
     let process = Process(handle);
     let mut critical = windows::core::BOOL(0);
-    if unsafe { IsProcessCritical(process.0, &mut critical) }.is_err() || critical.as_bool() { return 0; }
+    if unsafe { IsProcessCritical(process.0, &mut critical) }.is_err() || critical.as_bool() {
+        return 0;
+    }
     let mut image = [0u16; 1024];
     let mut size = image.len() as u32;
-    if unsafe { QueryFullProcessImageNameW(
-        process.0, PROCESS_NAME_WIN32, windows::core::PWSTR(image.as_mut_ptr()), &mut size,
-    ) }.is_err() { return 0; }
+    if unsafe {
+        QueryFullProcessImageNameW(
+            process.0,
+            PROCESS_NAME_WIN32,
+            windows::core::PWSTR(image.as_mut_ptr()),
+            &mut size,
+        )
+    }
+    .is_err()
+    {
+        return 0;
+    }
     let image = &image[..size as usize];
-    let name = &image[image.iter().rposition(|unit| *unit == b'\\' as u16).map_or(0, |index| index + 1)..];
+    let name = &image[image
+        .iter()
+        .rposition(|unit| *unit == b'\\' as u16)
+        .map_or(0, |index| index + 1)..];
     if name.len() == b"explorer.exe".len()
-        && name.iter().zip(b"explorer.exe").all(|(unit, byte)| (*unit | 0x20) == u16::from(*byte))
+        && name
+            .iter()
+            .zip(b"explorer.exe")
+            .all(|(unit, byte)| (*unit | 0x20) == u16::from(*byte))
     {
         return 0;
     }
@@ -202,7 +228,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "raze-lock-holder-{}-{}.txt",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::write(&path, b"locked").unwrap();
         let file = std::fs::OpenOptions::new()
@@ -213,7 +242,12 @@ mod tests {
         let holders = processes_using(std::slice::from_ref(&path));
         drop(file);
         std::fs::remove_file(&path).unwrap();
-        assert!(holders.iter().any(|holder| holder.pid == std::process::id()), "{holders:?}");
+        assert!(
+            holders
+                .iter()
+                .any(|holder| holder.pid == std::process::id()),
+            "{holders:?}"
+        );
     }
 
     #[test]

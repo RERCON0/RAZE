@@ -31,7 +31,7 @@ if (-not $bin) { throw 'Windows SDK signing tools (makeappx.exe, signtool.exe) w
 $makeappx = "$($bin.FullName)\x64\makeappx.exe"
 $signtool = "$($bin.FullName)\x64\signtool.exe"
 
-# --- version: Cargo "0.1.0" -> package "0.1.0.0" ----------------------------------------------
+# --- version: Cargo "major.minor.patch" -> package "major.minor.patch.0" ----------------------------
 $match = Select-String -Path (Join-Path $root 'Cargo.toml') -Pattern '^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"' | Select-Object -First 1
 if (-not $match) { throw 'Cannot read the package version from Cargo.toml.' }
 $version = '{0}.{1}.{2}.0' -f $match.Matches[0].Groups[1].Value, $match.Matches[0].Groups[2].Value, $match.Matches[0].Groups[3].Value

@@ -4,8 +4,8 @@
 //! меню (`raze --from-shell --mode "%1"`). Второй вариант не должен
 //! требовать подтверждения: человек уже сказал «удалить» самим кликом.
 
-use std::io::{IsTerminal, Write};
 use std::ffi::OsString;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
 use clap::{ArgAction, Parser};
@@ -16,9 +16,9 @@ use raze_rs::engine::elevation::{
 use raze_rs::engine::path::NtPath;
 use raze_rs::engine::scan::ScanOptions;
 use raze_rs::job::{self, Options};
-use raze_rs::report::{Report, human_bytes};
+use raze_rs::report::{human_bytes, Report};
 use raze_rs::shell;
-use raze_rs::{TELEGRAM_URL, VERSION, banner, i18n, tr, tr_format};
+use raze_rs::{banner, i18n, tr, tr_format, TELEGRAM_URL, VERSION};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -215,7 +215,10 @@ fn run(cli: Cli) -> i32 {
     // Пробный прогон ничего не меняет, спрашивать нечего.
     if !cli.dry_run && !cli.yes && !cli.from_shell && !confirm(&planned) {
         if cli.json {
-            let report = Report { cancelled: true, ..Report::default() };
+            let report = Report {
+                cancelled: true,
+                ..Report::default()
+            };
             if let Err(error) = write_json(&mut std::io::stdout().lock(), &report) {
                 eprintln!("{error}");
             }
@@ -334,18 +337,32 @@ fn shell_install(cli: &Cli, uninstall: bool) -> i32 {
 }
 
 fn write_install_report(path: &std::path::Path, lines: &[String]) -> std::io::Result<()> {
-    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
     file.write_all(lines.join("\n").as_bytes())
 }
 
 fn install_elevated(uninstall: bool) -> i32 {
     let Ok(exe) = std::env::current_exe() else {
-        eprintln!("{}", tr!("Cannot find this program.", "Не удалось определить путь программы."));
+        eprintln!(
+            "{}",
+            tr!(
+                "Cannot find this program.",
+                "Не удалось определить путь программы."
+            )
+        );
         return 1;
     };
-    let report_file = std::env::temp_dir().join(format!("raze-install-{}.txt", unpredictable_name()));
+    let report_file =
+        std::env::temp_dir().join(format!("raze-install-{}.txt", unpredictable_name()));
     let line = build_arguments(&[
-        OsString::from(if uninstall { "--uninstall" } else { "--install" }),
+        OsString::from(if uninstall {
+            "--uninstall"
+        } else {
+            "--install"
+        }),
         "--lang".into(),
         i18n::language().code().into(),
         "--report-file".into(),
@@ -366,7 +383,13 @@ fn install_elevated(uninstall: bool) -> i32 {
             match text {
                 Ok(text) => println!("{text}"),
                 Err(_) => {
-                    eprintln!("{}", tr!("The elevated copy left no report.", "Повышенная копия не оставила отчёта."));
+                    eprintln!(
+                        "{}",
+                        tr!(
+                            "The elevated copy left no report.",
+                            "Повышенная копия не оставила отчёта."
+                        )
+                    );
                     return 1;
                 }
             }
@@ -384,7 +407,10 @@ fn install_elevated(uninstall: bool) -> i32 {
             1
         }
         Err(error) => {
-            eprintln!("{}: {error}", tr!("Cannot restart", "Не удалось перезапустить"));
+            eprintln!(
+                "{}: {error}",
+                tr!("Cannot restart", "Не удалось перезапустить")
+            );
             1
         }
     }
@@ -448,37 +474,59 @@ fn relaunch_as_admin(cli: &Cli, planned: &[job::Target], report: &Report) -> Opt
     let Ok(exe) = std::env::current_exe() else {
         return None;
     };
-    let retry: Vec<&job::Target> = planned.iter()
-        .filter(|target| report.targets.iter().any(|r| {
-            target.path.as_ref().is_some_and(|path| path.to_path() == r.native_path) && r.failures.iter().any(|failure| {
-                raze_rs::engine::error::NtError(failure.code).needs_elevation()
+    let retry: Vec<&job::Target> = planned
+        .iter()
+        .filter(|target| {
+            report.targets.iter().any(|r| {
+                target
+                    .path
+                    .as_ref()
+                    .is_some_and(|path| path.to_path() == r.native_path)
+                    && r.failures.iter().any(|failure| {
+                        raze_rs::engine::error::NtError(failure.code).needs_elevation()
+                    })
             })
-        }))
+        })
         .collect();
     if retry.is_empty() {
         return None;
     }
     let line = build_arguments(&elevation_arguments(cli, retry));
     if cli.verbose > 0 {
-        eprintln!("{}", tr_format!("Requesting admin rights…", "Запрашиваю права администратора…"));
+        eprintln!(
+            "{}",
+            tr_format!(
+                "Requesting admin rights…",
+                "Запрашиваю права администратора…"
+            )
+        );
     }
     match relaunch_elevated(&exe, &line) {
         Ok(true) => {
-            println!("{}", tr!(
-                "Handed off to the administrator CLI. Its report is separate.",
-                "Передано CLI с правами администратора. Его отчёт — отдельно."
-            ));
+            println!(
+                "{}",
+                tr!(
+                    "Handed off to the administrator CLI. Its report is separate.",
+                    "Передано CLI с правами администратора. Его отчёт — отдельно."
+                )
+            );
             Some(0)
         }
         Ok(false) => {
             eprintln!(
                 "{}",
-                tr!("Administrator rights were not granted.", "Права администратора не выданы.")
+                tr!(
+                    "Administrator rights were not granted.",
+                    "Права администратора не выданы."
+                )
             );
             Some(1)
         }
         Err(error) => {
-            eprintln!("{}: {error}", tr!("Cannot restart", "Не удалось перезапустить"));
+            eprintln!(
+                "{}: {error}",
+                tr!("Cannot restart", "Не удалось перезапустить")
+            );
             Some(1)
         }
     }
@@ -490,7 +538,10 @@ fn relaunch_as_admin(cli: &Cli, planned: &[job::Target], report: &Report) -> Opt
 /// `-p` и `--keep-owners` терялись, и повышенный процесс брал владение там, где
 /// просили этого не делать. Пути идут абсолютными из плана: у повышенного
 /// процесса другой рабочий каталог, и относительный путь указал бы на другое.
-fn elevation_arguments<'a>(cli: &Cli, planned: impl IntoIterator<Item = &'a job::Target>) -> Vec<OsString> {
+fn elevation_arguments<'a>(
+    cli: &Cli,
+    planned: impl IntoIterator<Item = &'a job::Target>,
+) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec!["--elevated".into(), "--yes".into()];
     for (enabled, flag) in [
         (cli.permanent, "--permanent"),
@@ -504,7 +555,10 @@ fn elevation_arguments<'a>(cli: &Cli, planned: impl IntoIterator<Item = &'a job:
             args.push(flag.into());
         }
     }
-    args.extend(std::iter::repeat_n(OsString::from("--verbose"), usize::from(cli.verbose)));
+    args.extend(std::iter::repeat_n(
+        OsString::from("--verbose"),
+        usize::from(cli.verbose),
+    ));
     args.extend([OsString::from("--lang"), i18n::language().code().into()]);
     // `--`: путь, начинающийся с «-», не должен читаться как параметр.
     args.push("--".into());
@@ -512,7 +566,12 @@ fn elevation_arguments<'a>(cli: &Cli, planned: impl IntoIterator<Item = &'a job:
         planned
             .into_iter()
             .filter(|target| target.refused.is_none())
-            .filter_map(|target| target.path.as_ref().map(|path| path.to_path().into_os_string())),
+            .filter_map(|target| {
+                target
+                    .path
+                    .as_ref()
+                    .map(|path| path.to_path().into_os_string())
+            }),
     );
     args
 }
@@ -537,9 +596,16 @@ fn print_plan(targets: &[job::Target], summary: &job::Summary, verbose: u8) {
             )
         );
         if !target.reason.is_empty() {
-            println!("  {}", tr_format!("why: {reason}", "почему: {reason}", reason = target.reason));
+            println!(
+                "  {}",
+                tr_format!("why: {reason}", "почему: {reason}", reason = target.reason)
+            );
         }
-        for problem in target.problems.iter().take(if verbose > 0 { 50 } else { 5 }) {
+        for problem in target
+            .problems
+            .iter()
+            .take(if verbose > 0 { 50 } else { 5 })
+        {
             println!("  - {problem}");
         }
     }
@@ -562,10 +628,16 @@ fn print_report(report: &Report) {
             raze_rs::engine::recycle::Disposition::RecycleBin => tr!("Recycle Bin", "Корзина"),
             raze_rs::engine::recycle::Disposition::Permanent => tr!("permanently", "безвозвратно"),
         };
-        let removed = if target.dry_run { tr!("would remove", "будет удалено") }
-            else { tr!("removed", "удалено") };
-        let freed = if target.dry_run { tr!("would free", "будет освобождено") }
-            else { tr!("freed", "освобождено") };
+        let removed = if target.dry_run {
+            tr!("would remove", "будет удалено")
+        } else {
+            tr!("removed", "удалено")
+        };
+        let freed = if target.dry_run {
+            tr!("would free", "будет освобождено")
+        } else {
+            tr!("freed", "освобождено")
+        };
         println!(
             "{}",
             tr_format!(
@@ -631,15 +703,39 @@ fn confirm(targets: &[job::Target]) -> bool {
     if std::io::stdin().read_line(&mut answer).is_err() {
         return false;
     }
-    matches!(answer.trim().to_lowercase().as_str(), "y" | "yes" | "д" | "да")
+    matches!(
+        answer.trim().to_lowercase().as_str(),
+        "y" | "yes" | "д" | "да"
+    )
 }
 
 fn print_usage() {
     println!("\n{}", banner());
-    println!("{}", tr_format!("Usage: raze [OPTIONS] <PATH>...", "Использование: raze [ПАРАМЕТРЫ] <ПУТЬ>..."));
-    println!("  {}", tr!("Example: raze C:\\Users\\me\\Desktop\\Seller", "Пример: raze C:\\Users\\me\\Desktop\\Seller"));
-    println!("  {}", tr!("Example: raze -n C:\\tmp", "Пример: raze -n C:\\tmp"));
-    println!("\n{}", tr!("Run raze --help for the full list.", "Полный список — raze --help."));
+    println!(
+        "{}",
+        tr_format!(
+            "Usage: raze [OPTIONS] <PATH>...",
+            "Использование: raze [ПАРАМЕТРЫ] <ПУТЬ>..."
+        )
+    );
+    println!(
+        "  {}",
+        tr!(
+            "Example: raze C:\\Users\\me\\Desktop\\Seller",
+            "Пример: raze C:\\Users\\me\\Desktop\\Seller"
+        )
+    );
+    println!(
+        "  {}",
+        tr!("Example: raze -n C:\\tmp", "Пример: raze -n C:\\tmp")
+    );
+    println!(
+        "\n{}",
+        tr!(
+            "Run raze --help for the full list.",
+            "Полный список — raze --help."
+        )
+    );
     println!("{TELEGRAM_URL}");
 }
 
@@ -682,11 +778,27 @@ mod tests {
 
     #[test]
     fn the_elevated_copy_gets_every_option_and_absolute_paths() {
-        let cli = Cli::parse_from(["raze", "-p", "-c", "--keep-owners", "-L", "-vv", "relative-target"]);
+        let cli = Cli::parse_from([
+            "raze",
+            "-p",
+            "-c",
+            "--keep-owners",
+            "-L",
+            "-vv",
+            "relative-target",
+        ]);
         let planned = job::plan(&collect_paths(&cli), &Options::default());
         let args = elevation_arguments(&cli, &planned);
 
-        for expected in ["--elevated", "--yes", "--permanent", "--close-locks", "--keep-owners", "--find-locks", "--"] {
+        for expected in [
+            "--elevated",
+            "--yes",
+            "--permanent",
+            "--close-locks",
+            "--keep-owners",
+            "--find-locks",
+            "--",
+        ] {
             assert!(args.iter().any(|a| a == expected), "{expected}: {args:?}");
         }
         assert!(!args.iter().any(|a| a == "--recycle"));
@@ -704,7 +816,14 @@ mod tests {
     fn install_and_uninstall_accept_the_internal_report_file() {
         // Повышенная копия запускается как `--install --lang xx --report-file PATH`:
         // раньше `--install` был exclusive и такой вызов не разбирался.
-        let cli = Cli::parse_from(["raze", "--install", "--lang", "ru", "--report-file", "C:\\tmp\\r.txt"]);
+        let cli = Cli::parse_from([
+            "raze",
+            "--install",
+            "--lang",
+            "ru",
+            "--report-file",
+            "C:\\tmp\\r.txt",
+        ]);
         assert!(cli.install);
         assert_eq!(cli.report_file, Some(PathBuf::from("C:\\tmp\\r.txt")));
         let cli = Cli::parse_from(["raze", "--uninstall", "--report-file", "r.txt"]);
@@ -716,7 +835,8 @@ mod tests {
         assert_ne!(unpredictable_name(), unpredictable_name());
         assert_eq!(unpredictable_name().len(), 32);
         // Занятое имя (файл или ссылка) не перезаписывается: create_new откажет.
-        let taken = std::env::temp_dir().join(format!("raze-report-test-{}.txt", unpredictable_name()));
+        let taken =
+            std::env::temp_dir().join(format!("raze-report-test-{}.txt", unpredictable_name()));
         std::fs::write(&taken, b"keep").unwrap();
         assert!(write_install_report(&taken, &["replace".into()]).is_err());
         assert_eq!(std::fs::read(&taken).unwrap(), b"keep");
@@ -728,7 +848,10 @@ mod tests {
         let mut report = shell::InstallReport::default();
         let (_, code) = install_summary(&report, false);
         assert_eq!(code, 0);
-        report.steps.push(shell::Step::Failed { what: "copy x".into(), error: "boom".into() });
+        report.steps.push(shell::Step::Failed {
+            what: "copy x".into(),
+            error: "boom".into(),
+        });
         let (lines, code) = install_summary(&report, false);
         assert_eq!(code, 1);
         assert!(lines.iter().any(|l| l == "[fail] copy x: boom"));
@@ -766,5 +889,4 @@ mod tests {
         let args = elevation_arguments(&cli, &planned);
         assert_eq!(args.last().unwrap(), native.as_os_str());
     }
-
 }

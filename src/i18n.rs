@@ -7,8 +7,8 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use serde::Serialize;
-use winreg::RegKey;
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+use winreg::RegKey;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -62,7 +62,11 @@ pub fn load_language() -> std::io::Result<Language> {
 
 /// Save only an explicit user choice, not a command-line override.
 pub fn save_language(language: Language) -> std::io::Result<()> {
-    write_language(&RegKey::predef(HKEY_CURRENT_USER), PREFERENCES_KEY, language)
+    write_language(
+        &RegKey::predef(HKEY_CURRENT_USER),
+        PREFERENCES_KEY,
+        language,
+    )
 }
 
 fn read_language(root: &RegKey, path: &str) -> std::io::Result<Language> {
@@ -100,7 +104,6 @@ pub fn language() -> Language {
 pub fn is_russian() -> bool {
     LANGUAGE.load(Ordering::Relaxed) == 1
 }
-
 
 #[macro_export]
 macro_rules! tr {
@@ -141,22 +144,37 @@ mod tests {
         assert!(Language::parse(Language::Ru.label().to_lowercase().as_str()).is_err());
     }
 
-
     #[test]
     fn saved_language_survives_reopening_and_invalid_data_is_not_overwritten() {
         let root = RegKey::predef(HKEY_CURRENT_USER);
-        let path = format!(r"Software\RAZE.Tests\language-{}-{}",
+        let path = format!(
+            r"Software\RAZE.Tests\language-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
         assert_eq!(read_language(&root, &path).unwrap(), Language::En);
         for language in [Language::Ru, Language::En] {
             write_language(&root, &path, language).unwrap();
-            assert_eq!(read_language(&RegKey::predef(HKEY_CURRENT_USER), &path).unwrap(), language);
+            assert_eq!(
+                read_language(&RegKey::predef(HKEY_CURRENT_USER), &path).unwrap(),
+                language
+            );
         }
-        let key = root.open_subkey_with_flags(&path, winreg::enums::KEY_WRITE | KEY_READ).unwrap();
+        let key = root
+            .open_subkey_with_flags(&path, winreg::enums::KEY_WRITE | KEY_READ)
+            .unwrap();
         key.set_value("Language", &"unsupported").unwrap();
-        assert_eq!(read_language(&root, &path).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
-        assert_eq!(key.get_value::<String, _>("Language").unwrap(), "unsupported");
+        assert_eq!(
+            read_language(&root, &path).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            key.get_value::<String, _>("Language").unwrap(),
+            "unsupported"
+        );
         drop(key);
         root.delete_subkey_all(&path).unwrap();
     }

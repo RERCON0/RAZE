@@ -24,19 +24,36 @@ pub fn pin_pixel_scale(ctx: &egui::Context, resize_viewport: bool) {
     }
     ctx.set_pixels_per_point(UI_SCALE);
     if resize_viewport {
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(WINDOW_SIZE[0], WINDOW_SIZE[1])));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
+            WINDOW_SIZE[0],
+            WINDOW_SIZE[1],
+        )));
     }
-    ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(WINDOW_MIN_SIZE[0], WINDOW_MIN_SIZE[1])));
+    ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+        WINDOW_MIN_SIZE[0],
+        WINDOW_MIN_SIZE[1],
+    )));
 }
 
 pub fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    for (name, offset) in [("body", 0.15), ("button", 0.0), ("field", 0.0), ("title", -0.08)] {
+    for (name, offset) in [
+        ("body", 0.15),
+        ("button", 0.0),
+        ("field", 0.0),
+        ("title", -0.08),
+    ] {
         let key = format!("cascadia-{name}");
-        fonts.font_data.insert(key.clone(), egui::FontData::from_static(MONO).tweak(egui::FontTweak {
-            y_offset_factor: offset, ..Default::default()
-        }));
-        fonts.families.insert(FontFamily::Name(name.into()), vec![key]);
+        fonts.font_data.insert(
+            key.clone(),
+            egui::FontData::from_static(MONO).tweak(egui::FontTweak {
+                y_offset_factor: offset,
+                ..Default::default()
+            }),
+        );
+        fonts
+            .families
+            .insert(FontFamily::Name(name.into()), vec![key]);
     }
     for family in [FontFamily::Monospace, FontFamily::Proportional] {
         if let Some(list) = fonts.families.get_mut(&family) {
@@ -49,7 +66,11 @@ pub fn setup_fonts(ctx: &egui::Context) {
 pub fn setup_theme(ctx: &egui::Context, dark: bool) {
     // egui keeps two style buckets. Configure both so the OS theme cannot
     // replace our spacing or colors after eframe's first native frame.
-    ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
+    ctx.set_theme(if dark {
+        egui::Theme::Dark
+    } else {
+        egui::Theme::Light
+    });
     ctx.all_styles_mut(|style| {
         style.visuals = terminal_visuals(dark);
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
@@ -63,9 +84,17 @@ pub fn setup_theme(ctx: &egui::Context, dark: bool) {
         for (text, size, family) in [
             (egui::TextStyle::Body, 13.0, FontFamily::Proportional),
             (egui::TextStyle::Monospace, 13.0, FontFamily::Monospace),
-            (egui::TextStyle::Button, 12.5, FontFamily::Name("button".into())),
+            (
+                egui::TextStyle::Button,
+                12.5,
+                FontFamily::Name("button".into()),
+            ),
             (egui::TextStyle::Small, 11.5, FontFamily::Proportional),
-            (egui::TextStyle::Heading, 18.0, FontFamily::Name("title".into())),
+            (
+                egui::TextStyle::Heading,
+                18.0,
+                FontFamily::Name("title".into()),
+            ),
         ] {
             style.text_styles.insert(text, FontId::new(size, family));
         }
@@ -77,15 +106,37 @@ pub fn setup_theme(ctx: &egui::Context, dark: bool) {
 pub fn terminal_visuals(dark: bool) -> egui::Visuals {
     let rgb = Color32::from_rgb;
     let (bg, bg_lift, field, line, line_bright, text, text_dim, accent, warn, err) = if dark {
-        (rgb(0x0b, 0x0b, 0x0e), rgb(0x0e, 0x0e, 0x11), rgb(0x11, 0x11, 0x14),
-         rgb(0x1e, 0x1e, 0x24), rgb(0x33, 0x33, 0x3c), rgb(0xd6, 0xd6, 0xda),
-         rgb(0x83, 0x83, 0x8c), rgb(255, 138, 60), rgb(0xe0, 0xb3, 0x4d), rgb(0xe0, 0x65, 0x5c))
+        (
+            rgb(0x0b, 0x0b, 0x0e),
+            rgb(0x0e, 0x0e, 0x11),
+            rgb(0x11, 0x11, 0x14),
+            rgb(0x1e, 0x1e, 0x24),
+            rgb(0x33, 0x33, 0x3c),
+            rgb(0xd6, 0xd6, 0xda),
+            rgb(0x83, 0x83, 0x8c),
+            rgb(255, 138, 60),
+            rgb(0xe0, 0xb3, 0x4d),
+            rgb(0xe0, 0x65, 0x5c),
+        )
     } else {
-        (rgb(0xf3, 0xf3, 0xf1), rgb(0xff, 0xff, 0xff), rgb(0xfb, 0xfb, 0xfa),
-         rgb(0xda, 0xda, 0xd6), rgb(0xb5, 0xb5, 0xb0), rgb(0x1c, 0x1c, 0x1e),
-         rgb(0x5c, 0x5c, 0x62), rgb(163, 70, 12), rgb(0x9a, 0x67, 0x00), rgb(0xcf, 0x22, 0x2e))
+        (
+            rgb(0xf3, 0xf3, 0xf1),
+            rgb(0xff, 0xff, 0xff),
+            rgb(0xfb, 0xfb, 0xfa),
+            rgb(0xda, 0xda, 0xd6),
+            rgb(0xb5, 0xb5, 0xb0),
+            rgb(0x1c, 0x1c, 0x1e),
+            rgb(0x5c, 0x5c, 0x62),
+            rgb(163, 70, 12),
+            rgb(0x9a, 0x67, 0x00),
+            rgb(0xcf, 0x22, 0x2e),
+        )
     };
-    let mut v = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
+    let mut v = if dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
     v.window_rounding = egui::Rounding::ZERO;
     v.menu_rounding = egui::Rounding::ZERO;
     v.window_fill = bg_lift;
@@ -101,8 +152,13 @@ pub fn terminal_visuals(dark: bool) -> egui::Visuals {
     v.error_fg_color = err;
     v.selection.bg_fill = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 45);
     v.selection.stroke = Stroke::new(1.0, accent);
-    for widget in [&mut v.widgets.noninteractive, &mut v.widgets.inactive,
-        &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
+    for widget in [
+        &mut v.widgets.noninteractive,
+        &mut v.widgets.inactive,
+        &mut v.widgets.hovered,
+        &mut v.widgets.active,
+        &mut v.widgets.open,
+    ] {
         widget.rounding = egui::Rounding::ZERO;
         // bg_fill backs checkboxes and must stay visible; weak_bg_fill backs
         // plain buttons, which is what makes them "ghost" (border only).
@@ -146,22 +202,43 @@ pub fn window_title(text: &str) -> RichText {
 
 pub fn accent_button(text: &str, accent: Color32) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text.to_owned()).color(accent))
-        .stroke(Stroke::new(1.0, accent)).fill(Color32::TRANSPARENT)
+        .stroke(Stroke::new(1.0, accent))
+        .fill(Color32::TRANSPARENT)
 }
 
 /// Flat "● label" / "○ label" choice with no box, as SNATCH's engine row.
 /// `active` is the colour of the picked choice.
 pub fn choice(ui: &mut egui::Ui, label: &str, selected: bool, active: Color32) -> egui::Response {
-    let color = if selected { active } else { ui.visuals().widgets.inactive.fg_stroke.color };
-    let dot_color = if selected { active } else { ui.visuals().weak_text_color() };
+    let color = if selected {
+        active
+    } else {
+        ui.visuals().widgets.inactive.fg_stroke.color
+    };
+    let dot_color = if selected {
+        active
+    } else {
+        ui.visuals().weak_text_color()
+    };
     // The dot is 11pt and the label 13pt: two sizes in one label need a LayoutJob.
     let mut job = egui::text::LayoutJob::default();
-    job.append(if selected { "● " } else { "○ " }, 0.0, egui::TextFormat {
-        font_id: FontId::monospace(11.0), color: dot_color, ..Default::default()
-    });
-    job.append(label, 0.0, egui::TextFormat {
-        font_id: FontId::monospace(13.0), color, ..Default::default()
-    });
+    job.append(
+        if selected { "● " } else { "○ " },
+        0.0,
+        egui::TextFormat {
+            font_id: FontId::monospace(11.0),
+            color: dot_color,
+            ..Default::default()
+        },
+    );
+    job.append(
+        label,
+        0.0,
+        egui::TextFormat {
+            font_id: FontId::monospace(13.0),
+            color,
+            ..Default::default()
+        },
+    );
     let text: egui::WidgetText = job.into();
     // Not .fill()/.stroke(): each of them silently turns the frame back on.
     ui.add(egui::Button::new(text).frame(false))
@@ -179,7 +256,8 @@ pub fn slow_spinner(ui: &mut egui::Ui) {
     if !ui.is_rect_visible(rect) {
         return;
     }
-    ui.ctx().request_repaint_after(std::time::Duration::from_millis(66));
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(66));
     let radius = (rect.height() / 2.0) - 2.0;
     let time = ui.input(|i| i.time);
     let start = time * std::f64::consts::TAU;
@@ -191,8 +269,10 @@ pub fn slow_spinner(ui: &mut egui::Ui) {
             rect.center() + radius * egui::vec2(cos as f32, sin as f32)
         })
         .collect();
-    ui.painter()
-        .add(egui::Shape::line(points, Stroke::new(3.0, ui.visuals().strong_text_color())));
+    ui.painter().add(egui::Shape::line(
+        points,
+        Stroke::new(3.0, ui.visuals().strong_text_color()),
+    ));
 }
 
 pub fn tag(ui: &mut egui::Ui, text: &str) {
@@ -201,13 +281,20 @@ pub fn tag(ui: &mut egui::Ui, text: &str) {
 
 /// Dashed 1px rule across the available width, as SNATCH's separator.
 pub fn rule(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
     let stroke = Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
     let (dash, gap) = (4.0, 3.0);
     let mut x = rect.left();
     while x < rect.right() {
         let end = (x + dash).min(rect.right());
-        ui.painter().line_segment([egui::pos2(x, rect.center().y), egui::pos2(end, rect.center().y)], stroke);
+        ui.painter().line_segment(
+            [
+                egui::pos2(x, rect.center().y),
+                egui::pos2(end, rect.center().y),
+            ],
+            stroke,
+        );
         x += dash + gap;
     }
 }
@@ -216,7 +303,9 @@ pub fn badge(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
     egui::Frame::none()
         .stroke(Stroke::new(1.0, color.gamma_multiply(0.5)))
         .inner_margin(egui::Margin::symmetric(6.0, 2.0))
-        .show(ui, |ui| ui.label(RichText::new(text).size(11.0).color(color)))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text).size(11.0).color(color))
+        })
         .response
 }
 
@@ -225,17 +314,32 @@ pub fn badge(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
 /// whole block is centred. Only line breaks are trimmed: `trim()` would eat the
 /// first row's leading space and shift it one column left.
 pub fn wordmark(ui: &mut egui::Ui) {
-    let lines: Vec<&str> = raze_rs::WORDMARK.trim_matches(['\r', '\n']).lines().collect();
+    let lines: Vec<&str> = raze_rs::WORDMARK
+        .trim_matches(['\r', '\n'])
+        .lines()
+        .collect();
     let measure = |ui: &egui::Ui, text: &str, size: f32| -> egui::Vec2 {
-        ui.fonts(|fonts| fonts.layout_job(egui::text::LayoutJob::single_section(
-            text.to_string(),
-            egui::TextFormat { font_id: FontId::monospace(size), ..Default::default() },
-        )).size())
+        ui.fonts(|fonts| {
+            fonts
+                .layout_job(egui::text::LayoutJob::single_section(
+                    text.to_string(),
+                    egui::TextFormat {
+                        font_id: FontId::monospace(size),
+                        ..Default::default()
+                    },
+                ))
+                .size()
+        })
     };
     ui.add_space(2.0);
     ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
         let available = ui.available_width();
-        let width_at = |size: f32| lines.iter().map(|line| measure(ui, line, size).x).fold(0.0_f32, f32::max);
+        let width_at = |size: f32| {
+            lines
+                .iter()
+                .map(|line| measure(ui, line, size).x)
+                .fold(0.0_f32, f32::max)
+        };
         // Подбор кегля — до двенадцати замеров всех строк; он зависит только от
         // ширины окна, поэтому считается один раз на ширину, а не на кадр.
         let cache_id = egui::Id::new("wordmark-size");
@@ -247,11 +351,15 @@ pub fn wordmark(ui: &mut egui::Ui) {
                 while size > 5.0 && width_at(size) > available {
                     size -= 0.5;
                 }
-                ui.ctx().data_mut(|data| data.insert_temp(cache_id, (available.to_bits(), size)));
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(cache_id, (available.to_bits(), size)));
                 size
             }
         };
-        let block = egui::vec2(width_at(size) + 2.0, measure(ui, "█", size).y * lines.len() as f32);
+        let block = egui::vec2(
+            width_at(size) + 2.0,
+            measure(ui, "█", size).y * lines.len() as f32,
+        );
         // Align::Min: the art is not a padded rectangle, so rows that centred
         // themselves would drift sideways from their neighbours.
         ui.allocate_ui_with_layout(block, egui::Layout::top_down(egui::Align::Min), |ui| {

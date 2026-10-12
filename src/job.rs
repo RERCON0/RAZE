@@ -254,9 +254,17 @@ pub fn execute(targets: &[Target], options: &Options) -> Report {
         let mut target_report = TargetReport {
             path: target.display.clone(),
             native_path: path.to_path(),
-            disposition: if options.permanent { Disposition::Permanent } else { mode_of(target) },
+            disposition: if options.permanent {
+                Disposition::Permanent
+            } else {
+                mode_of(target)
+            },
             reason: if options.permanent {
-                crate::tr!("permanent removal was requested", "выбрано безвозвратное удаление").to_string()
+                crate::tr!(
+                    "permanent removal was requested",
+                    "выбрано безвозвратное удаление"
+                )
+                .to_string()
             } else {
                 target.verdict.reason.clone()
             },
@@ -367,7 +375,10 @@ mod tests {
 
         paths.push(PathBuf::from("C:\\"));
         let targets = plan(&paths, &options);
-        assert!(targets[1].refused.is_some(), "корень тома обязан быть отклонён");
+        assert!(
+            targets[1].refused.is_some(),
+            "корень тома обязан быть отклонён"
+        );
         assert!(!has_work(&targets[1..]));
     }
 
@@ -465,10 +476,16 @@ mod tests {
             path: Some(NtPath::new(std::path::Path::new(&format!("{windows}\\System32"))).unwrap()),
             entries: Vec::new(),
             summary: ScanSummary::default(),
-            verdict: RecycleVerdict { reusable: false, reason: String::new() },
+            verdict: RecycleVerdict {
+                reusable: false,
+                reason: String::new(),
+            },
             refused: None,
         };
-        let options = Options { dry_run: true, ..Default::default() };
+        let options = Options {
+            dry_run: true,
+            ..Default::default()
+        };
         let report = execute(&[forged], &options);
         assert_eq!(report.refused.len(), 1);
         assert!(report.targets.is_empty());
@@ -479,12 +496,18 @@ mod tests {
         use std::os::windows::ffi::OsStringExt;
         let base = scratch("raw-utf16");
         let file = base.join(std::ffi::OsString::from_wide(&[
-            b'r' as u16, b'a' as u16, b'w' as u16, 0xD800,
+            b'r' as u16,
+            b'a' as u16,
+            b'w' as u16,
+            0xD800,
         ]));
         let sibling = base.join("raw\u{FFFD}");
         std::fs::write(&file, b"intended").unwrap();
         std::fs::write(&sibling, b"preserve").unwrap();
-        let options = Options { permanent: true, ..Default::default() };
+        let options = Options {
+            permanent: true,
+            ..Default::default()
+        };
         let targets = plan(&[file.clone()], &options);
         let report = execute(&targets, &options);
         assert!(!report.failed(), "{:?}", report.targets);
@@ -500,7 +523,11 @@ mod tests {
         std::fs::write(&file, b"keep during preview").unwrap();
         let mut targets = plan(&[file.clone()], &Options::default());
         targets[0].verdict.reusable = true;
-        let options = Options { permanent: true, dry_run: true, ..Default::default() };
+        let options = Options {
+            permanent: true,
+            dry_run: true,
+            ..Default::default()
+        };
         let report = execute(&targets, &options);
         assert_eq!(report.targets[0].disposition, Disposition::Permanent);
         assert!(file.exists());

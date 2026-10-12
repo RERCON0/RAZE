@@ -28,13 +28,20 @@ pub const WORDMARK: &str = r#"
 
 /// Tagline under the wordmark, in the interface language.
 pub fn tagline() -> &'static str {
-    tr!("stubborn files, clean folders", "сложные файлы. чистые папки.")
+    tr!(
+        "stubborn files, clean folders",
+        "сложные файлы. чистые папки."
+    )
 }
 
 /// Wordmark plus the tagline centred under it, for the CLI.
 pub fn banner() -> String {
     let art = WORDMARK.trim_matches(['\r', '\n']);
-    let width = art.lines().map(|line| line.chars().count()).max().unwrap_or(0);
+    let width = art
+        .lines()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0);
     let tagline = tagline();
     let pad = width.saturating_sub(tagline.chars().count()) / 2;
     format!("{art}\n{}{tagline}\n", " ".repeat(pad))
@@ -53,4 +60,3 @@ pub fn outln(s: impl AsRef<str>) {
 pub fn errln(s: impl AsRef<str>) {
     eprintln!("{}", s.as_ref());
 }
-

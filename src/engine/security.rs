@@ -7,19 +7,20 @@
 
 use std::ptr;
 
-use windows::Win32::Foundation::{HLOCAL, LocalFree};
-use windows::Win32::Security::{
-    ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-};
+use windows::core::PWSTR;
+use windows::Win32::Foundation::{LocalFree, HLOCAL};
 use windows::Win32::Security::Authorization::{
-    ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GetSecurityInfo, GRANT_ACCESS, SE_FILE_OBJECT,
-    SetEntriesInAclW, SetSecurityInfo, TRUSTEE_IS_ALIAS, TRUSTEE_IS_SID, TRUSTEE_IS_USER,
+    ConvertStringSidToSidW, GetSecurityInfo, SetEntriesInAclW, SetSecurityInfo, EXPLICIT_ACCESS_W,
+    GRANT_ACCESS, SE_FILE_OBJECT, TRUSTEE_IS_ALIAS, TRUSTEE_IS_SID, TRUSTEE_IS_USER,
     TRUSTEE_IS_WELL_KNOWN_GROUP, TRUSTEE_W,
 };
-use windows::core::PWSTR;
+use windows::Win32::Security::{
+    ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE, OWNER_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR,
+};
 
-use super::error::{ERROR_OUTSIDE_TREE, NtError};
-use super::handle::{Containment, OwnedHandle, open_with};
+use super::error::{NtError, ERROR_OUTSIDE_TREE};
+use super::handle::{open_with, Containment, OwnedHandle};
 use super::path::{NtPath, Wide};
 use super::privs;
 
@@ -53,14 +54,14 @@ impl LocalSid {
     }
 
     fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.0.0.cast::<u8>(), self.1) }
+        unsafe { std::slice::from_raw_parts(self.0 .0.cast::<u8>(), self.1) }
     }
 }
 
 impl Drop for LocalSid {
     fn drop(&mut self) {
         unsafe {
-            let _ = LocalFree(Some(HLOCAL(self.0.0.cast())));
+            let _ = LocalFree(Some(HLOCAL(self.0 .0.cast())));
         }
     }
 }
@@ -68,7 +69,9 @@ impl Drop for LocalSid {
 struct LocalSecurityDescriptor(PSECURITY_DESCRIPTOR);
 impl Drop for LocalSecurityDescriptor {
     fn drop(&mut self) {
-        unsafe { let _ = LocalFree(Some(HLOCAL(self.0.0))); }
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(self.0 .0)));
+        }
     }
 }
 
@@ -103,7 +106,9 @@ pub fn take_ownership(path: &NtPath, guard: Option<&Containment>) -> Result<(), 
             handle.raw(),
             SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION,
-            Some(windows::Win32::Security::PSID(owner.as_ptr() as *mut core::ffi::c_void)),
+            Some(windows::Win32::Security::PSID(
+                owner.as_ptr() as *mut core::ffi::c_void
+            )),
             None,
             None,
             None,
@@ -148,7 +153,9 @@ pub fn grant_full_control(path: &NtPath, guard: Option<&Containment>) -> Result<
         let _descriptor = LocalSecurityDescriptor(descriptor);
         // A NULL DACL already grants everybody full access; replacing it with
         // just our trustees would revoke existing access rather than extend it.
-        if existing.is_null() { return Ok(()); }
+        if existing.is_null() {
+            return Ok(());
+        }
 
         let entries = [
             entry(current.as_slice(), TRUSTEE_IS_USER),
@@ -218,15 +225,23 @@ mod tests {
         let mut access = entry(&sid, TRUSTEE_IS_USER);
         access.grfAccessPermissions = rights;
         let mut acl = ptr::null_mut();
-        unsafe { SetEntriesInAclW(Some(&[access]), None, &mut acl) }.ok().unwrap();
+        unsafe { SetEntriesInAclW(Some(&[access]), None, &mut acl) }
+            .ok()
+            .unwrap();
         let acl = LocalAcl(acl);
         unsafe {
             SetSecurityInfo(
-                handle.raw(), SE_FILE_OBJECT,
+                handle.raw(),
+                SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                None, None, Some(acl.0), None,
+                None,
+                None,
+                Some(acl.0),
+                None,
             )
-        }.ok().unwrap();
+        }
+        .ok()
+        .unwrap();
     }
 
     #[test]
@@ -234,7 +249,10 @@ mod tests {
         let base = std::env::temp_dir().join(format!(
             "raze-acl-repair-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::create_dir(&base).unwrap();
         let file = base.join("locked.txt");
@@ -245,12 +263,30 @@ mod tests {
         // Neither the file nor its parent grants a deletion route.
         // Win32 CreateFile also requires SYNCHRONIZE; omit DELETE, not this
         // unrelated prerequisite for opening a synchronous file handle.
-        let file_access = restrict(&path, (READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES | windows::Win32::Storage::FileSystem::SYNCHRONIZE).0);
+        let file_access = restrict(
+            &path,
+            (READ_CONTROL
+                | WRITE_DAC
+                | WRITE_OWNER
+                | FILE_READ_ATTRIBUTES
+                | windows::Win32::Storage::FileSystem::SYNCHRONIZE)
+                .0,
+        );
         let root_access = restrict(&root, FILE_ALL_ACCESS.0 & !FILE_DELETE_CHILD.0);
-        let denied = open_with(&path, DELETE, windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT).is_err();
+        let denied = open_with(
+            &path,
+            DELETE,
+            windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+        .is_err();
         let owner = take_ownership(&path, Some(&guard));
         let grant = grant_full_control(&path, Some(&guard));
-        let deletable = open_with(&path, DELETE, windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT).is_ok();
+        let deletable = open_with(
+            &path,
+            DELETE,
+            windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+        )
+        .is_ok();
         // Restore access before assertions so a failed regression does not
         // leave an ACL-restricted temporary object behind.
         set_access(&file_access, FILE_ALL_ACCESS.0);
@@ -270,7 +306,10 @@ mod tests {
         let base = std::env::temp_dir().join(format!(
             "raze-acl-scan-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         std::fs::create_dir(&base).unwrap();
         let root = NtPath::new(&base).unwrap();
@@ -280,21 +319,37 @@ mod tests {
             std::fs::create_dir(&path).unwrap();
             std::fs::write(path.join("contents.txt"), b"x").unwrap();
             let path = NtPath::new(&path).unwrap();
-            restrict(&path, FILE_ALL_ACCESS.0 & !windows::Win32::Storage::FileSystem::FILE_LIST_DIRECTORY.0);
+            restrict(
+                &path,
+                FILE_ALL_ACCESS.0 & !windows::Win32::Storage::FileSystem::FILE_LIST_DIRECTORY.0,
+            );
             paths.push(path);
         }
-        let options = ScanOptions { max_listed: 1, probe_access: false, ..ScanOptions::default() };
+        let options = ScanOptions {
+            max_listed: 1,
+            probe_access: false,
+            ..ScanOptions::default()
+        };
         let (listed, summary) = scan(&root, &options);
-        let (empty, zero) = scan(&root, &ScanOptions { max_listed: 0, ..options });
-        for path in paths { restrict(&path, FILE_ALL_ACCESS.0); }
+        let (empty, zero) = scan(
+            &root,
+            &ScanOptions {
+                max_listed: 0,
+                ..options
+            },
+        );
+        for path in paths {
+            restrict(&path, FILE_ALL_ACCESS.0);
+        }
         std::fs::remove_dir_all(&base).unwrap();
         assert!(summary.truncated);
         assert_eq!((summary.directories, summary.troubled), (4, 4));
         assert_eq!(listed.len() + summary.unlisted, summary.directories);
         assert!(listed.len() <= options.max_listed * 2);
-        assert!(listed.iter().all(|entry| entry.blockers.iter().any(
-            |blocker| matches!(blocker, crate::engine::scan::Blocker::Unreadable { .. })
-        )));
+        assert!(listed.iter().all(|entry| entry
+            .blockers
+            .iter()
+            .any(|blocker| matches!(blocker, crate::engine::scan::Blocker::Unreadable { .. }))));
         let mut listed_paths: Vec<_> = listed.iter().map(|entry| &entry.path).collect();
         listed_paths.sort();
         listed_paths.dedup();

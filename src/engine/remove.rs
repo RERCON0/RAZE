@@ -14,17 +14,15 @@ use std::time::Duration;
 
 use serde::Serialize;
 use windows::Win32::Storage::FileSystem::{
+    FileDispositionInfo, FileDispositionInfoEx, SetFileInformationByHandle,
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE,
     FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
-    FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX, FileDispositionInfo, FileDispositionInfoEx,
-    SetFileInformationByHandle,
+    FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
 };
 
 use super::dir;
-use super::error::{ERROR_OUTSIDE_TREE, NtError};
-use super::handle::{
-    Containment, attributes, clear_read_only, open_for_delete, open_for_read,
-};
+use super::error::{NtError, ERROR_OUTSIDE_TREE};
+use super::handle::{attributes, clear_read_only, open_for_delete, open_for_read, Containment};
 use super::locker::{self, Holder};
 use super::path::NtPath;
 use super::privs;
@@ -61,14 +59,27 @@ impl Default for RemoveOptions {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Note {
-    ReadOnlyCleared { path: String },
-    OwnershipTaken { path: String },
-    AccessGranted { path: String },
-    ProcessCloseRequested { pid: u32, name: String },
+    ReadOnlyCleared {
+        path: String,
+    },
+    OwnershipTaken {
+        path: String,
+    },
+    AccessGranted {
+        path: String,
+    },
+    ProcessCloseRequested {
+        pid: u32,
+        name: String,
+    },
     /// Объект исчез между сканированием и удалением.
-    Vanished { path: String },
+    Vanished {
+        path: String,
+    },
     /// Помечен на удаление, но физически ещё лежит — ждём закрытия дескрипторов.
-    DeletePending { path: String },
+    DeletePending {
+        path: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -145,7 +156,6 @@ pub fn remove_tree(root: &NtPath, options: &RemoveOptions) -> Outcome {
         privs::enable_backup_restore();
     }
 
-
     // Пробный прогон ничего не меняет, и защищать в нём нечего.
     let guard = if options.dry_run {
         None
@@ -194,7 +204,15 @@ pub fn remove_tree(root: &NtPath, options: &RemoveOptions) -> Outcome {
                 // сбое на содержимом корень не сносится (он не пуст), попытка
                 // только добавила бы шум.
                 if !outcome.failed() {
-                    remove_leaf(&finished.dir, EntryKind::Directory, 0, options, guard, &mut outcome, false);
+                    remove_leaf(
+                        &finished.dir,
+                        EntryKind::Directory,
+                        0,
+                        options,
+                        guard,
+                        &mut outcome,
+                        false,
+                    );
                 }
                 break;
             };
@@ -204,7 +222,15 @@ pub fn remove_tree(root: &NtPath, options: &RemoveOptions) -> Outcome {
                 parent.failed = true;
             } else {
                 let before = outcome.failures.len();
-                remove_leaf(&finished.dir, EntryKind::Directory, 0, options, guard, &mut outcome, true);
+                remove_leaf(
+                    &finished.dir,
+                    EntryKind::Directory,
+                    0,
+                    options,
+                    guard,
+                    &mut outcome,
+                    true,
+                );
                 if outcome.failures.len() > before {
                     parent.failed = true;
                 }
@@ -301,10 +327,7 @@ impl Frame {
 
 /// Удаляет уже перечисленные объекты — так работает «точечный» режим GUI,
 /// где пользователь отметил конкретные файлы и папки.
-pub fn remove_selected(
-    targets: &[(NtPath, EntryKind, u64)],
-    options: &RemoveOptions,
-) -> Outcome {
+pub fn remove_selected(targets: &[(NtPath, EntryKind, u64)], options: &RemoveOptions) -> Outcome {
     let mut outcome = Outcome {
         dry_run: options.dry_run,
         ..Default::default()
@@ -336,7 +359,7 @@ pub fn remove_selected(
 /// обход сам доложит `Vanished` или ошибку доступа.
 fn classify_root(root: &NtPath) -> Option<(EntryKind, u64)> {
     use windows::Win32::Storage::FileSystem::{
-        FileStandardInfo, FILE_STANDARD_INFO, GetFileInformationByHandleEx,
+        FileStandardInfo, GetFileInformationByHandleEx, FILE_STANDARD_INFO,
     };
     let handle = open_for_read(root).ok()?;
     let attrs = attributes(&handle).ok()?;
@@ -426,10 +449,14 @@ fn remove_leaf(
                                 });
                             }
                         }
-                        if attempt < options.retries && locker::wait_for_release(
-                            &[path.to_path()],
-                            options.lock_timeout.min(Duration::from_millis(400) * attempt),
-                        ) {
+                        if attempt < options.retries
+                            && locker::wait_for_release(
+                                &[path.to_path()],
+                                options
+                                    .lock_timeout
+                                    .min(Duration::from_millis(400) * attempt),
+                            )
+                        {
                             continue;
                         }
                     }
@@ -501,7 +528,6 @@ fn try_delete(
             return DeleteStep::Refused(NtError(ERROR_OUTSIDE_TREE));
         }
     }
-
 
     match mark_for_delete(&handle) {
         Ok(()) => {}
@@ -581,8 +607,6 @@ fn mark_for_delete_legacy(handle: &super::handle::OwnedHandle) -> Result<(), NtE
     })
 }
 
-
-
 /// Тихая проверка существования для отчёта.
 pub fn exists(path: &NtPath) -> bool {
     open_for_read(path).is_ok()
@@ -643,21 +667,27 @@ mod tests {
         std::fs::set_permissions(&file, permissions).unwrap();
         let outcome = remove_tree(
             &NtPath::new(&file).unwrap(),
-            &RemoveOptions { take_ownership: false, ..Default::default() },
+            &RemoveOptions {
+                take_ownership: false,
+                ..Default::default()
+            },
         );
         assert!(!outcome.failed(), "{:?}", outcome.failures);
         assert!(!file.exists(), "readonly file must be removed");
         assert!(base.exists(), "the containing directory must be preserved");
         assert_eq!(outcome.removed_files, 1);
         assert!(!outcome.notes.iter().any(|note| matches!(
-            note, Note::OwnershipTaken { .. } | Note::AccessGranted { .. }
+            note,
+            Note::OwnershipTaken { .. } | Note::AccessGranted { .. }
         )));
         std::fs::remove_dir(base).unwrap();
     }
 
     #[test]
     fn legacy_removal_clears_a_lone_readonly_attribute() {
-        use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_READONLY, FILE_WRITE_ATTRIBUTES, SetFileAttributesW};
+        use windows::Win32::Storage::FileSystem::{
+            SetFileAttributesW, FILE_ATTRIBUTE_READONLY, FILE_WRITE_ATTRIBUTES,
+        };
         let base = scratch("legacy-readonly");
         let file = base.join("one.bin");
         std::fs::write(&file, b"legacy").unwrap();
@@ -667,11 +697,15 @@ mod tests {
             &path,
             super::super::handle::delete_access() | FILE_WRITE_ATTRIBUTES,
             super::super::handle::object_flags(),
-        ).unwrap();
+        )
+        .unwrap();
         clear_read_only(&handle).unwrap();
         mark_for_delete_legacy(&handle).unwrap();
         drop(handle);
-        assert!(!present(&path), "legacy fallback must remove the readonly file");
+        assert!(
+            !present(&path),
+            "legacy fallback must remove the readonly file"
+        );
         std::fs::remove_dir(base).unwrap();
     }
 
@@ -700,10 +734,7 @@ mod tests {
         let root = NtPath::new(&ghost).unwrap();
         let outcome = remove_tree(&root, &RemoveOptions::default());
         assert!(!outcome.failed());
-        assert!(matches!(
-            outcome.notes.first(),
-            Some(Note::Vanished { .. })
-        ));
+        assert!(matches!(outcome.notes.first(), Some(Note::Vanished { .. })));
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -777,7 +808,15 @@ mod tests {
         let options = RemoveOptions::default();
 
         let mut outcome = Outcome::default();
-        remove_leaf(&through_link, EntryKind::File, 7, &options, Some(&guard), &mut outcome, true);
+        remove_leaf(
+            &through_link,
+            EntryKind::File,
+            7,
+            &options,
+            Some(&guard),
+            &mut outcome,
+            true,
+        );
         assert_eq!(outcome.failures.len(), 1, "{:?}", outcome.failures);
         assert_eq!(outcome.failures[0].code, ERROR_OUTSIDE_TREE);
         assert_eq!(outcome.removed_files, 0);
@@ -785,7 +824,15 @@ mod tests {
 
         // Без проверки тот же вызов сносит чужой файл: это и была дыра.
         let mut unguarded = Outcome::default();
-        remove_leaf(&through_link, EntryKind::File, 7, &options, None, &mut unguarded, true);
+        remove_leaf(
+            &through_link,
+            EntryKind::File,
+            7,
+            &options,
+            None,
+            &mut unguarded,
+            true,
+        );
         assert!(!outside.join("victim.txt").exists());
 
         let _ = std::fs::remove_dir(&link); // сама ссылка, без захода в цель
@@ -815,10 +862,12 @@ mod tests {
         let outcome = remove_tree(&NtPath::new(&base).unwrap(), &options);
         assert_eq!(outcome.failures.len(), 1, "{:?}", outcome.failures);
         assert!(locked.exists());
-        assert!(!base.join("a").join("free.txt").exists(), "остальное уходит");
+        assert!(
+            !base.join("a").join("free.txt").exists(),
+            "остальное уходит"
+        );
 
         drop(held);
         let _ = std::fs::remove_dir_all(&base);
     }
-
 }

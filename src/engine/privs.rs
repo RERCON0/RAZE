@@ -10,12 +10,13 @@ use std::sync::OnceLock;
 
 use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
 use windows::Win32::Security::{
-    AdjustTokenPrivileges, GetTokenInformation, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES,
-    SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY, TokenUser,
+    AdjustTokenPrivileges, GetTokenInformation, LookupPrivilegeValueW, TokenUser,
+    LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+    TOKEN_QUERY,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-use super::error::{NtError, nt};
+use super::error::{nt, NtError};
 
 /// `AdjustTokenPrivileges` возвращает TRUE даже когда привилегии у токена
 /// нет — тогда в `GetLastError` лежит ERROR_NOT_ALL_ASSIGNED (1300).
@@ -122,7 +123,11 @@ pub fn current_user_sid() -> Result<Vec<u8>, NtError> {
         ))?;
         // TOKEN_USER = { SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes } }.
         // Первое поле — указатель, сам SID лежит по этому адресу.
-        let sid = (*(buffer.as_ptr() as *const windows::Win32::Security::TOKEN_USER)).User.Sid.0.cast::<u8>();
+        let sid = (*(buffer.as_ptr() as *const windows::Win32::Security::TOKEN_USER))
+            .User
+            .Sid
+            .0
+            .cast::<u8>();
         if sid.is_null() {
             return Err(NtError::last());
         }
@@ -161,7 +166,6 @@ pub fn is_elevated() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn current_user_sid_returns_sid_header() {

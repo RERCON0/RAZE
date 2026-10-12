@@ -2,4 +2,4 @@
 
 pub mod install;
 
-pub use install::{InstallReport, Step, install};
+pub use install::{install, InstallReport, Step};

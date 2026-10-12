@@ -111,23 +111,31 @@ fn canonical_path(path: &NtPath) -> Option<PathBuf> {
 
     let handle = open_with(path, FILE_READ_ATTRIBUTES, object_flags()).ok()?;
     let text = String::from_utf16_lossy(&final_path(&handle)?);
-    Some(PathBuf::from(if let Some(rest) = text.strip_prefix("\\\\?\\UNC\\") {
-        format!("\\\\{rest}")
-    } else if let Some(rest) = text.strip_prefix("\\\\?\\") {
-        rest.to_string()
-    } else {
-        text
-    }))
+    Some(PathBuf::from(
+        if let Some(rest) = text.strip_prefix("\\\\?\\UNC\\") {
+            format!("\\\\{rest}")
+        } else if let Some(rest) = text.strip_prefix("\\\\?\\") {
+            rest.to_string()
+        } else {
+            text
+        },
+    ))
 }
 
 /// Проверка одной записи пути против якорей и защищённых поддеревьев.
 fn check_location(target: &Path, locations: &Locations) -> Result<(), Reason> {
-    if anchor_forms(&locations.program_dir).iter().any(|form| would_take_anchor(target, form)) {
+    if anchor_forms(&locations.program_dir)
+        .iter()
+        .any(|form| would_take_anchor(target, form))
+    {
         return Err(Reason::ProgramDirectory);
     }
 
     for (anchor, system) in &locations.anchors {
-        if anchor_forms(anchor).iter().any(|form| would_take_anchor(target, form)) {
+        if anchor_forms(anchor)
+            .iter()
+            .any(|form| would_take_anchor(target, form))
+        {
             let label = anchor.to_string_lossy().to_string();
             return Err(if *system {
                 Reason::SystemLocation { anchor: label }
@@ -184,13 +192,17 @@ fn protected_interior(target: &Path, locations: &Locations) -> Option<String> {
     // 1. Внутри Windows можно только список выше.
     for base in anchor_forms(&locations.windows) {
         if let Some(rest) = inside(&parts, &components_of(&base)) {
-                let disposable = WINDOWS_DISPOSABLE
-                    .iter()
-                    .any(|allowed| rest.len() >= allowed.len() && rest.iter().zip(allowed.iter()).all(|(a, b)| a.as_str() == *b));
-                if !disposable {
-                    return Some(base.to_string_lossy().to_string());
-                }
+            let disposable = WINDOWS_DISPOSABLE.iter().any(|allowed| {
+                rest.len() >= allowed.len()
+                    && rest
+                        .iter()
+                        .zip(allowed.iter())
+                        .all(|(a, b)| a.as_str() == *b)
+            });
+            if !disposable {
+                return Some(base.to_string_lossy().to_string());
             }
+        }
     }
 
     // 2. Program Files: приложения сносить можно, а то, что принадлежит самой
@@ -199,7 +211,10 @@ fn protected_interior(target: &Path, locations: &Locations) -> Option<String> {
         for base in anchor_forms(files) {
             if let Some(rest) = inside(&parts, &components_of(&base)) {
                 let first = rest[0].as_str();
-                if first.starts_with("windows") || first == "common files" || first == "modifiablewindowsapps" {
+                if first.starts_with("windows")
+                    || first == "common files"
+                    || first == "modifiablewindowsapps"
+                {
                     return Some(base.join(first).to_string_lossy().to_string());
                 }
             }
@@ -239,9 +254,8 @@ struct Locations {
 impl Locations {
     fn load() -> Result<Self, Reason> {
         use windows::Win32::UI::Shell::{
-            FOLDERID_LocalAppData, FOLDERID_Profile, FOLDERID_ProgramData,
-            FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_RoamingAppData,
-            FOLDERID_Windows,
+            FOLDERID_LocalAppData, FOLDERID_Profile, FOLDERID_ProgramData, FOLDERID_ProgramFiles,
+            FOLDERID_ProgramFilesX86, FOLDERID_RoamingAppData, FOLDERID_Windows,
         };
         let windows = known_folder(&FOLDERID_Windows)?;
         let program_files = [
@@ -262,18 +276,25 @@ impl Locations {
         ];
         let exe = std::env::current_exe().map_err(|_| Reason::SafetyUnavailable)?;
         let program_dir = exe.parent().ok_or(Reason::SafetyUnavailable)?.to_path_buf();
-        Ok(Self { program_dir, windows, program_files, anchors })
+        Ok(Self {
+            program_dir,
+            windows,
+            program_files,
+            anchors,
+        })
     }
 }
 
 fn known_folder(id: &windows::core::GUID) -> Result<PathBuf, Reason> {
     use std::os::windows::ffi::OsStringExt;
     use windows::Win32::System::Com::CoTaskMemFree;
-    use windows::Win32::UI::Shell::{KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+    use windows::Win32::UI::Shell::{SHGetKnownFolderPath, KF_FLAG_DEFAULT};
     let pointer = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) }
         .map_err(|_| Reason::SafetyUnavailable)?;
     let path = PathBuf::from(std::ffi::OsString::from_wide(unsafe { pointer.as_wide() }));
-    unsafe { CoTaskMemFree(Some(pointer.0.cast())); }
+    unsafe {
+        CoTaskMemFree(Some(pointer.0.cast()));
+    }
     if path.is_absolute() {
         Ok(path)
     } else {
@@ -301,7 +322,10 @@ fn components_of(path: &Path) -> Vec<String> {
 }
 
 fn normalize(component: &str) -> String {
-    component.to_lowercase().trim_end_matches(['\\', '/']).to_string()
+    component
+        .to_lowercase()
+        .trim_end_matches(['\\', '/'])
+        .to_string()
 }
 
 #[cfg(test)]
@@ -318,18 +342,35 @@ mod tests {
         }
         let fake = std::env::temp_dir().join("raze-not-the-system");
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        command.args([
-            "--exact", "protect::tests::spoofed_environment_cannot_disable_system_protection",
-            "--nocapture",
-        ]).env(CHILD, known_folder(&windows::Win32::UI::Shell::FOLDERID_Windows).unwrap());
-        for variable in ["SystemRoot", "windir", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData"] {
+        command
+            .args([
+                "--exact",
+                "protect::tests::spoofed_environment_cannot_disable_system_protection",
+                "--nocapture",
+            ])
+            .env(
+                CHILD,
+                known_folder(&windows::Win32::UI::Shell::FOLDERID_Windows).unwrap(),
+            );
+        for variable in [
+            "SystemRoot",
+            "windir",
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+            "ProgramW6432",
+            "ProgramData",
+        ] {
             command.env(variable, &fake);
         }
         command.env("SystemDrive", "Z:");
         let output = command.output().unwrap();
-        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
-
 
     #[test]
     fn volume_roots_are_always_refused() {
@@ -380,10 +421,16 @@ mod tests {
         assert!(would_take_anchor(Path::new("C:\\a"), Path::new("C:\\a\\b")));
         assert!(would_take_anchor(Path::new("C:\\a"), Path::new("C:\\a")));
         // Цель — потомок якоря: якорь при этом остаётся целым.
-        assert!(!would_take_anchor(Path::new("C:\\a\\b"), Path::new("C:\\a")));
+        assert!(!would_take_anchor(
+            Path::new("C:\\a\\b"),
+            Path::new("C:\\a")
+        ));
         // Похожий по имени сосед — не предок.
         assert!(!would_take_anchor(Path::new("C:\\ab"), Path::new("C:\\a")));
-        assert!(would_take_anchor(Path::new("C:\\A\\B"), Path::new("c:\\a\\b\\c")));
+        assert!(would_take_anchor(
+            Path::new("C:\\A\\B"),
+            Path::new("c:\\a\\b\\c")
+        ));
     }
 
     fn target(path: &str) -> NtPath {
@@ -408,7 +455,10 @@ mod tests {
             "Fonts",
         ] {
             assert!(
-                matches!(check(&target(&format!("{windows}\\{protected}"))), Err(Reason::SystemLocation { .. })),
+                matches!(
+                    check(&target(&format!("{windows}\\{protected}"))),
+                    Err(Reason::SystemLocation { .. })
+                ),
                 "{protected}"
             );
         }
@@ -420,7 +470,10 @@ mod tests {
             "System32\\spool\\PRINTERS\\00001.SPL",
             "Logs\\CBS",
         ] {
-            assert!(check(&target(&format!("{windows}\\{disposable}"))).is_ok(), "{disposable}");
+            assert!(
+                check(&target(&format!("{windows}\\{disposable}"))).is_ok(),
+                "{disposable}"
+            );
         }
         // Соседи по имени — не Windows.
         assert!(check(&target("C:\\Windows.old")).is_ok());
@@ -428,9 +481,19 @@ mod tests {
 
     #[test]
     fn windows_owned_folders_in_program_files_are_protected() {
-        let Ok(files) = std::env::var("ProgramFiles") else { return };
-        for protected in ["WindowsApps", "Windows Defender\\x", "Common Files", "WindowsPowerShell"] {
-            assert!(check(&target(&format!("{files}\\{protected}"))).is_err(), "{protected}");
+        let Ok(files) = std::env::var("ProgramFiles") else {
+            return;
+        };
+        for protected in [
+            "WindowsApps",
+            "Windows Defender\\x",
+            "Common Files",
+            "WindowsPowerShell",
+        ] {
+            assert!(
+                check(&target(&format!("{files}\\{protected}"))).is_err(),
+                "{protected}"
+            );
         }
         // А вот оставшиеся от удалённой программы папки — как раз цель.
         assert!(check(&target(&format!("{files}\\SomeLeftoverApp"))).is_ok());
@@ -441,7 +504,10 @@ mod tests {
     fn system_drive_service_folders_are_protected_but_a_broken_recycle_bin_is_not() {
         let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
         for protected in ["System Volume Information", "Recovery\\x", "Boot"] {
-            assert!(check(&target(&format!("{drive}\\{protected}"))).is_err(), "{protected}");
+            assert!(
+                check(&target(&format!("{drive}\\{protected}"))).is_err(),
+                "{protected}"
+            );
         }
         assert!(check(&target(&format!("{drive}\\$Recycle.Bin"))).is_ok());
     }
@@ -450,7 +516,10 @@ mod tests {
     fn a_short_8_3_name_cannot_hide_a_protected_folder() {
         // `C:\PROGRA~1` — это `C:\Program Files`. Если коротких имён на диске
         // нет, проверять нечего.
-        let alias = format!("{}\\PROGRA~1", std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()));
+        let alias = format!(
+            "{}\\PROGRA~1",
+            std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into())
+        );
         if !Path::new(&alias).exists() {
             return;
         }

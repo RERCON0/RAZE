@@ -11,8 +11,8 @@ use std::fmt;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
-use windows::Win32::Storage::FileSystem::GetFullPathNameW;
 use windows::core::PCWSTR;
+use windows::Win32::Storage::FileSystem::GetFullPathNameW;
 
 /// Классический лимит пути Win32 без префикса `\\?\`.
 pub const MAX_PATH: usize = 260;
@@ -149,7 +149,6 @@ impl Wide {
         Self(out)
     }
 
-
     pub fn to_string_lossy(&self) -> String {
         String::from_utf16_lossy(self.as_slice())
     }
@@ -226,10 +225,14 @@ impl fmt::Display for PathError {
                 "incomplete UNC path: a share name is required",
                 "неполный UNC-путь: нужно указать имя общей папки"
             )),
-            Self::NotAbsolute => {
-                f.write_str(tr!("path cannot be resolved to absolute", "путь не удалось привести к абсолютному"))
-            }
-            Self::NotUtf16 => f.write_str(tr!("path is not valid UTF-16", "путь не является корректным UTF-16")),
+            Self::NotAbsolute => f.write_str(tr!(
+                "path cannot be resolved to absolute",
+                "путь не удалось привести к абсолютному"
+            )),
+            Self::NotUtf16 => f.write_str(tr!(
+                "path is not valid UTF-16",
+                "путь не является корректным UTF-16"
+            )),
             Self::InvalidCharacters => f.write_str(tr!(
                 "path contains characters that names cannot have (* ? \" < > | :)",
                 "в пути есть символы, которых не бывает в именах (* ? \" < > | :)"
@@ -310,34 +313,34 @@ impl NtPath {
         }
 
         // Диск: `C:\...` или `C:...`
-        if text.len() >= 2 && text.as_bytes()[1] == b':'
-            && text.as_bytes()[0].is_ascii_alphabetic() {
-                reject_invalid_characters(&text[2..])?;
-                if text.len() >= 3 && text.as_bytes()[2] == b'\\' {
-                    let plain = normalize_absolute(raw);
-                    return Ok(Self {
-                        ext: Wide::prefixed(r"\\?\", plain.as_slice()),
-                        plain,
-                    });
-                }
-                if text.len() == 2 {
-                    // Голый `C:` — спецификация диска, а не корень тома.
-                    // GetFullPathNameW вернул бы `C:\` (текущий каталог
-                    // диска), и путь стал бы корнем тома.
-                    return Ok(Self {
-                        ext: Wide::prefixed(r"\\?\", slice),
-                        plain: raw.clone(),
-                    });
-                }
-                // `C:foo` — относительно текущей папки диска C. Тут нужен
-                // GetFullPathNameW: он знает про per-drive current directory.
-                let full = full_path_name(raw)?;
-                let plain = normalize_absolute(&Wide::from_path(&full));
+        if text.len() >= 2 && text.as_bytes()[1] == b':' && text.as_bytes()[0].is_ascii_alphabetic()
+        {
+            reject_invalid_characters(&text[2..])?;
+            if text.len() >= 3 && text.as_bytes()[2] == b'\\' {
+                let plain = normalize_absolute(raw);
                 return Ok(Self {
                     ext: Wide::prefixed(r"\\?\", plain.as_slice()),
                     plain,
                 });
             }
+            if text.len() == 2 {
+                // Голый `C:` — спецификация диска, а не корень тома.
+                // GetFullPathNameW вернул бы `C:\` (текущий каталог
+                // диска), и путь стал бы корнем тома.
+                return Ok(Self {
+                    ext: Wide::prefixed(r"\\?\", slice),
+                    plain: raw.clone(),
+                });
+            }
+            // `C:foo` — относительно текущей папки диска C. Тут нужен
+            // GetFullPathNameW: он знает про per-drive current directory.
+            let full = full_path_name(raw)?;
+            let plain = normalize_absolute(&Wide::from_path(&full));
+            return Ok(Self {
+                ext: Wide::prefixed(r"\\?\", plain.as_slice()),
+                plain,
+            });
+        }
 
         // Всё остальное — относительный путь.
         if first == b'\\' {
@@ -529,11 +532,25 @@ pub fn is_reserved_name(name: &str) -> bool {
 
 /// Проверка с учётом надстрочных цифр (они многобайтовые в UTF-16).
 pub fn is_reserved_component_wide(name: &[u16]) -> bool {
-    let end = name.iter().position(|unit| *unit == b'.' as u16).unwrap_or(name.len());
+    let end = name
+        .iter()
+        .position(|unit| *unit == b'.' as u16)
+        .unwrap_or(name.len());
     let base = &name[..end];
-    let end = base.iter().rposition(|unit| *unit != b' ' as u16).map_or(0, |pos| pos + 1);
+    let end = base
+        .iter()
+        .rposition(|unit| *unit != b' ' as u16)
+        .map_or(0, |pos| pos + 1);
     let base = &base[..end];
-    for device in [b"CON".as_slice(), b"PRN", b"AUX", b"NUL", b"CLOCK$", b"CONIN$", b"CONOUT$"] {
+    for device in [
+        b"CON".as_slice(),
+        b"PRN",
+        b"AUX",
+        b"NUL",
+        b"CLOCK$",
+        b"CONIN$",
+        b"CONOUT$",
+    ] {
         if wide_eq_ascii(base, device) {
             return true;
         }
@@ -546,9 +563,10 @@ pub fn is_reserved_component_wide(name: &[u16]) -> bool {
 
 fn wide_eq_ascii(wide: &[u16], ascii: &[u8]) -> bool {
     wide.len() == ascii.len()
-        && wide.iter().zip(ascii).all(|(unit, byte)| {
-            *unit <= 0x7F && (*unit as u8).eq_ignore_ascii_case(byte)
-        })
+        && wide
+            .iter()
+            .zip(ascii)
+            .all(|(unit, byte)| *unit <= 0x7F && (*unit as u8).eq_ignore_ascii_case(byte))
 }
 
 /// `X:\` — буква диска и разделитель. Голый `X:` сюда не входит: после
@@ -659,7 +677,11 @@ mod tests {
 
     #[test]
     fn empty_wide_values_are_safe_win32_strings() {
-        for empty in [Wide::default(), Wide::new(""), Wide::from_path(Path::new(""))] {
+        for empty in [
+            Wide::default(),
+            Wide::new(""),
+            Wide::from_path(Path::new("")),
+        ] {
             assert!(unsafe { empty.pc().as_wide() }.is_empty());
             assert_eq!(NtPath::from_wide(&empty).unwrap_err(), PathError::Empty);
         }
@@ -668,7 +690,10 @@ mod tests {
     #[test]
     fn drive_paths_get_extended_prefix() {
         let path = nt(r"C:\Users\name\Desktop\Seller");
-        assert_eq!(path.ext().to_string_lossy(), r"\\?\C:\Users\name\Desktop\Seller");
+        assert_eq!(
+            path.ext().to_string_lossy(),
+            r"\\?\C:\Users\name\Desktop\Seller"
+        );
         assert_eq!(path.to_string_lossy(), r"C:\Users\name\Desktop\Seller");
     }
 
@@ -696,7 +721,10 @@ mod tests {
             PathError::DevicePath
         );
         assert_eq!(
-            NtPath::new(Path::new(r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1")).unwrap_err(),
+            NtPath::new(Path::new(
+                r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1"
+            ))
+            .unwrap_err(),
             PathError::DevicePath
         );
     }
@@ -754,7 +782,10 @@ mod tests {
             );
         }
         // Для показа и сравнения расширенный UNC — обычный `\\server\share`.
-        assert_eq!(nt(r"\\?\UNC\srv\shr\dir").to_string_lossy(), r"\\srv\shr\dir");
+        assert_eq!(
+            nt(r"\\?\UNC\srv\shr\dir").to_string_lossy(),
+            r"\\srv\shr\dir"
+        );
         assert!(nt(r"\\?\UNC\srv\shr").is_volume_root());
         assert!(nt(r"\\?\C:\").is_volume_root());
     }
@@ -780,10 +811,16 @@ mod tests {
         assert!(!is_reserved_name("NUL1.txt"));
         for name in ["COM¹", "com².txt", "Lpt³.log ", "nul.txt"] {
             assert!(is_reserved_name(name), "{name}");
-            assert!(is_reserved_component_wide(Wide::new(name).as_slice()), "{name}");
+            assert!(
+                is_reserved_component_wide(Wide::new(name).as_slice()),
+                "{name}"
+            );
         }
 
-        assert_eq!(nt(r"C:\dir\NUL").reserved_component().as_deref(), Some("NUL"));
+        assert_eq!(
+            nt(r"C:\dir\NUL").reserved_component().as_deref(),
+            Some("NUL")
+        );
         assert_eq!(
             nt(r"C:\dir\sub\CON.log").reserved_component().as_deref(),
             Some("CON.log")
