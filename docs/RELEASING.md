@@ -8,7 +8,7 @@
 ## Подготовка
 
 Нужны Windows x64, MSVC Build Tools + Windows SDK (`makeappx.exe`, `signtool.exe`),
-Rust 1.99.0 (`rust-toolchain.toml`) и `windres` (MSYS2/MinGW-w64), Python 3.13+ и OpenSSL 3
+Rust 1.99.0 (`rust-toolchain.toml`), компилятор ресурсов Windows SDK (`rc.exe`), Python 3.13+ и OpenSSL 3
 (входит в Git for Windows). Cargo.lock обязателен. Сначала выполните проверки
 из корня репозитория:
 
