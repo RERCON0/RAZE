@@ -30,6 +30,12 @@ const PARENT: &[u16] = &[b'.' as u16, b'.' as u16];
 /// вызывающий решает сам, что с этим делать (в обходе это «пропустить»,
 /// в удалении — «записать отказ»).
 pub fn children(dir: &NtPath) -> Result<Vec<Child>, NtError> {
+    children_limited(dir, usize::MAX).map(|(children, _)| children)
+}
+
+/// Ограниченный список; `true` означает, что найден реальный объект сверх
+/// лимита. Не выделяет память для остальных имён большого каталога.
+pub fn children_limited(dir: &NtPath, limit: usize) -> Result<(Vec<Child>, bool), NtError> {
     let pattern = dir.ext().join(&[b'*' as u16]);
     let mut data = WIN32_FIND_DATAW::default();
     let handle = nt(unsafe {
@@ -47,6 +53,12 @@ pub fn children(dir: &NtPath) -> Result<Vec<Child>, NtError> {
     loop {
         let name = name_of(&data);
         if name != CURRENT && name != PARENT {
+            if out.len() == limit {
+                unsafe {
+                    let _ = FindClose(handle);
+                }
+                return Ok((out, true));
+            }
             out.push(Child {
                 name: name.to_vec(),
                 attributes: data.dwFileAttributes,
@@ -61,7 +73,7 @@ pub fn children(dir: &NtPath) -> Result<Vec<Child>, NtError> {
             // Нормальный конец списка — ERROR_NO_MORE_FILES. Всё остальное
             // (отказ посреди каталога, обрыв сети) раньше тоже означало «конец»,
             // и недочитанный каталог выдавался за полностью прочитанный.
-            return if error.code() == ERROR_NO_MORE_FILES { Ok(out) } else { Err(error) };
+            return if error.code() == ERROR_NO_MORE_FILES { Ok((out, false)) } else { Err(error) };
         }
     }
 }

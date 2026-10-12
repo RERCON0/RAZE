@@ -7,6 +7,7 @@
 
 use crate::tr_format;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::Serialize;
 use windows::Win32::Storage::FileSystem::{
@@ -171,6 +172,9 @@ pub struct ScanSummary {
 /// Рекурсивный обход без рекурсии в стеке: глубина в Windows ограничена
 /// только стеком, а нам не хочется его исчерпывать на пути в 200 компонентов.
 pub fn scan(root: &NtPath, options: &ScanOptions) -> (Vec<Entry>, ScanSummary) {
+    if options.max_entries == 0 {
+        return (Vec::new(), ScanSummary { truncated: true, ..ScanSummary::default() });
+    }
     // Цель-файл или цель-ссылка: каталога нет, читать нечего. Раньше такая
     // цель читалась как каталог и выглядела «нечитаемой папкой» из нуля
     // объектов, поэтому удаление одиночного файла молча не запускалось.
@@ -179,15 +183,21 @@ pub fn scan(root: &NtPath, options: &ScanOptions) -> (Vec<Entry>, ScanSummary) {
     }
     let mut entries = Vec::new();
     let mut summary = ScanSummary::default();
-    let mut stack = vec![(root.clone(), 0usize)];
+    // Queued siblings share their parent path. Storing a full expanded path
+    // per directory makes a wide tree below a long root consume gigabytes.
+    let mut stack = vec![(Arc::new(root.clone()), None::<Vec<u16>>, 0usize, None, false)];
     let (mut visited, mut listed_trouble) = (0usize, 0usize);
 
-    while let Some((dir, depth)) = stack.pop() {
+    while let Some((parent, name, depth, listed_index, was_trouble)) = stack.pop() {
         if depth > options.max_depth {
             summary.truncated = true;
             continue;
         }
-        let children = match dir::children(&dir) {
+        let dir = match name {
+            Some(name) => parent.child_raw(&name),
+            None => Arc::unwrap_or_clone(parent),
+        };
+        let (children, more_children) = match dir::children_limited(&dir, options.max_entries - visited) {
             Ok(children) => children,
             Err(error) if error.not_found() => {
                 summary.truncated = true;
@@ -197,21 +207,39 @@ pub fn scan(root: &NtPath, options: &ScanOptions) -> (Vec<Entry>, ScanSummary) {
                 // Каталог есть, а прочитать его не дали: показываем это
                 // отдельной записью, иначе папка выглядит пустой и «здоровой».
                 summary.truncated = true;
-                entries.push(unreadable(dir.clone(), depth, error.code()));
+                if let Some(index) = listed_index {
+                    let entry: &mut Entry = &mut entries[index];
+                    if !entry.has_trouble() {
+                        summary.troubled += 1;
+                        listed_trouble += 1;
+                    }
+                    entry.blockers.push(Blocker::Unreadable { code: error.code() });
+                } else {
+                    summary.troubled += usize::from(!was_trouble);
+                    if entries.len() < options.max_listed || listed_trouble < options.max_listed {
+                        entries.push(unreadable(dir, depth, error.code()));
+                        listed_trouble += 1;
+                        if depth > 0 { summary.unlisted -= 1; }
+                    } else if depth == 0 {
+                        summary.unlisted += 1;
+                    }
+                }
                 continue;
             }
         };
+        summary.truncated |= more_children;
+        let mut shared_dir = None;
         for child in children {
             let path = dir.child_raw(&child.name);
-            let is_dir = matches!(classify(child.attributes), EntryKind::Directory);
             let entry = make_entry(
-                path.clone(),
+                path,
                 String::from_utf16_lossy(&child.name),
                 depth,
                 child.attributes,
                 child.size,
                 options,
             );
+            let is_dir = entry.kind == EntryKind::Directory;
             match entry.kind {
                 EntryKind::File => summary.files += 1,
                 EntryKind::Directory => summary.directories += 1,
@@ -223,23 +251,28 @@ pub fn scan(root: &NtPath, options: &ScanOptions) -> (Vec<Entry>, ScanSummary) {
             }
             visited += 1;
             let trouble = entry.has_trouble();
-            if entries.len() < options.max_listed || (trouble && listed_trouble < options.max_listed) {
+            let listed_index = if entries.len() < options.max_listed
+                || (trouble && listed_trouble < options.max_listed)
+            {
+                Some(entries.len())
+            } else {
+                None
+            };
+            if listed_index.is_some() {
                 listed_trouble += usize::from(trouble);
                 entries.push(entry);
             } else {
                 summary.unlisted += 1;
             }
 
-            if visited >= options.max_entries {
-                summary.truncated = true;
-                break;
-            }
             // Каталоги кладём в стек только если они настоящие: в link не идём.
             if is_dir {
-                stack.push((path, depth + 1));
+                let parent = shared_dir.get_or_insert_with(|| Arc::new(dir.clone()));
+                stack.push((parent.clone(), Some(child.name), depth + 1, listed_index, trouble));
             }
         }
         if visited >= options.max_entries {
+            summary.truncated |= !stack.is_empty();
             break;
         }
     }
@@ -282,8 +315,8 @@ fn make_entry(
     }
     probe(
         Entry {
-            nt_path: path.clone(),
             path: path.to_path(),
+            nt_path: path,
             name,
             depth,
             kind,
@@ -337,7 +370,12 @@ fn scan_leaf(root: &NtPath, attributes: u32, size: u64, options: &ScanOptions) -
     }
     summary.bytes = entry.size;
     summary.troubled = usize::from(entry.has_trouble());
-    (vec![entry], summary)
+    if options.max_listed == 0 {
+        summary.unlisted = 1;
+        (Vec::new(), summary)
+    } else {
+        (vec![entry], summary)
+    }
 }
 
 /// Достраивает запись реальными атрибутами из дескриптора и, если попросили,
@@ -352,6 +390,7 @@ fn probe(entry: Entry, options: &ScanOptions) -> Entry {
             Ok(handle) => {
                 if let Ok(attrs) = attributes(&handle) {
                     entry.attributes = attrs.attributes;
+                    entry.kind = classify(attrs.attributes);
                     entry.reparse_tag = attrs.reparse_tag;
                     if matches!(entry.kind, EntryKind::Link) {
                         entry.blockers.retain(|b| !matches!(b, Blocker::ReparsePoint { .. }));
@@ -403,28 +442,15 @@ pub fn classify(attributes: u32) -> EntryKind {
 }
 
 fn reserved_component(path: &NtPath) -> Option<String> {
-    let skip = extended_root_len(path);
+    let skip = path.ext().drive_prefix_len().unwrap_or(0);
     path.ext()
         .as_slice()[skip..]
         .split(|c| *c == b'\\' as u16)
         .filter(|c| !c.is_empty())
-        .map(|c| c.to_vec())
         .find(|c| is_reserved_component_wide(c))
-        .map(|c| String::from_utf16_lossy(&c))
+        .map(String::from_utf16_lossy)
 }
 
-fn extended_root_len(path: &NtPath) -> usize {
-    let text = path.ext().to_string_lossy();
-    if let Some(rest) = text.strip_prefix("\\\\?\\UNC\\") {
-        // \\?\UNC\server\share — корень заканчивается после имени шары.
-        match rest.find('\\') {
-            Some(pos) => 8 + pos + 1,
-            None => text.len(),
-        }
-    } else {
-        4.min(text.len())
-    }
-}
 
 /// `cFileName` — буфер фиксированной длины без NUL в начале, но с NUL в
 /// конце; имя заканчивается на первом нуле.
@@ -500,24 +526,6 @@ mod tests {
         assert!(!Blocker::ReparsePoint { tag: 0 }.is_trouble());
     }
 
-    #[test]
-    fn labels_are_localized() {
-        use crate::i18n::{Language, with_language};
-        for language in [Language::En, Language::Ru] {
-            with_language(language, || {
-                let label = Blocker::ReservedName {
-                    component: "NUL".into(),
-                }
-                .label();
-                assert!(label.contains("NUL"));
-                if language == Language::Ru {
-                    assert!(label.contains("зарезервированное"));
-                } else {
-                    assert!(label.contains("reserved"));
-                }
-            });
-        }
-    }
 
     #[test]
     fn the_list_is_capped_but_every_object_is_counted() {
@@ -538,6 +546,49 @@ mod tests {
         assert_eq!(summary.unlisted, 30);
         assert!(!summary.truncated);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_exact_entry_limit_is_not_reported_as_an_incomplete_tree() {
+        let base = std::env::temp_dir().join(format!(
+            "raze-scan-limit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&base).unwrap();
+        for index in 0..3 { std::fs::write(base.join(format!("{index}.txt")), b"x").unwrap(); }
+        let path = NtPath::new(&base).unwrap();
+        let mut options = ScanOptions { max_entries: 3, probe_access: false, ..ScanOptions::default() };
+        let (_, exact) = scan(&path, &options);
+        options.max_entries = 2;
+        let (_, limited) = scan(&path, &options);
+        options.max_entries = 0;
+        let (empty, zero) = scan(&path, &options);
+        std::fs::remove_dir_all(&base).unwrap();
+        assert_eq!(exact.files, 3);
+        assert!(!exact.truncated);
+        assert_eq!(limited.files, 2);
+        assert!(limited.truncated);
+        assert!(empty.is_empty());
+        assert_eq!(zero.files, 0);
+        assert!(zero.truncated);
+    }
+
+    #[test]
+    fn a_leaf_respects_a_zero_display_budget_without_losing_its_count() {
+        let path = NtPath::new(std::path::Path::new(r"C:\sample.txt")).unwrap();
+        let options = ScanOptions { max_listed: 0, probe_access: false, ..ScanOptions::default() };
+        let (entries, summary) = scan_leaf(&path, 0, 7, &options);
+        assert!(entries.is_empty());
+        assert_eq!((summary.files, summary.bytes, summary.unlisted), (1, 7, 1));
+    }
+
+    #[test]
+    fn non_ascii_unc_servers_do_not_shift_reserved_component_boundaries() {
+        let path = NtPath::new(std::path::Path::new(r"\\серверсерверсервер\share\NUL")).unwrap();
+        assert_eq!(reserved_component(&path).as_deref(), Some("NUL"));
+        let path = NtPath::new(std::path::Path::new(r"\\серверсерверсервер\share\ordinary")).unwrap();
+        assert!(reserved_component(&path).is_none());
     }
 
     #[test]

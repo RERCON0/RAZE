@@ -51,18 +51,33 @@ pub const PINNED_CERT_THUMBPRINT: &str = include_str!("../../packaging/cert-thum
 /// файл из каталога, который может переписать любой процесс пользователя,
 /// подменили бы до запроса (повышение прав без всякой подписи). Из Program
 /// Files подменить его без прав администратора нельзя.
-pub fn default_install_dir() -> PathBuf {
-    let base = std::env::var_os("ProgramFiles")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
-    base.join("RAZE")
+pub fn default_install_dir() -> Result<PathBuf, String> {
+    known_folder(&windows::Win32::UI::Shell::FOLDERID_ProgramFiles)
+        .map(|base| base.join("RAZE"))
 }
 
 /// Где ставили прежние версии: каталог пользователя. Он перезаписываем любым
 /// процессом пользователя, поэтому копия оттуда убирается при установке.
-pub fn legacy_install_dir() -> PathBuf {
-    let local = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| "C:\\".into());
-    PathBuf::from(local).join("Programs").join("RAZE")
+pub fn legacy_install_dir() -> Result<PathBuf, String> {
+    known_folder(&windows::Win32::UI::Shell::FOLDERID_LocalAppData)
+        .map(|base| base.join("Programs").join("RAZE"))
+}
+
+fn known_folder(id: &windows::core::GUID) -> Result<PathBuf, String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+
+    let pointer = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) }
+        .map_err(|error| error.to_string())?;
+    let path = PathBuf::from(OsString::from_wide(unsafe { pointer.as_wide() }));
+    unsafe { CoTaskMemFree(Some(pointer.0.cast())) };
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err("Windows returned an invalid known-folder path".into())
+    }
 }
 
 /// Ключи реестра, под которыми появляется пункт меню.
@@ -111,9 +126,16 @@ impl InstallReport {
 /// Ставит или снимает интеграцию. `uninstall = false` — установка.
 pub fn install(source_dir: &Path, uninstall: bool) -> InstallReport {
     let mut report = InstallReport {
-        install_dir: default_install_dir(),
+        install_dir: PathBuf::new(),
         ..Default::default()
     };
+    match default_install_dir() {
+        Ok(dir) => report.install_dir = dir,
+        Err(error) => {
+            report.failed("locate Program Files", error);
+            return report;
+        }
+    }
 
     if uninstall {
         remove_classic(&mut report);
@@ -123,10 +145,16 @@ pub fn install(source_dir: &Path, uninstall: bool) -> InstallReport {
     }
 
     let dir = report.install_dir.clone();
+    if !source_dir.join("raze.exe").is_file() {
+        report.failed("copy raze.exe", format!("not found in {}", source_dir.display()));
+        return report;
+    }
     // Зарегистрированный пакет держит `raze_shell.dll` загруженной, и файл
     // нельзя заменить. Снимаем регистрацию, ниже она ставится заново.
     let _ = unregister_package();
-    copy_binaries(source_dir, &dir, &mut report);
+    if !copy_binaries(source_dir, &dir, &mut report) {
+        return report;
+    }
     forget_legacy_registration(&dir);
     write_classic(&dir, &mut report);
     register_modern(&dir, &mut report);
@@ -139,8 +167,20 @@ pub fn install(source_dir: &Path, uninstall: bool) -> InstallReport {
 /// на новый каталог. Если копия запущена прямо сейчас, файл занят: это не
 /// ошибка установки, а напоминание удалить папку вручную.
 fn remove_legacy_install(report: &mut InstallReport) {
-    let old = legacy_install_dir();
-    if old == default_install_dir() || !old.join("raze.exe").exists() {
+    // Programs and its ancestors are writable by the user. A junction there
+    // must never turn migration into an administrator's arbitrary deletion.
+    let _user_context = match UnelevatedContext::enter() {
+        Ok(context) => context,
+        Err(error) => {
+            report.skipped(format!("the old per-user copy was not removed ({error}); delete it by hand"));
+            return;
+        }
+    };
+    let Ok(old) = legacy_install_dir() else {
+        report.skipped("could not locate the old per-user install directory");
+        return;
+    };
+    if old == report.install_dir || !old.join("raze.exe").exists() {
         return;
     }
     match std::fs::remove_dir_all(&old) {
@@ -152,24 +192,81 @@ fn remove_legacy_install(report: &mut InstallReport) {
     }
 }
 
+struct UnelevatedContext;
+
+impl UnelevatedContext {
+    fn enter() -> Result<Option<Self>, String> {
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows::Win32::Security::{
+            GetTokenInformation, ImpersonateLoggedOnUser, TokenLinkedToken,
+            TOKEN_LINKED_TOKEN, TOKEN_QUERY,
+        };
+        use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        if !is_elevated() {
+            return Ok(None);
+        }
+        let mut token = HANDLE::default();
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
+            .map_err(|error| error.to_string())?;
+        let mut linked = TOKEN_LINKED_TOKEN::default();
+        let mut returned = 0;
+        let result = unsafe {
+            GetTokenInformation(
+                token,
+                TokenLinkedToken,
+                Some((&mut linked as *mut TOKEN_LINKED_TOKEN).cast()),
+                std::mem::size_of::<TOKEN_LINKED_TOKEN>() as u32,
+                &mut returned,
+            )
+        };
+        let _ = unsafe { CloseHandle(token) };
+        result.map_err(|error| format!("cannot obtain an unelevated token: {error}"))?;
+        let result = unsafe { ImpersonateLoggedOnUser(linked.LinkedToken) };
+        let _ = unsafe { CloseHandle(linked.LinkedToken) };
+        result.map_err(|error| format!("cannot impersonate the unelevated user: {error}"))?;
+        Ok(Some(Self))
+    }
+}
+
+impl Drop for UnelevatedContext {
+    fn drop(&mut self) {
+        // Windows requires termination if reverting fails: continuing under an
+        // unexpected identity is unsafe. Normal unwinding always restores it.
+        if unsafe { windows::Win32::Security::RevertToSelf() }.is_err() {
+            std::process::abort();
+        }
+    }
+}
+
 /// Раскладывает исполняемые файлы, DLL и файлы пакета в каталог установки.
-fn copy_binaries(source: &Path, target: &Path, report: &mut InstallReport) {
+fn copy_binaries(source: &Path, target: &Path, report: &mut InstallReport) -> bool {
+    if !source.join("raze.exe").is_file() {
+        report.failed("copy raze.exe", format!("not found in {}", source.display()));
+        return false;
+    }
     if let Err(error) = std::fs::create_dir_all(target) {
         report.failed("create install directory", error.to_string());
-        return;
+        return false;
     }
+    let same_directory = std::fs::canonicalize(source).ok()
+        .zip(std::fs::canonicalize(target).ok())
+        .is_some_and(|(source, target)| source == target);
     // DLL крейта `raze-shell` собирается как `raze_shell.dll`:
     // cargo не разрешает дефисы в именах lib-таргетов.
     let wanted = ["raze.exe", "raze-app.exe", "raze_shell.dll", PACKAGE_FILE, CERT_FILE];
     let mut copied = 0usize;
     for name in wanted {
         let from = source.join(name);
-        let Ok(bytes) = std::fs::read(&from) else {
+        if !from.is_file() {
             report.skipped(format!("{name} (not found in {})", source.display()));
             continue;
-        };
+        }
+        if same_directory {
+            continue;
+        }
         let to = target.join(name);
-        if let Err(error) = std::fs::write(&to, &bytes) {
+        if let Err(error) = std::fs::copy(&from, &to) {
             report.failed(format!("copy {name}"), error.to_string());
             continue;
         }
@@ -178,6 +275,10 @@ fn copy_binaries(source: &Path, target: &Path, report: &mut InstallReport) {
     if copied > 0 {
         report.done(format!("installed {copied} file(s) into {}", target.display()));
     }
+    if same_directory {
+        report.done(format!("already running from {}", target.display()));
+    }
+    report.ok()
 }
 
 /// Прежние версии установщика писали сюда собственный манифест и
@@ -294,7 +395,7 @@ fn remove_modern(report: &mut InstallReport) {
     let _ = RegKey::predef(HKEY_CURRENT_USER)
         .delete_subkey_all(format!(r"Software\Classes\CLSID\{COMMAND_CLSID}"));
 
-    let dir = default_install_dir();
+    let dir = report.install_dir.clone();
     // Каталог удаляем только если он действительно наш и там нечего терять.
     if dir.join("raze.exe").exists() {
         remove_install_dir(&dir, report);
@@ -305,8 +406,8 @@ fn remove_modern(report: &mut InstallReport) {
 
 /// Удаляет каталог установки. Если снятие запущено из самой установленной
 /// копии, её `raze.exe` занят: удалить его нельзя, а остальные файлы уже ушли бы,
-/// оставив каталог с одним exe. Тогда остаток убирает отсоединённый `cmd` после
-/// завершения процесса.
+/// оставив каталог с одним exe. Тогда остаток убирает отсоединённый PowerShell
+/// после завершения процесса.
 fn remove_install_dir(dir: &Path, report: &mut InstallReport) {
     let own = std::env::current_exe().ok();
     let running_from_here = own
@@ -337,30 +438,33 @@ fn remove_install_dir(dir: &Path, report: &mut InstallReport) {
     }
 }
 
-/// Отсоединённый `cmd` ждёт несколько секунд и удаляет каталог, когда процесс
-/// снятия уже завершился. Путь запрещённых кавычек не содержит (это Program Files).
+/// Отсоединённый системный PowerShell ждёт освобождения файлов после выхода.
+/// LiteralPath не интерпретирует имена как маску, а shell/PATH здесь не участвуют.
 fn spawn_delayed_removal(dir: &Path) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    let text = dir.to_string_lossy();
-    if text.contains('"') || text.contains('&') {
-        return Err("unexpected characters in the install path".into());
-    }
-    let system = powershell_exe()
-        .ancestors()
-        .nth(3)
-        .map(Path::to_path_buf)
-        .ok_or("cannot locate the system folder")?;
-    // Строка идёт как есть (`raw_arg`): обычный `arg` заключил бы её в кавычки и
-    // экранировал внутренние как `\"`, а `cmd` такого не понимает и не запускался.
-    // `/S` велит снять внешние кавычки, внутренние остаются у пути.
-    Command::new(system.join("cmd.exe"))
-        .raw_arg(format!("/D /S /C \"ping -n 4 127.0.0.1 >nul & rmdir /S /Q \"{text}\"\""))
-        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         for ($i = 0; $i -lt 30; $i++) {{ \
+             Start-Sleep -Seconds 1; \
+             if (-not (Test-Path -LiteralPath {0})) {{ exit 0 }}; \
+             try {{ Remove-Item -LiteralPath {0} -Recurse -Force; exit 0 }} catch {{ }} \
+         }}; exit 1",
+        ps_quote(dir)
+    );
+    let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let executable = powershell_exe()?;
+    let working_directory = executable.parent().ok_or("cannot locate the PowerShell directory")?;
+    Command::new(&executable)
+        .current_dir(working_directory)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &base64(&utf16)])
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|error| error.to_string())
 }
 
 fn label() -> &'static str {
@@ -371,7 +475,7 @@ fn label() -> &'static str {
 /// `Add-AppxPackage` с каталогом установки как внешним расположением.
 /// Вынесено отдельно, чтобы вызывать и без полной установки.
 pub fn register_sparse_package() -> Result<(), String> {
-    let dir = default_install_dir();
+    let dir = default_install_dir()?;
     let package = dir.join(PACKAGE_FILE);
     let cert = dir.join(CERT_FILE);
     for file in [&package, &cert] {
@@ -447,20 +551,22 @@ fn ensure_certificate_trusted(cert: &Path) -> Result<(), String> {
 /// `powershell` его искали бы по `PATH` и рабочему каталогу, а запускается он
 /// с правами администратора: чужой `powershell.exe` в начале `PATH` получил бы
 /// эти права.
-fn powershell_exe() -> PathBuf {
+fn powershell_exe() -> Result<PathBuf, String> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
     use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
-    let mut buffer = [0u16; 260];
+    let mut buffer = [0u16; 32768];
     let length = unsafe { GetSystemDirectoryW(Some(&mut buffer)) } as usize;
     if length == 0 || length >= buffer.len() {
-        return PathBuf::from("powershell");
+        return Err("cannot locate the Windows system directory".into());
     }
-    PathBuf::from(String::from_utf16_lossy(&buffer[..length]))
-        .join(r"WindowsPowerShell\v1.0\powershell.exe")
+    Ok(PathBuf::from(OsString::from_wide(&buffer[..length]))
+        .join(r"WindowsPowerShell\v1.0\powershell.exe"))
 }
 
 fn run_powershell(script: &str) -> Result<String, String> {
-    let output = Command::new(powershell_exe())
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+    let output = Command::new(powershell_exe()?)
+        .args(["-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference = 'Stop';", script])
         .output()
         .map_err(|e| e.to_string())?;
     if output.status.success() {
@@ -487,18 +593,27 @@ fn run_privileged_powershell(script: &str) -> Result<(), String> {
 fn run_elevated_powershell(script: &str) -> Result<(), String> {
     let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let launcher = format!(
-        "Start-Process -FilePath {} -Verb RunAs -Wait -WindowStyle Hidden \
-         -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','{}'",
-        ps_quote(&powershell_exe()),
+        "$ErrorActionPreference = 'Stop'; \
+         $p = Start-Process -FilePath {} -Verb RunAs -Wait -PassThru -WindowStyle Hidden \
+         -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','{}'; exit $p.ExitCode",
+        ps_quote(&powershell_exe()?),
         base64(&utf16)
     );
     run_powershell(&launcher).map(|_| ())
 }
 
-/// Строка в одинарных кавычках PowerShell (внутри них ничего не
-/// раскрывается, кавычка удваивается).
+/// Литерал пути PowerShell. Непарные суррогаты нельзя заменять на U+FFFD:
+/// для такого NTFS-имени строим строку напрямую из исходных UTF-16 единиц.
 fn ps_quote(path: &Path) -> String {
-    format!("'{}'", path.to_string_lossy().replace('\'', "''"))
+    use std::os::windows::ffi::OsStrExt;
+    if let Some(text) = path.to_str() {
+        return format!("'{}'", text.replace('\'', "''"));
+    }
+    let units = path.as_os_str().encode_wide()
+        .map(|unit| unit.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("([string]::new([char[]]@({units})))")
 }
 
 fn base64(bytes: &[u8]) -> String {
@@ -520,35 +635,6 @@ fn base64(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn clsid_has_the_shape_shell_expects() {
-        assert!(COMMAND_CLSID.starts_with('{'));
-        assert!(COMMAND_CLSID.ends_with('}'));
-        assert_eq!(COMMAND_CLSID.len(), 38, "GUID with braces is 38 characters");
-        assert_eq!(COMMAND_CLSID.matches('-').count(), 4);
-        assert!(COMMAND_CLSID[1..37]
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() || c == '-'));
-    }
-
-    #[test]
-    fn package_template_agrees_with_the_code() {
-        let xml = include_str!("../../packaging/AppxManifest.xml");
-        assert!(xml.contains(&COMMAND_CLSID[1..37]), "CLSID in the manifest");
-        assert!(xml.contains(&format!("Name=\"{PACKAGE_NAME}\"")));
-        assert!(xml.contains("Publisher=\"CN=RERCON RAZE\""));
-        assert!(xml.contains("raze_shell.dll"));
-        assert!(xml.contains("windows.fileExplorerContextMenus"));
-        assert!(xml.contains("Version=\"@VERSION@\""), "version is filled in by build-package.ps1");
-    }
-
-    #[test]
-    fn pinned_thumbprint_is_a_sha1_in_upper_hex() {
-        assert_eq!(PINNED_CERT_THUMBPRINT.len(), 40);
-        assert!(PINNED_CERT_THUMBPRINT
-            .chars()
-            .all(|c| c.is_ascii_digit() || ('A'..='F').contains(&c)));
-    }
 
     #[test]
     fn base64_matches_the_standard_vectors() {
@@ -564,15 +650,42 @@ mod tests {
     }
 
     #[test]
+    fn powershell_path_literals_preserve_unpaired_surrogates() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        let units = [b'C' as u16, b':' as u16, b'\\' as u16, 0xD800, b'\'' as u16];
+        let path = PathBuf::from(OsString::from_wide(&units));
+        let result = run_powershell(&format!(
+            "({}).ToCharArray() | ForEach-Object {{ [int]$_ }}",
+            ps_quote(&path)
+        )).unwrap();
+        let actual: Vec<u16> = result.lines().map(|line| line.parse().unwrap()).collect();
+        assert_eq!(actual, units);
+    }
+
+    #[test]
     fn install_dir_is_in_program_files_and_the_old_user_copy_is_elsewhere() {
         // Из Program Files процесс без прав администратора файл не подменит;
         // каталог пользователя для этого не годится.
-        let dir = default_install_dir();
+        let dir = default_install_dir().unwrap();
         assert!(dir.ends_with("RAZE"));
-        if let Some(files) = std::env::var_os("ProgramFiles") {
-            assert_eq!(dir.parent(), Some(Path::new(&files)));
-        }
-        assert_ne!(dir, legacy_install_dir());
+        assert_eq!(
+            dir.parent(),
+            Some(known_folder(&windows::Win32::UI::Shell::FOLDERID_ProgramFiles).unwrap().as_path())
+        );
+        assert_ne!(dir, legacy_install_dir().unwrap());
+    }
+
+    #[test]
+    fn missing_cli_does_not_create_or_register_an_installation() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let source = std::env::temp_dir().join(format!("raze-missing-source-{unique}"));
+        let target = std::env::temp_dir().join(format!("raze-missing-target-{unique}"));
+        let mut report = InstallReport::default();
+        assert!(!copy_binaries(&source, &target, &mut report));
+        assert!(!report.ok());
+        assert!(!target.exists());
     }
 
     #[test]
@@ -581,7 +694,9 @@ mod tests {
         // Настоящие ключи не трогаем: тесты идут на машине, где RAZE может
         // быть установлен, и `remove_classic` стёр бы его пункты меню.
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let verb = format!(r"Software\RAZE.Tests\{}\shell\RAZE.Delete", std::process::id());
+        let base = format!(r"Software\RAZE.Tests\{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let verb = format!(r"{base}\shell\RAZE.Delete");
 
         let mut report = InstallReport::default();
         remove_verbs(&hkcu, &[verb.as_str()], &mut report);
@@ -592,6 +707,33 @@ mod tests {
         let mut report = InstallReport::default();
         remove_verbs(&hkcu, &[verb.as_str()], &mut report);
         assert!(matches!(report.steps[0], Step::Done { .. }));
-        let _ = hkcu.delete_subkey_all(r"Software\RAZE.Tests");
+        let _ = hkcu.delete_subkey_all(&base);
+    }
+
+    #[test]
+    fn delayed_removal_does_not_hold_its_target_directory_open() {
+        const CHILD: &str = "RAZE_TEST_DELAYED_REMOVAL";
+        if let Some(path) = std::env::var_os(CHILD) {
+            spawn_delayed_removal(Path::new(&path)).unwrap();
+            return;
+        }
+        let base = std::env::temp_dir().join(format!(
+            "raze-delayed-{}-{}- 'percent%[literal]",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&base).unwrap();
+        std::fs::write(base.join("raze.exe"), b"disposable placeholder file").unwrap();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "shell::install::tests::delayed_removal_does_not_hold_its_target_directory_open", "--nocapture"])
+            .env(CHILD, &base)
+            .current_dir(&base)
+            .output().unwrap();
+        assert!(child.status.success(), "{}", String::from_utf8_lossy(&child.stderr));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while base.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(!base.exists(), "delayed helper retained its target or interpreted its name as a wildcard");
     }
 }

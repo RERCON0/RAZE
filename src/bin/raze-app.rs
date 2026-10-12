@@ -1,6 +1,7 @@
 //! Native RAZE window. Planning/removal use the same job engine as the CLI.
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -17,12 +18,10 @@ use raze_rs::{i18n, tr, tr_format, TELEGRAM_URL, VERSION};
 mod style;
 #[path = "raze-app/view.rs"]
 mod view;
-#[cfg(feature = "ui-preview")]
-#[path = "raze-app/preview.rs"]
-mod preview;
 
 const MAX_LOG_LINES: usize = 500;
 const MAX_TARGETS: usize = 512;
+const MAX_LISTED_ENTRIES: usize = 20_000;
 const ICON_PNG: &[u8] = include_bytes!("../../icons/icon.png");
 
 fn app_icon() -> Option<egui::IconData> {
@@ -110,14 +109,24 @@ struct RazeApp {
     running_options: Options,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
-    #[cfg(test)]
-    geometry: view::Geometry,
-    #[cfg(feature = "ui-preview")]
-    preview: Option<preview::Preview>,
 }
 
 impl RazeApp {
     fn new(ctx: &egui::Context) -> Self {
+        let status = match i18n::load_language() {
+            Ok(language) => {
+                i18n::set_language(language);
+                None
+            }
+            Err(error) => {
+                i18n::set_language(i18n::Language::En);
+                Some(tr_format!(
+                    "Could not load saved language: {error}",
+                    "Не удалось загрузить сохранённый язык: {error}"
+                ))
+            }
+        };
+        let status_error = status.is_some();
         style::setup_fonts(ctx);
         style::setup_theme(ctx, true);
         style::pin_pixel_scale(ctx, true);
@@ -131,27 +140,16 @@ impl RazeApp {
             log: Vec::new(),
             dark: true,
             maximized: false,
-            status: None,
-            status_error: false,
+            status,
+            status_error,
             show_log: false,
             close_locks: false,
             running_options: Options::default(),
             tx,
             rx,
-            #[cfg(test)]
-            geometry: view::Geometry::default(),
-            #[cfg(feature = "ui-preview")]
-            preview: None,
         }
     }
 
-    fn is_preview(&self) -> bool {
-        #[cfg(feature = "ui-preview")]
-        if self.preview.is_some() {
-            return true;
-        }
-        false
-    }
 
     fn log(&mut self, line: impl Into<String>) {
         self.log.push(line.into());
@@ -161,20 +159,21 @@ impl RazeApp {
     }
 
     fn add_paths(&mut self, ctx: &egui::Context, paths: Vec<PathBuf>) {
-        if self.phase != Phase::Idle || self.is_preview() {
+        if self.phase != Phase::Idle {
             return;
         }
         let mut fresh = Vec::new();
+        let mut seen: std::collections::HashSet<OsString> = self.plan.iter()
+            .filter_map(|target| target.path.as_ref())
+            .map(|path| path.to_path().into_os_string().to_ascii_lowercase())
+            .collect();
         for path in paths {
             // Сравнение по разобранному пути, как в плане: `C:\a\` и `c:/a` — одна
             // цель. По набранному тексту она добавлялась бы второй раз.
-            let normalize = |p: &PathBuf| {
-                NtPath::new(p).map(|n| n.to_string_lossy()).unwrap_or_else(|_| p.to_string_lossy().into_owned())
-            };
-            let display = normalize(&path);
-            if self.plan.iter().any(|t| t.display.eq_ignore_ascii_case(&display))
-                || fresh.iter().any(|p: &PathBuf| normalize(p).eq_ignore_ascii_case(&display))
-            {
+            let key = NtPath::new(&path)
+                .map(|path| path.to_path().into_os_string().to_ascii_lowercase())
+                .unwrap_or_else(|_| path.as_os_str().to_ascii_lowercase());
+            if !seen.insert(key) {
                 continue;
             }
             if self.plan.len() + fresh.len() >= MAX_TARGETS {
@@ -197,10 +196,12 @@ impl RazeApp {
             count = fresh.len()
         ));
         self.phase = Phase::Planning;
+        let entry_budget = MAX_LISTED_ENTRIES.saturating_sub(
+            self.plan.iter().map(|target| target.entries.len()).sum::<usize>()
+        );
         let (ctx, tx) = (ctx.clone(), self.tx.clone());
         thread::spawn(move || {
-            let targets = job::plan(&fresh, &Options::default());
-            let _ = tx.send(Msg::Plan(targets));
+            let _ = tx.send(Msg::Plan(plan_paths(fresh, entry_budget)));
             ctx.request_repaint();
         });
     }
@@ -217,7 +218,14 @@ impl RazeApp {
     fn selected_targets(&self) -> Vec<Target> {
         self.plan.iter().zip(&self.rows)
             .filter(|(t, r)| r.selected && t.refused.is_none())
-            .map(|(t, _)| t.clone()).collect()
+            .map(|(t, _)| Target {
+                display: t.display.clone(),
+                path: t.path.clone(),
+                entries: Vec::new(),
+                summary: t.summary.clone(),
+                verdict: t.verdict.clone(),
+                refused: t.refused.clone(),
+            }).collect()
     }
 
     fn totals(&self) -> Totals {
@@ -246,7 +254,7 @@ impl RazeApp {
     }
 
     fn start_removal(&mut self, ctx: &egui::Context, options: Options) {
-        if self.phase.working() || self.is_preview() {
+        if self.phase.working() {
             return;
         }
         let targets = self.selected_targets();
@@ -304,16 +312,18 @@ impl RazeApp {
         // Keep the retry paths before removing completed cards from the view.
         if report.needs_elevation && !is_elevated() && !self.running_options.dry_run {
             let paths: Vec<PathBuf> = report.targets.iter()
-                .filter(|t| t.failures.iter().any(|f| f.code == 5))
-                .map(|t| PathBuf::from(&t.path)).collect();
+                .filter(|t| t.failures.iter().any(|f| {
+                    raze_rs::engine::error::NtError(f.code).needs_elevation()
+                }))
+                .map(|t| t.native_path.clone()).collect();
             self.relaunch_as_admin(&paths);
         }
-        if !self.running_options.dry_run {
+        if !self.running_options.dry_run && !report.cancelled {
             let mut kept = Vec::new();
             let mut rows = Vec::new();
             for (target, row) in self.plan.drain(..).zip(self.rows.drain(..)) {
                 let completed = row.selected && report.targets.iter()
-                    .any(|r| r.path == target.display && r.ok());
+                    .any(|r| r.ok() && target.path.as_ref().is_some_and(|p| p.to_path() == r.native_path));
                 if !completed {
                     kept.push(target);
                     rows.push(row);
@@ -325,7 +335,7 @@ impl RazeApp {
     }
 
     fn relaunch_as_admin(&mut self, paths: &[PathBuf]) {
-        if paths.is_empty() || self.is_preview() {
+        if paths.is_empty() {
             return;
         }
         let Some(exe) = std::env::current_exe().ok().map(|e| e.with_file_name("raze.exe")) else {
@@ -363,13 +373,32 @@ impl RazeApp {
     }
 }
 
-fn elevation_arguments(paths: &[PathBuf], options: &Options) -> String {
-    let mut args = vec!["--elevated".to_string(), "--yes".to_string()];
+fn plan_paths(paths: Vec<PathBuf>, mut entry_budget: usize) -> Vec<Target> {
+    let mut targets = Vec::with_capacity(paths.len());
+    for path in paths {
+        let mut options = Options::default();
+        // Troublesome entries may use a second max_listed allowance.
+        options.scan.max_listed = options.scan.max_listed.min(entry_budget / 2);
+        for mut target in job::plan(std::slice::from_ref(&path), &options) {
+            let retained = target.entries.len().min(entry_budget);
+            target.summary.unlisted = target.summary.unlisted.saturating_add(
+                target.entries.len() - retained
+            );
+            target.entries.truncate(retained);
+            entry_budget -= retained;
+            targets.push(target);
+        }
+    }
+    targets
+}
+
+fn elevation_arguments(paths: &[PathBuf], options: &Options) -> OsString {
+    let mut args: Vec<OsString> = vec!["--elevated".into(), "--yes".into()];
     if options.permanent { args.push("--permanent".into()); }
     if options.close_locks { args.push("--close-locks".into()); }
     if !options.take_ownership { args.push("--keep-owners".into()); }
     args.extend(["--lang".into(), i18n::language().code().into(), "--".into()]);
-    args.extend(paths.iter().map(|p| p.to_string_lossy().into_owned()));
+    args.extend(paths.iter().map(|p| p.as_os_str().to_os_string()));
     build_arguments(&args)
 }
 
@@ -397,10 +426,6 @@ impl eframe::App for RazeApp {
         let dropped = ctx.input(|i| i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect());
         self.add_paths(ctx, dropped);
         self.render(ctx);
-        #[cfg(feature = "ui-preview")]
-        if let Some(preview) = &mut self.preview {
-            preview.capture(ctx);
-        }
     }
 }
 
@@ -416,16 +441,9 @@ fn main() -> eframe::Result {
     #[cfg(windows)]
     { viewport = viewport.with_decorations(false); }
     if let Some(icon) = app_icon() { viewport = viewport.with_icon(icon); }
-    #[cfg(feature = "ui-preview")]
-    { viewport = preview::configure_viewport(viewport); }
     let result = eframe::run_native("RAZE", eframe::NativeOptions { viewport, ..Default::default() },
         Box::new(|cc| {
-            let mut app = RazeApp::new(&cc.egui_ctx);
-            #[cfg(feature = "ui-preview")]
-            preview::configure_app(&mut app, &cc.egui_ctx);
-            // Keep one creation path for production, preview, and layout tests.
-            let _ = &mut app;
-            Ok(Box::new(app))
+            Ok(Box::new(RazeApp::new(&cc.egui_ctx)))
         }));
     if let Err(error) = &result {
         fatal_dialog(tr!("RAZE — could not open window", "RAZE — не удалось открыть окно"),
@@ -437,6 +455,124 @@ fn main() -> eframe::Result {
     result
 }
 
+
 #[cfg(test)]
-#[path = "raze-app/tests.rs"]
-mod tests;
+mod tests {
+    use super::*;
+    use raze_rs::engine::recycle::RecycleVerdict;
+    use raze_rs::report::TargetReport;
+
+    fn target(path: PathBuf) -> Target {
+        let path = NtPath::new(&path).unwrap();
+        Target {
+            display: path.to_string_lossy(),
+            path: Some(path),
+            entries: Vec::new(),
+            summary: Default::default(),
+            verdict: RecycleVerdict { reusable: true, reason: String::new() },
+            refused: None,
+        }
+    }
+
+    fn completed(target: &Target, dry_run: bool) -> TargetReport {
+        TargetReport {
+            path: target.display.clone(),
+            native_path: target.path.as_ref().unwrap().to_path(),
+            disposition: Disposition::RecycleBin,
+            reason: String::new(),
+            removed_files: 1,
+            removed_directories: 0,
+            removed_links: 0,
+            freed_bytes: 1,
+            notes: Vec::new(),
+            failures: Vec::new(),
+            dry_run,
+        }
+    }
+
+    #[test]
+    fn list_budget_preserves_full_counts_and_every_requested_target() {
+        let scratch = std::env::temp_dir().join(format!("raze-gui-budget-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let folder = scratch.join("folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        for name in ["one", "two", "three"] {
+            std::fs::write(folder.join(name), b"x").unwrap();
+        }
+        let file = scratch.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let plan = plan_paths(vec![folder, file], 2);
+        std::fs::remove_dir_all(scratch).unwrap();
+        assert_eq!(plan.len(), 2);
+        assert!(plan.iter().all(|target| target.refused.is_none()));
+        assert!(plan.iter().map(|target| target.entries.len()).sum::<usize>() <= 2);
+        assert_eq!(plan.iter().map(|target| target.summary.files).sum::<usize>(), 4);
+        assert_eq!(plan.iter().map(|target| target.summary.bytes).sum::<u64>(), 4);
+        assert_eq!(plan.iter().map(|target| target.entries.len() + target.summary.unlisted).sum::<usize>(), 4);
+    }
+
+    #[test]
+    fn preview_keeps_the_targets_available_for_actual_removal() {
+        let mut app = RazeApp::new(&egui::Context::default());
+        app.plan.push(target(PathBuf::from(r"C:\raze-ui-test\file")));
+        app.rows.push(RowState { selected: true, expanded: true });
+        app.running_options.dry_run = true;
+        let report = Report {
+            targets: vec![completed(&app.plan[0], true)],
+            ..Default::default()
+        };
+        app.handle_report(report);
+        assert_eq!(app.plan.len(), 1);
+        assert!(app.rows[0].selected && app.rows[0].expanded);
+        assert!(matches!(app.phase, Phase::Idle));
+    }
+
+    #[test]
+    fn only_completed_selected_targets_disappear() {
+        let mut app = RazeApp::new(&egui::Context::default());
+        for name in ["completed", "failed", "unselected"] {
+            app.plan.push(target(PathBuf::from(r"C:\raze-ui-test").join(name)));
+            app.rows.push(RowState { selected: name != "unselected", expanded: false });
+        }
+        let successful = completed(&app.plan[0], false);
+        let mut failed = completed(&app.plan[1], false);
+        failed.failures.push(raze_rs::engine::remove::Failure {
+            path: failed.path.clone(),
+            code: 32,
+            message: String::new(),
+            holders: Vec::new(),
+        });
+        app.handle_report(Report { targets: vec![successful, failed], ..Default::default() });
+        assert_eq!(app.plan.len(), 2);
+        assert!(app.plan[0].display.ends_with("failed"));
+        assert!(app.plan[1].display.ends_with("unselected"));
+        assert!(app.rows[0].selected);
+        assert!(!app.rows[1].selected);
+        assert!(app.status_error);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lossy_display_collision_does_not_hide_an_unremoved_native_target() {
+        use std::os::windows::ffi::OsStringExt;
+        let mut app = RazeApp::new(&egui::Context::default());
+        let prefix: Vec<u16> = r"C:\raze-ui-test\".encode_utf16().collect();
+        for name in [0xd800, 0xfffd] {
+            let mut wide = prefix.clone();
+            wide.push(name);
+            app.plan.push(target(PathBuf::from(OsString::from_wide(&wide))));
+            app.rows.push(RowState { selected: true, expanded: false });
+        }
+        assert_eq!(app.plan[0].display, app.plan[1].display);
+        let native_unremoved = app.plan[0].path.as_ref().unwrap().to_path();
+        let report = Report {
+            targets: vec![completed(&app.plan[1], false)],
+            ..Default::default()
+        };
+        app.handle_report(report);
+        assert_eq!(app.plan.len(), 1);
+        assert_eq!(app.plan[0].path.as_ref().unwrap().to_path(), native_unremoved);
+    }
+}

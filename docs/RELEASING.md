@@ -14,8 +14,8 @@ Rust (stable) и `windres` (MSYS2/MinGW-w64), Python 3.13+ и OpenSSL 3
 
 ```powershell
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --lib --workspace
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-targets --all-features
 cargo audit --deny yanked --deny unsound
 ```
 
@@ -27,11 +27,14 @@ cargo audit --deny yanked --deny unsound
 Доверенный публичный ключ — [`release/public-key.pem`](../release/public-key.pem).
 Приватный ключ владельца проекта хранится в
 `%LOCALAPPDATA%\RAZE\release-signing\raze-private.pem`, вне рабочего дерева.
-Каталог ограничен ACL текущего пользователя. Резервную копию приватного ключа
-нужно хранить отдельно; его потеря потребует публично объявить смену ключа.
+Генератор ограничивает ACL самого приватного файла его владельцем; права
+существующего родительского каталога не меняются. На POSIX файл создаётся с
+режимом `0600`. Резервную копию нужно хранить отдельно; потеря ключа потребует
+публично объявить смену ключа.
 
 Для своего форка создайте отдельную пару, предварительно задав новый путь
-публичного ключа. Команда не перезаписывает существующие ключи:
+публичного ключа. Команда требует разные пути и создаёт оба файла эксклюзивно:
+существующие ключи и ссылки не перезаписываются.
 
 ```powershell
 python scripts/release.py keygen --private-key "$env:LOCALAPPDATA\MyFork\release-signing\fork-private.pem" --public-key .\release\fork-public.pem
@@ -51,8 +54,8 @@ Get-FileHash .\dist\raze-windows-x64.zip -Algorithm SHA256
 Сборщик сам запускает `packaging\build-package.ps1`: тот собирает разреженный
 пакет `RAZE.msix` с `RAZE.cer` и обновляет вшитый отпечаток сертификата. Затем
 в новом временном дереве `target` выполняется `cargo build --locked --release
---workspace` для MSVC x64, и проверяются оба EXE: архитектура, подсистемы
-CLI/GUI, ASLR, DEP и статический CRT без `VCRUNTIME`/`MSVCP`. После компиляции
+--workspace` для MSVC x64. У обоих EXE и `raze_shell.dll` проверяются архитектура,
+тип образа (EXE/DLL), подсистема, ASLR, DEP и статический CRT без `VCRUNTIME`/`MSVCP`. После компиляции
 все входные файлы и Git-ревизия проверяются повторно.
 
 Манифест содержит версию продукта, commit/tree Git, SHA-256 всех отслеживаемых

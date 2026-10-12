@@ -5,6 +5,7 @@
 //! требовать подтверждения: человек уже сказал «удалить» самим кликом.
 
 use std::io::{IsTerminal, Write};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::{ArgAction, Parser};
@@ -40,7 +41,7 @@ struct Cli {
     #[arg(short, long)]
     permanent: bool,
 
-    /// Force the Recycle Bin even for objects that normally bypass it.
+    /// Explicitly request the default Recycle Bin mode where possible.
     #[arg(long, conflicts_with = "permanent")]
     recycle: bool,
 
@@ -65,8 +66,8 @@ struct Cli {
     json: bool,
 
     /// Interface language: en or ru.
-    #[arg(short, long, default_value = "en")]
-    lang: String,
+    #[arg(short, long)]
+    lang: Option<String>,
 
     /// Internal: this process was started by the Explorer context menu.
     #[arg(long, hide = true)]
@@ -81,7 +82,7 @@ struct Cli {
     elevated: bool,
 
     /// Install RAZE into Program Files with the Explorer context menu (asks for administrator rights).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "uninstall")]
     install: bool,
 
     /// Remove RAZE and its Explorer context menu (asks for administrator rights).
@@ -107,13 +108,20 @@ struct Cli {
 
 fn main() {
     let cli = Cli::parse();
-    match raze_rs::i18n::Language::parse(&cli.lang) {
-        Ok(language) => i18n::set_language(language),
-        Err(message) => {
-            eprintln!("--lang: {message}");
-            std::process::exit(2);
-        }
-    }
+    let language = match cli.lang.as_deref() {
+        Some(code) => match i18n::Language::parse(code) {
+            Ok(language) => language,
+            Err(message) => {
+                eprintln!("--lang: {message}");
+                std::process::exit(2);
+            }
+        },
+        None => i18n::load_language().unwrap_or_else(|error| {
+            eprintln!("Cannot load saved language: {error}");
+            i18n::Language::En
+        }),
+    };
+    i18n::set_language(language);
 
     let code = run(cli);
     std::process::exit(code);
@@ -153,12 +161,15 @@ fn run(cli: Cli) -> i32 {
 
     let targets_paths = collect_paths(&cli);
     if targets_paths.is_empty() {
-        print_usage();
+        if cli.json || cli.plan_only {
+            eprintln!("Usage: raze [OPTIONS] <PATH>...");
+        } else {
+            print_usage();
+        }
         return 2;
     }
 
     let options = Options {
-        prefer_recycle: cli.recycle,
         permanent: cli.permanent,
         take_ownership: !cli.keep_owners,
         close_locks: cli.close_locks,
@@ -173,9 +184,14 @@ fn run(cli: Cli) -> i32 {
     let planned = job::plan(&targets_paths, &options);
     let summary = job::describe(&planned);
 
-    if cli.json {
-        println!("{}", serde_json::to_string_pretty(&summary).unwrap_or_default());
-    } else {
+    if cli.plan_only {
+        if let Err(error) = write_json(&mut std::io::stdout().lock(), &summary) {
+            eprintln!("{error}");
+            return 1;
+        }
+        return if summary.refused.is_empty() { 0 } else { 3 };
+    }
+    if !cli.json {
         print_plan(&planned, &summary, cli.verbose);
     }
 
@@ -185,33 +201,46 @@ fn run(cli: Cli) -> i32 {
         }
     }
     if !job::has_work(&planned) {
+        if cli.json {
+            let report = job::execute(&planned, &options);
+            if let Err(error) = write_json(&mut std::io::stdout().lock(), &report) {
+                eprintln!("{error}");
+                return 1;
+            }
+        }
         return if summary.refused.is_empty() { 0 } else { 3 };
-    }
-    if cli.plan_only {
-        return 0;
     }
 
     // Подтверждение: из контекстного меню и с --yes вопросов не задаём.
     // Пробный прогон ничего не меняет, спрашивать нечего.
     if !cli.dry_run && !cli.yes && !cli.from_shell && !confirm(&planned) {
-        println!("{}", tr!("Cancelled.", "Отменено."));
+        if cli.json {
+            let report = Report { cancelled: true, ..Report::default() };
+            if let Err(error) = write_json(&mut std::io::stdout().lock(), &report) {
+                eprintln!("{error}");
+            }
+        } else {
+            println!("{}", tr!("Cancelled.", "Отменено."));
+        }
         return 1;
     }
 
     let report = job::execute(&planned, &options);
 
-    // Один раз предлагаем повышение и повторяем всё с начала.
-    if report.needs_elevation && !cli.elevated && !is_elevated() {
-        if let Some(code) = relaunch_as_admin(&cli, &planned) {
+    // A ShellExecute handoff has separate stdout and cannot return a report
+    // to a script. JSON mode reports this attempt; run it elevated explicitly.
+    if report.needs_elevation && !cli.dry_run && !cli.json && !cli.elevated && !is_elevated() {
+        print_report(&report);
+        if let Some(code) = relaunch_as_admin(&cli, &planned, &report) {
             return code;
         }
     }
 
     if cli.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&report).unwrap_or_default()
-        );
+        if let Err(error) = write_json(&mut std::io::stdout().lock(), &report) {
+            eprintln!("{error}");
+            return 1;
+        }
     } else {
         print_report(&report);
     }
@@ -221,6 +250,11 @@ fn run(cli: Cli) -> i32 {
     } else {
         0
     }
+}
+
+fn write_json(writer: &mut impl Write, value: &impl serde::Serialize) -> std::io::Result<()> {
+    serde_json::to_writer_pretty(&mut *writer, value).map_err(std::io::Error::other)?;
+    writeln!(writer)
 }
 
 /// Explorer вызывает классический verb с одним или несколькими `%1`;
@@ -243,16 +277,22 @@ fn drop_empty_placeholders(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 }
 
 fn dedupe(paths: Vec<PathBuf>) -> Vec<PathBuf> {
-    let mut seen = std::collections::HashSet::new();
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL};
+    let mut seen: Vec<Vec<u16>> = Vec::new();
     let mut out = Vec::new();
     for path in paths {
         // Сравниваем по разобранному пути: `C:\a\` и `C:\a` — одно и то же.
         let key = NtPath::new(&path)
-            .map(|p| p.to_string_lossy().to_lowercase())
-            .unwrap_or_else(|_| path.to_string_lossy().to_lowercase());
-        if seen.insert(key) {
-            out.push(path);
+            .map(|p| p.plain().as_slice().to_vec())
+            .unwrap_or_else(|_| path.as_os_str().encode_wide().collect());
+        if seen.iter().any(|previous| {
+            previous == &key || unsafe { CompareStringOrdinal(previous, &key, true) == CSTR_EQUAL }
+        }) {
+            continue;
         }
+        seen.push(key);
+        out.push(path);
     }
     out
 }
@@ -279,8 +319,9 @@ fn shell_install(cli: &Cli, uninstall: bool) -> i32 {
             // Только в новый файл: `create_new` не пишет в уже существующее имя,
             // в том числе в символическую ссылку, заранее положенную процессом
             // пользователя, — повышенная запись иначе перезаписала бы любой файл.
-            if let Ok(mut file) = std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
-                let _ = file.write_all(lines.join("\n").as_bytes());
+            if let Err(error) = write_install_report(path, &lines) {
+                eprintln!("{}: {error}", path.display());
+                return 1;
             }
         }
         None => {
@@ -292,6 +333,11 @@ fn shell_install(cli: &Cli, uninstall: bool) -> i32 {
     code
 }
 
+fn write_install_report(path: &std::path::Path, lines: &[String]) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(lines.join("\n").as_bytes())
+}
+
 fn install_elevated(uninstall: bool) -> i32 {
     let Ok(exe) = std::env::current_exe() else {
         eprintln!("{}", tr!("Cannot find this program.", "Не удалось определить путь программы."));
@@ -299,11 +345,11 @@ fn install_elevated(uninstall: bool) -> i32 {
     };
     let report_file = std::env::temp_dir().join(format!("raze-install-{}.txt", unpredictable_name()));
     let line = build_arguments(&[
-        (if uninstall { "--uninstall" } else { "--install" }).to_string(),
-        "--lang".to_string(),
-        i18n::language().code().to_string(),
-        "--report-file".to_string(),
-        report_file.to_string_lossy().into_owned(),
+        OsString::from(if uninstall { "--uninstall" } else { "--install" }),
+        "--lang".into(),
+        i18n::language().code().into(),
+        "--report-file".into(),
+        report_file.as_os_str().to_os_string(),
     ]);
     eprintln!(
         "{}",
@@ -319,7 +365,10 @@ fn install_elevated(uninstall: bool) -> i32 {
         Ok(code) => {
             match text {
                 Ok(text) => println!("{text}"),
-                Err(_) => eprintln!("{}", tr!("The elevated copy left no report.", "Повышенная копия не оставила отчёта.")),
+                Err(_) => {
+                    eprintln!("{}", tr!("The elevated copy left no report.", "Повышенная копия не оставила отчёта."));
+                    return 1;
+                }
             }
             code as i32
         }
@@ -364,7 +413,7 @@ fn install_summary(report: &shell::InstallReport, uninstall: bool) -> (Vec<Strin
             shell::Step::Failed { what, error } => format!("[fail] {what}: {error}"),
         })
         .collect();
-    if uninstall {
+    if uninstall && report.ok() {
         lines.push(
             tr!(
                 "Done. The context menu is back to normal.",
@@ -377,8 +426,8 @@ fn install_summary(report: &shell::InstallReport, uninstall: bool) -> (Vec<Strin
     if !report.ok() {
         lines.push(
             tr!(
-                "Some steps failed; the classic menu verb is still registered if it succeeded.",
-                "Часть шагов не удалась; если verb зарегистрирован, он работает."
+                "Some steps failed; see the errors above.",
+                "Часть шагов не удалась; ошибки перечислены выше."
             )
             .to_string(),
         );
@@ -392,19 +441,35 @@ fn install_summary(report: &shell::InstallReport, uninstall: bool) -> (Vec<Strin
     (lines, 0)
 }
 
-fn relaunch_as_admin(cli: &Cli, planned: &[job::Target]) -> Option<i32> {
+fn relaunch_as_admin(cli: &Cli, planned: &[job::Target], report: &Report) -> Option<i32> {
     if !needs_elevation() {
         return None;
     }
     let Ok(exe) = std::env::current_exe() else {
         return None;
     };
-    let line = build_arguments(&elevation_arguments(cli, planned));
+    let retry: Vec<&job::Target> = planned.iter()
+        .filter(|target| report.targets.iter().any(|r| {
+            target.path.as_ref().is_some_and(|path| path.to_path() == r.native_path) && r.failures.iter().any(|failure| {
+                raze_rs::engine::error::NtError(failure.code).needs_elevation()
+            })
+        }))
+        .collect();
+    if retry.is_empty() {
+        return None;
+    }
+    let line = build_arguments(&elevation_arguments(cli, retry));
     if cli.verbose > 0 {
         eprintln!("{}", tr_format!("Requesting admin rights…", "Запрашиваю права администратора…"));
     }
     match relaunch_elevated(&exe, &line) {
-        Ok(true) => Some(0),
+        Ok(true) => {
+            println!("{}", tr!(
+                "Handed off to the administrator CLI. Its report is separate.",
+                "Передано CLI с правами администратора. Его отчёт — отдельно."
+            ));
+            Some(0)
+        }
         Ok(false) => {
             eprintln!(
                 "{}",
@@ -425,27 +490,29 @@ fn relaunch_as_admin(cli: &Cli, planned: &[job::Target]) -> Option<i32> {
 /// `-p` и `--keep-owners` терялись, и повышенный процесс брал владение там, где
 /// просили этого не делать. Пути идут абсолютными из плана: у повышенного
 /// процесса другой рабочий каталог, и относительный путь указал бы на другое.
-fn elevation_arguments(cli: &Cli, planned: &[job::Target]) -> Vec<String> {
-    let mut args = vec!["--elevated".to_string(), "--yes".to_string()];
+fn elevation_arguments<'a>(cli: &Cli, planned: impl IntoIterator<Item = &'a job::Target>) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec!["--elevated".into(), "--yes".into()];
     for (enabled, flag) in [
         (cli.permanent, "--permanent"),
         (cli.recycle, "--recycle"),
         (cli.close_locks, "--close-locks"),
         (cli.keep_owners, "--keep-owners"),
         (cli.json, "--json"),
+        (cli.find_locks, "--find-locks"),
     ] {
         if enabled {
-            args.push(flag.to_string());
+            args.push(flag.into());
         }
     }
-    args.extend(["--lang".to_string(), i18n::language().code().to_string()]);
+    args.extend(std::iter::repeat_n(OsString::from("--verbose"), usize::from(cli.verbose)));
+    args.extend([OsString::from("--lang"), i18n::language().code().into()]);
     // `--`: путь, начинающийся с «-», не должен читаться как параметр.
-    args.push("--".to_string());
+    args.push("--".into());
     args.extend(
         planned
-            .iter()
+            .into_iter()
             .filter(|target| target.refused.is_none())
-            .map(|target| target.display.clone()),
+            .filter_map(|target| target.path.as_ref().map(|path| path.to_path().into_os_string())),
     );
     args
 }
@@ -495,11 +562,15 @@ fn print_report(report: &Report) {
             raze_rs::engine::recycle::Disposition::RecycleBin => tr!("Recycle Bin", "Корзина"),
             raze_rs::engine::recycle::Disposition::Permanent => tr!("permanently", "безвозвратно"),
         };
+        let removed = if target.dry_run { tr!("would remove", "будет удалено") }
+            else { tr!("removed", "удалено") };
+        let freed = if target.dry_run { tr!("would free", "будет освобождено") }
+            else { tr!("freed", "освобождено") };
         println!(
             "{}",
             tr_format!(
-                "{path}: {mode}, removed {count}, freed {size}",
-                "{path}: {mode}, удалено {count}, освобождено {size}",
+                "{path}: {mode}, {removed} {count}, {freed} {size}",
+                "{path}: {mode}, {removed} {count}, {freed} {size}",
                 path = target.path,
                 mode = mode,
                 count = target.removed_total(),
@@ -587,6 +658,13 @@ mod tests {
     }
 
     #[test]
+    fn unicode_case_aliases_preserve_only_the_first_requested_path() {
+        let first = PathBuf::from(r"C:\Данные\Файл");
+        let paths = dedupe(vec![first.clone(), PathBuf::from(r"c:\данные\файл")]);
+        assert_eq!(paths, vec![first]);
+    }
+
+    #[test]
     fn empty_placeholders_from_explorer_are_dropped() {
         // clap 4 отвергает пустые значения на входе, поэтому
         // проверяем линию обороны, которая собирает пути.
@@ -604,20 +682,22 @@ mod tests {
 
     #[test]
     fn the_elevated_copy_gets_every_option_and_absolute_paths() {
-        let cli = Cli::parse_from(["raze", "-p", "-c", "--keep-owners", "relative-target"]);
+        let cli = Cli::parse_from(["raze", "-p", "-c", "--keep-owners", "-L", "-vv", "relative-target"]);
         let planned = job::plan(&collect_paths(&cli), &Options::default());
         let args = elevation_arguments(&cli, &planned);
 
-        for expected in ["--elevated", "--yes", "--permanent", "--close-locks", "--keep-owners", "--"] {
+        for expected in ["--elevated", "--yes", "--permanent", "--close-locks", "--keep-owners", "--find-locks", "--"] {
             assert!(args.iter().any(|a| a == expected), "{expected}: {args:?}");
         }
         assert!(!args.iter().any(|a| a == "--recycle"));
+        assert_eq!(args.iter().filter(|arg| *arg == "--verbose").count(), 2);
         // Пути идут после `--` и абсолютными, а не «как набрали».
         let separator = args.iter().position(|a| a == "--").unwrap();
         let paths = &args[separator + 1..];
         assert_eq!(paths.len(), 1);
-        assert!(paths[0].as_bytes()[1] == b':', "{}", paths[0]);
-        assert!(paths[0].to_lowercase().ends_with("relative-target"));
+        let path = paths[0].to_string_lossy();
+        assert!(path.as_bytes()[1] == b':', "{path}");
+        assert!(path.to_lowercase().ends_with("relative-target"));
     }
 
     #[test]
@@ -638,7 +718,7 @@ mod tests {
         // Занятое имя (файл или ссылка) не перезаписывается: create_new откажет.
         let taken = std::env::temp_dir().join(format!("raze-report-test-{}.txt", unpredictable_name()));
         std::fs::write(&taken, b"keep").unwrap();
-        assert!(std::fs::OpenOptions::new().write(true).create_new(true).open(&taken).is_err());
+        assert!(write_install_report(&taken, &["replace".into()]).is_err());
         assert_eq!(std::fs::read(&taken).unwrap(), b"keep");
         let _ = std::fs::remove_file(&taken);
     }
@@ -652,21 +732,39 @@ mod tests {
         let (lines, code) = install_summary(&report, false);
         assert_eq!(code, 1);
         assert!(lines.iter().any(|l| l == "[fail] copy x: boom"));
-        // Снятие всегда заканчивается «Готово».
-        assert_eq!(install_summary(&report, true).1, 0);
+        assert_eq!(install_summary(&report, true).1, 1);
     }
 
     #[test]
-    fn a_dry_run_never_asks_for_confirmation() {
-        let cli = Cli::parse_from(["raze", "-n", "C:\tmp"]);
-        assert!(cli.dry_run && !cli.yes && !cli.from_shell);
+    fn installation_and_uninstallation_cannot_be_requested_together() {
+        assert!(Cli::try_parse_from(["raze", "--install", "--uninstall"]).is_err());
     }
 
+    #[cfg(windows)]
     #[test]
-    fn cli_parses_the_documented_flags() {
-        let cli = Cli::parse_from(["raze", "-n", "-y", "C:\\tmp"]);
-        assert!(cli.dry_run);
-        assert!(cli.yes);
-        assert_eq!(cli.paths, vec![PathBuf::from("C:\\tmp")]);
+    fn native_paths_are_not_deduplicated_or_elevated_through_lossy_display_text() {
+        use std::os::windows::ffi::OsStringExt;
+        let mut wide: Vec<u16> = r"C:\raze-cli-test\".encode_utf16().collect();
+        wide.push(0xd800);
+        let native = PathBuf::from(OsString::from_wide(&wide));
+        let replacement = PathBuf::from(r"C:\raze-cli-test\�");
+        let paths = dedupe(vec![native.clone(), replacement.clone(), native.clone()]);
+        assert_eq!(paths, vec![native.clone(), replacement]);
+        let path = NtPath::new(&native).unwrap();
+        let planned = vec![job::Target {
+            display: path.to_string_lossy(),
+            path: Some(path),
+            entries: Vec::new(),
+            summary: Default::default(),
+            verdict: raze_rs::engine::recycle::RecycleVerdict {
+                reusable: true,
+                reason: String::new(),
+            },
+            refused: None,
+        }];
+        let cli = Cli::parse_from(["raze", "-y"]);
+        let args = elevation_arguments(&cli, &planned);
+        assert_eq!(args.last().unwrap(), native.as_os_str());
     }
+
 }

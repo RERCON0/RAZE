@@ -21,8 +21,8 @@
 //! выбранными путями и возвращает управление: удаление занимает секунды,
 //! а Проводник не должен висеть на нашем модальном окне.
 
-use std::ffi::c_void;
-use std::os::windows::ffi::OsStrExt;
+use std::ffi::{c_void, OsString};
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -98,6 +98,7 @@ const ICON_RESOURCE_ID: i32 = -1;
 /// счётчике ссылок, а `Drop` на теле объекта — единственное место,
 /// где мы об этом узнаём.
 static LIVE_OBJECTS: AtomicUsize = AtomicUsize::new(0);
+static SERVER_LOCKS: AtomicUsize = AtomicUsize::new(0);
 
 /// Команда меню «Удалить с помощью RAZE».
 #[implement(IExplorerCommand, IObjectWithSite)]
@@ -239,7 +240,15 @@ impl IClassFactory_Impl for RazeFactory_Impl {
         }
     }
 
-    fn LockServer(&self, _lock: BOOL) -> windows::core::Result<()> {
+    fn LockServer(&self, lock: BOOL) -> windows::core::Result<()> {
+        if lock.as_bool() {
+            SERVER_LOCKS.fetch_add(1, Ordering::SeqCst);
+        } else {
+            // An unmatched unlock must not wrap the counter and pin the DLL forever.
+            let _ = SERVER_LOCKS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |locks| {
+                locks.checked_sub(1)
+            });
+        }
         Ok(())
     }
 }
@@ -284,7 +293,7 @@ pub unsafe extern "system" fn DllGetClassObject(
 /// спросят ещё раз.
 #[no_mangle]
 pub extern "system" fn DllCanUnloadNow() -> HRESULT {
-    if LIVE_OBJECTS.load(Ordering::SeqCst) == 0 {
+    if LIVE_OBJECTS.load(Ordering::SeqCst) == 0 && SERVER_LOCKS.load(Ordering::SeqCst) == 0 {
         HRESULT(0)
     } else {
         HRESULT(1)
@@ -326,7 +335,7 @@ fn selected_paths(items: &IShellItemArray) -> windows::core::Result<Vec<PathBuf>
             Err(_) => continue,
         };
         let text = unsafe { wide_slice(&name) };
-        let path = PathBuf::from(String::from_utf16_lossy(text));
+        let path = PathBuf::from(OsString::from_wide(text));
         unsafe { CoTaskMemFree(Some(name.0.cast::<c_void>())) };
         if path.as_os_str().is_empty() {
             continue;
@@ -372,13 +381,22 @@ fn module_path() -> Option<PathBuf> {
         )
     }
     .ok()?;
-    let mut buffer = vec![0u16; MAX_PATH_CHARS];
-    let length = unsafe { GetModuleFileNameW(Some(module), &mut buffer) };
-    if length == 0 || length as usize >= MAX_PATH_CHARS {
-        return None;
+    let mut buffer = vec![0u16; 260];
+    loop {
+        let length = unsafe { GetModuleFileNameW(Some(module), &mut buffer) } as usize;
+        if length == 0 {
+            return None;
+        }
+        if length < buffer.len() {
+            buffer.truncate(length);
+            break;
+        }
+        if buffer.len() == MAX_PATH_CHARS {
+            return None;
+        }
+        buffer.resize((buffer.len() * 2).min(MAX_PATH_CHARS), 0);
     }
-    buffer.truncate(length as usize);
-    let path = PathBuf::from(String::from_utf16_lossy(&buffer));
+    let path = PathBuf::from(OsString::from_wide(&buffer));
     if path.as_os_str().is_empty() {
         None
     } else {
@@ -398,7 +416,7 @@ fn spawn_raze(paths: &[PathBuf]) {
     // пункту меню молча ничего не запускал. Пути делятся на пакеты; каждый пакет
     // — отдельный `raze.exe`.
     for batch in batches(&exe, paths) {
-        launch(&command_line(&exe, batch));
+        launch(&mut command_line(&exe, batch));
     }
 }
 
@@ -425,13 +443,11 @@ fn command_line(exe: &Path, paths: &[PathBuf]) -> Vec<u16> {
 /// Один путь, который не помещается и сам по себе, получает свой пакет:
 /// длиннее предела NTFS (32 767) он быть не может.
 fn batches<'a>(exe: &Path, paths: &'a [PathBuf]) -> Vec<&'a [PathBuf]> {
-    let base = command_line(exe, &[]).len();
+    let base = quoted_len(exe) + " --from-shell".len() + 1;
     let mut out = Vec::new();
     let (mut start, mut used) = (0usize, base);
     for (index, path) in paths.iter().enumerate() {
-        let mut one = Vec::new();
-        push_quoted(&mut one, path);
-        let cost = " --mode ".len() + one.len();
+        let cost = " --mode ".len() + quoted_len(path);
         if index > start && used + cost > MAX_COMMAND_UNITS {
             out.push(&paths[start..index]);
             start = index;
@@ -445,8 +461,7 @@ fn batches<'a>(exe: &Path, paths: &'a [PathBuf]) -> Vec<&'a [PathBuf]> {
     out
 }
 
-fn launch(command: &[u16]) {
-    let mut command = command.to_vec();
+fn launch(command: &mut [u16]) {
     let startup = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
         ..Default::default()
@@ -478,6 +493,22 @@ fn launch(command: &[u16]) {
 /// хвост из обратных черт перед закрывающей кавычкой удваиваются, сама
 /// кавычка экранируется. Без этого путь с кавычкой в имени (NT такое
 /// имя разрешает) разорвал бы командную строку.
+fn quoted_len(argument: &Path) -> usize {
+    let (mut length, mut backslashes) = (2usize, 0usize);
+    for unit in argument.as_os_str().encode_wide() {
+        length += 1;
+        if unit == b'\\' as u16 {
+            backslashes += 1;
+        } else {
+            if unit == b'"' as u16 {
+                length += backslashes + 1;
+            }
+            backslashes = 0;
+        }
+    }
+    length + backslashes
+}
+
 fn push_quoted(out: &mut Vec<u16>, argument: &Path) {
     out.push(b'"' as u16);
     let mut backslashes = 0usize;
@@ -489,7 +520,7 @@ fn push_quoted(out: &mut Vec<u16>, argument: &Path) {
         if unit == b'"' as u16 {
             // k черт перед кавычкой становятся 2k+1: кавычка
             // экранируется, черты удваиваются.
-            out.resize(out.len() + backslashes + 1, b'\\' as u16);
+            out.resize(out.len() + backslashes * 2 + 1, b'\\' as u16);
         } else {
             out.resize(out.len() + backslashes, b'\\' as u16);
         }
@@ -545,6 +576,49 @@ mod tests {
         let mut command = Vec::new();
         push_quoted(&mut command, Path::new(r"C:\we\"));
         assert_eq!(String::from_utf16_lossy(&command), r#""C:\we\\""#);
+    }
+
+    #[test]
+    fn backslashes_before_quotes_round_trip_through_windows() {
+        use windows::Win32::Foundation::{HLOCAL, LocalFree};
+        use windows::Win32::UI::Shell::CommandLineToArgvW;
+        let argument = PathBuf::from(r#"C:\tmp\a\\"b\"#);
+        let mut command: Vec<u16> = "raze.exe ".encode_utf16().collect();
+        let start = command.len();
+        push_quoted(&mut command, &argument);
+        assert_eq!(command.len() - start, quoted_len(&argument));
+        command.push(0);
+        let mut count = 0;
+        let arguments = unsafe { CommandLineToArgvW(PCWSTR(command.as_ptr()), &mut count) };
+        assert!(!arguments.is_null());
+        assert_eq!(count, 2);
+        let actual = unsafe { OsString::from_wide(wide_slice(&*arguments.add(1))) };
+        unsafe { LocalFree(Some(HLOCAL(arguments.cast()))) };
+        assert_eq!(actual, argument.as_os_str());
+    }
+
+    #[test]
+    fn server_lock_survives_release_of_the_factory() {
+        LIVE_OBJECTS.fetch_add(1, Ordering::SeqCst);
+        let factory: IClassFactory = RazeFactory.into();
+        unsafe { factory.LockServer(true).unwrap() };
+        drop(factory);
+        assert_eq!(DllCanUnloadNow(), HRESULT(1));
+        LIVE_OBJECTS.fetch_add(1, Ordering::SeqCst);
+        let factory: IClassFactory = RazeFactory.into();
+        unsafe { factory.LockServer(false).unwrap() };
+        assert_eq!(SERVER_LOCKS.load(Ordering::SeqCst), 0);
+        // A bad caller must not turn zero into usize::MAX.
+        unsafe { factory.LockServer(false).unwrap() };
+        assert_eq!(SERVER_LOCKS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn shell_paths_preserve_unpaired_utf16_surrogates() {
+        let units = [b'C' as u16, b':' as u16, b'\\' as u16, 0xD800, 0];
+        let name = PWSTR(units.as_ptr().cast_mut());
+        let path = PathBuf::from(OsString::from_wide(unsafe { wide_slice(&name) }));
+        assert_eq!(path.as_os_str().encode_wide().collect::<Vec<_>>(), units[..4]);
     }
 
     #[test]

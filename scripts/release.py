@@ -24,15 +24,16 @@ TARGET = "x86_64-pc-windows-msvc"
 PAYLOAD = {"raze.exe", "raze-app.exe", "raze_shell.dll", "RAZE.msix", "RAZE.cer",
            "README.md", "LICENSE", "FONT-LICENSE.txt"}
 META = {"manifest.json", "manifest.sig", "public-key.pem"}
-SUBSYSTEMS = {"raze.exe": 3, "raze-app.exe": 2}
+SUBSYSTEMS = {"raze.exe": 3, "raze-app.exe": 2, "raze_shell.dll": 2}
 MAX_FILE = 64 * 1024 * 1024
 MAX_PACKAGE = 160 * 1024 * 1024
 MAX_META = 2 * 1024 * 1024
 ED25519_SPKI_PREFIX = bytes.fromhex("302a300506032b6570032100")
 
 
-def run(args: list[str], *, cwd: Path = ROOT, capture: bool = True, timeout: int = 120) -> bytes:
-    result = subprocess.run(args, cwd=cwd, check=True, timeout=timeout,
+def run(args: list[str], *, cwd: Path = ROOT, capture: bool = True, timeout: int = 120,
+        input: bytes | None = None) -> bytes:
+    result = subprocess.run(args, cwd=cwd, check=True, timeout=timeout, input=input,
                             stdout=subprocess.PIPE if capture else None,
                             stderr=subprocess.PIPE if capture else None)
     return result.stdout if capture else b""
@@ -88,8 +89,8 @@ def verify_signature(manifest: bytes, signature: bytes, key: Path) -> None:
              "-in", str(data), "-sigfile", str(sig)])
 
 
-def pe_info(data: bytes, subsystem: int) -> dict:
-    """Reject wrong architecture, missing exploit mitigations and dynamic CRT."""
+def pe_info(data: bytes, subsystem: int, *, dll: bool = False) -> dict:
+    """Reject wrong architecture/image type, missing mitigations and dynamic CRT."""
     def unpack(fmt: str, offset: int) -> tuple:
         size = struct.calcsize(fmt)
         if offset < 0 or offset + size > len(data):
@@ -103,6 +104,9 @@ def pe_info(data: bytes, subsystem: int) -> dict:
         raise ValueError("Missing PE header")
     machine, sections = unpack("<HH", pe + 4)
     opt_size, = unpack("<H", pe + 20)
+    characteristics, = unpack("<H", pe + 22)
+    if bool(characteristics & 0x2000) != dll:
+        raise ValueError("Incorrect PE executable/DLL image type")
     opt = pe + 24
     magic, = unpack("<H", opt)
     actual_subsystem, flags = unpack("<HH", opt + 68)
@@ -224,8 +228,10 @@ def verify_package(path: Path, trusted_key: Path = PUBLIC_KEY) -> dict:
             raise ValueError("Invalid payload record")
         if type(record["size"]) is not int or record["size"] != len(content[name]) or record["sha256"] != sha256(content[name]):
             raise ValueError(f"Payload hash/size mismatch: {name}")
-        if name.endswith(".exe") and record["pe"] != pe_info(content[name], SUBSYSTEMS[name]):
-            raise ValueError("PE metadata mismatch")
+        if name in SUBSYSTEMS:
+            info = pe_info(content[name], SUBSYSTEMS[name], dll=name.endswith(".dll"))
+            if name.endswith(".exe") and record["pe"] != info:
+                raise ValueError("PE metadata mismatch")
     return manifest
 
 
@@ -258,8 +264,10 @@ def package(payload: dict[str, bytes], source: dict, toolchain: dict, version: s
         if not data or len(data) > MAX_FILE:
             raise ValueError(f"Invalid payload size: {name}")
         files[name] = {"sha256": sha256(data), "size": len(data)}
-        if name.endswith(".exe"):
-            files[name]["pe"] = pe_info(data, SUBSYSTEMS[name])
+        if name in SUBSYSTEMS:
+            info = pe_info(data, SUBSYSTEMS[name], dll=name.endswith(".dll"))
+            if name.endswith(".exe"):
+                files[name]["pe"] = info
     manifest = {"schema": 1, "project": "RAZE", "version": version, "target": TARGET,
                 "source": source, "toolchain": toolchain, "files": files, "signer_sha256": sha256(der)}
     raw = canonical(manifest)
@@ -366,20 +374,35 @@ def release_readme(version: str, commit: str) -> bytes:
 def keygen(private: Path, public: Path) -> None:
     if private.resolve().is_relative_to(ROOT):
         raise ValueError("Private keys must live outside the repository")
-    if private.exists() or public.exists():
-        raise ValueError("Refusing to overwrite an existing signing key")
+    if private.resolve() == public.resolve():
+        raise ValueError("Private and public key paths must differ")
     private.parent.mkdir(parents=True, exist_ok=True)
-    if os.name == "nt":
-        account = os.environ["USERDOMAIN"] + "\\" + os.environ["USERNAME"]
-        run(["icacls", str(private.parent), "/inheritance:r", "/grant:r", account + ":(OI)(CI)F"])
-    else:
-        private.parent.chmod(0o700)
-    run([openssl(), "genpkey", "-algorithm", "ED25519", "-out", str(private)])
-    if os.name != "nt":
-        private.chmod(0o600)
     public.parent.mkdir(parents=True, exist_ok=True)
-    run([openssl(), "pkey", "-in", str(private), "-pubout", "-out", str(public)])
-    print("Public key SHA-256:", sha256(public_der(public)))
+    # Reserve both destinations exclusively, including dangling symlinks. Do not
+    # change permissions on a caller's existing directory or ask OpenSSL to
+    # reopen output paths, which could overwrite another key.
+    created: list[Path] = []
+    try:
+        with os.fdopen(os.open(private, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as private_file:
+            created.append(private)
+            if os.name == "nt":
+                # Reset explicit grants on this new, still empty file, then remove
+                # inherited grants. OWNER RIGHTS refers to the actual file owner,
+                # not USERNAME/USERDOMAIN inherited from the caller's environment.
+                run(["icacls", str(private), "/reset"])
+                run(["icacls", str(private), "/inheritance:r", "/grant:r", "*S-1-3-4:F"])
+            with public.open("xb") as public_file:
+                created.append(public)
+                secret = run([openssl(), "genpkey", "-algorithm", "ED25519"])
+                published = run([openssl(), "pkey", "-pubout"], input=secret)
+                private_file.write(secret)
+                public_file.write(published)
+        fingerprint = sha256(public_der(public))
+    except BaseException:
+        for path in reversed(created):
+            path.unlink(missing_ok=True)
+        raise
+    print("Public key SHA-256:", fingerprint)
 
 
 def main() -> None:
@@ -403,7 +426,7 @@ def main() -> None:
             if not 0 < path.stat().st_size <= MAX_FILE:
                 raise ValueError("Invalid executable size")
             data = path.read_bytes()
-            print(name, sha256(data), json.dumps(pe_info(data, subsystem), sort_keys=True))
+            print(name, sha256(data), json.dumps(pe_info(data, subsystem, dll=name.endswith(".dll")), sort_keys=True))
         return
     if args.command == "keygen":
         keygen(args.private_key, args.public_key)

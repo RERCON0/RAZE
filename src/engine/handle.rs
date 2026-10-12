@@ -12,7 +12,7 @@ use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo,
     FileBasicInfo, FILE_FLAGS_AND_ATTRIBUTES, GetFileInformationByHandleEx, OPEN_EXISTING,
-    READ_CONTROL, SetFileInformationByHandle, WRITE_DAC, WRITE_OWNER, FILE_ATTRIBUTE_TAG_INFO,
+    SetFileInformationByHandle, FILE_ATTRIBUTE_TAG_INFO,
     FILE_BASIC_INFO,
 };
 
@@ -31,16 +31,6 @@ pub fn delete_access() -> FILE_ACCESS_RIGHTS {
     DELETE | FILE_READ_ATTRIBUTES
 }
 
-/// Права для обхода защиты: с ними и привилетией `SeBackupPrivilege`
-/// открывается почти всё, включая файлы, на которые у процесса нет прав.
-pub fn privileged_access() -> FILE_ACCESS_RIGHTS {
-    DELETE | FILE_READ_ATTRIBUTES | READ_CONTROL
-}
-
-/// Права, нужные чтобы стать владельцем и починить DACL.
-pub fn security_access() -> FILE_ACCESS_RIGHTS {
-    DELETE | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_OWNER | WRITE_DAC
-}
 
 /// Открывает объект для удаления. `open_reparse` обязателен: без него
 /// junction откроется как каталог и обход уйдёт внутрь чужого дерева.
@@ -69,15 +59,6 @@ pub fn open_with(
     .map(OwnedHandle)
 }
 
-/// Попытка открыть объект, не падая на отсутствии: `None` — значит «нет
-/// такого пути», и это не ошибка удаления.
-pub fn try_open(
-    path: &NtPath,
-    access: FILE_ACCESS_RIGHTS,
-    options: FILE_FLAGS_AND_ATTRIBUTES,
-) -> Option<OwnedHandle> {
-    open_with(path, access, options).ok()
-}
 
 /// Дескриптор, который закрывается сам.
 pub struct OwnedHandle(HANDLE);
@@ -181,11 +162,17 @@ pub struct Containment {
 }
 
 impl Containment {
-    /// `Ok(None)` — файловая система не умеет отдавать окончательный путь:
-    /// защиту включить нечем, и это не повод отказывать в удалении всему тому.
-    pub fn new(root: &NtPath) -> Result<Option<Self>, NtError> {
+    /// Если окончательный путь недоступен, обход запрещён: без него нельзя
+    /// проверить, что удаляемый объект принадлежит выбранному дереву.
+    pub fn new(root: &NtPath) -> Result<Self, NtError> {
         let handle = open_with(root, FILE_READ_ATTRIBUTES, object_flags())?;
-        Ok(final_path(&handle).map(|root| Self { root }))
+        use std::os::windows::ffi::OsStringExt;
+        let root = final_path(&handle).ok_or(NtError(super::error::ERROR_OUTSIDE_TREE))?;
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_wide(&root));
+        let resolved = NtPath::new(&path).map_err(|_| NtError(super::error::ERROR_OUTSIDE_TREE))?;
+        crate::protect::check_resolved(&resolved)
+            .map_err(|_| NtError(super::error::ERROR_OUTSIDE_TREE))?;
+        Ok(Self { root })
     }
 
     pub fn holds(&self, handle: &OwnedHandle) -> bool {
@@ -213,8 +200,13 @@ pub fn clear_read_only(handle: &OwnedHandle) -> Result<(), NtError> {
     if !current.is_read_only() {
         return Ok(());
     }
+    let writable = current.attributes & !FILE_ATTRIBUTE_READONLY.0;
     let info = FILE_BASIC_INFO {
-        FileAttributes: current.attributes & !FILE_ATTRIBUTE_READONLY.0,
+        FileAttributes: if writable == 0 {
+            windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL.0
+        } else {
+            writable
+        },
         ..Default::default()
     };
     nt(unsafe {
@@ -227,21 +219,6 @@ pub fn clear_read_only(handle: &OwnedHandle) -> Result<(), NtError> {
     })
 }
 
-/// Читает время последней записи — используется для сортировки в GUI.
-pub fn last_write_time(path: &NtPath) -> Option<std::time::SystemTime> {
-    use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
-    let handle = try_open(
-        path,
-        FILE_READ_ATTRIBUTES,
-        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
-    )?;
-    let mut info = BY_HANDLE_FILE_INFORMATION::default();
-    unsafe { GetFileInformationByHandle(handle.raw(), &mut info) }.ok()?;
-    let ft = info.ftLastWriteTime;
-    Some(std::time::UNIX_EPOCH + std::time::Duration::from_nanos(
-        (ft.dwHighDateTime as u64) << 32 | ft.dwLowDateTime as u64,
-    ))
-}
 
 #[cfg(test)]
 mod tests {
@@ -259,6 +236,14 @@ mod tests {
         assert!(!guard.contains(&wide(r"\\?\C:\ab")), "похожий сосед не принадлежит дереву");
         assert!(!guard.contains(&wide(r"\\?\C:\")));
         assert!(!guard.contains(&wide(r"\\?\D:\a\b")));
+    }
+
+    #[test]
+    fn protected_resolved_root_is_refused_before_traversal() {
+        let windows = std::env::var_os("SystemRoot").unwrap();
+        let system = std::path::PathBuf::from(windows).join("System32");
+        let result = Containment::new(&NtPath::new(&system).unwrap());
+        assert!(matches!(result, Err(NtError(super::super::error::ERROR_OUTSIDE_TREE))));
     }
 
     #[test]

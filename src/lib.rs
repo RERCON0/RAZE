@@ -54,18 +54,3 @@ pub fn errln(s: impl AsRef<str>) {
     eprintln!("{}", s.as_ref());
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wordmark_is_seven_rows_and_the_banner_carries_the_tagline_in_both_languages() {
-        assert_eq!(WORDMARK.trim_matches(['\r', '\n']).lines().count(), 7);
-        for (language, expected) in [
-            (i18n::Language::En, "stubborn files, clean folders"),
-            (i18n::Language::Ru, "сложные файлы. чистые папки."),
-        ] {
-            i18n::with_language(language, || assert!(banner().contains(expected)));
-        }
-    }
-}

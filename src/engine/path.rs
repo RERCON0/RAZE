@@ -30,8 +30,14 @@ pub const LONG_PATH_WARN: usize = 240;
 /// конструкторах и в [`Wide::join`]; наружу отдаётся либо
 /// [`Wide::as_slice`] (содержимое без терминатора), либо
 /// [`Wide::pc`] (указатель, пригодный для передачи в API).
-#[derive(Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Wide(Vec<u16>);
+
+impl Default for Wide {
+    fn default() -> Self {
+        Self(vec![0])
+    }
+}
 
 impl Wide {
     pub fn new(text: &str) -> Self {
@@ -42,6 +48,18 @@ impl Wide {
 
     pub fn from_path(path: &Path) -> Self {
         let mut buffer: Vec<u16> = path.as_os_str().encode_wide().collect();
+        buffer.push(0);
+        Self(buffer)
+    }
+
+    fn from_units(units: &[u16]) -> Self {
+        Self::prefixed("", units)
+    }
+
+    fn prefixed(prefix: &str, units: &[u16]) -> Self {
+        let mut buffer = Vec::with_capacity(prefix.len() + units.len() + 1);
+        buffer.extend(prefix.encode_utf16());
+        buffer.extend_from_slice(units);
         buffer.push(0);
         Self(buffer)
     }
@@ -131,28 +149,6 @@ impl Wide {
         Self(out)
     }
 
-    /// Обрезать до `components` компонентов (после префикса и буквы диска).
-    pub fn truncate_components(&self, components: usize) -> Self {
-        let skip = self.drive_prefix_len().unwrap_or(0);
-        let body = self.as_slice();
-        let mut left = components;
-        let mut out: Vec<u16> = Vec::new();
-        let mut index = skip;
-        while index < body.len() {
-            if body[index] == b'\\' as u16 {
-                if left == 0 {
-                    break;
-                }
-                out.push(body[index]);
-                left -= 1;
-            } else {
-                out.push(body[index]);
-            }
-            index += 1;
-        }
-        out.push(0);
-        Self(out)
-    }
 
     pub fn to_string_lossy(&self) -> String {
         String::from_utf16_lossy(self.as_slice())
@@ -272,7 +268,7 @@ impl NtPath {
                 reject_invalid_characters(rest)?;
                 // Для показа и сравнения это обычный UNC-путь: `\\server\share`.
                 return Ok(Self {
-                    plain: normalize_absolute(&Wide::new(&format!("\\\\{rest}"))),
+                    plain: normalize_absolute(&Wide::prefixed(r"\\", &slice[8..])),
                     ext: raw.clone(),
                 });
             }
@@ -285,7 +281,7 @@ impl NtPath {
             }
             reject_invalid_characters(&body[2..])?;
             return Ok(Self {
-                plain: normalize_absolute(&Wide::new(body)),
+                plain: normalize_absolute(&Wide::from_units(&slice[4..])),
                 ext: raw.clone(),
             });
         }
@@ -304,12 +300,11 @@ impl NtPath {
             if !has_share {
                 return Err(PathError::IncompleteUnc);
             }
-            let plain = normalize_absolute(&Wide::new(&format!("\\\\{body}")));
+            let plain = normalize_absolute(raw);
             // `plain` уже начинается с `\\`, а расширенная форма
             // UNC — `\\?\UNC\server\share`: разделители не дублируем.
-            let plain_text = plain.to_string_lossy();
             return Ok(Self {
-                ext: Wide::new(&format!("\\\\?\\UNC\\{}", &plain_text[2..])),
+                ext: Wide::prefixed(r"\\?\UNC\", &plain.as_slice()[2..]),
                 plain,
             });
         }
@@ -319,9 +314,9 @@ impl NtPath {
             && text.as_bytes()[0].is_ascii_alphabetic() {
                 reject_invalid_characters(&text[2..])?;
                 if text.len() >= 3 && text.as_bytes()[2] == b'\\' {
-                    let plain = normalize_absolute(&Wide::new(&text));
+                    let plain = normalize_absolute(raw);
                     return Ok(Self {
-                        ext: Wide::new(&format!("\\\\?\\{}", plain.to_string_lossy())),
+                        ext: Wide::prefixed(r"\\?\", plain.as_slice()),
                         plain,
                     });
                 }
@@ -330,16 +325,16 @@ impl NtPath {
                     // GetFullPathNameW вернул бы `C:\` (текущий каталог
                     // диска), и путь стал бы корнем тома.
                     return Ok(Self {
-                        ext: Wide::new(&format!("\\\\?\\{text}")),
-                        plain: Wide::new(&text),
+                        ext: Wide::prefixed(r"\\?\", slice),
+                        plain: raw.clone(),
                     });
                 }
                 // `C:foo` — относительно текущей папки диска C. Тут нужен
                 // GetFullPathNameW: он знает про per-drive current directory.
-                let full = full_path_name(&Wide::new(&text))?;
+                let full = full_path_name(raw)?;
                 let plain = normalize_absolute(&Wide::from_path(&full));
                 return Ok(Self {
-                    ext: Wide::new(&format!("\\\\?\\{}", plain.to_string_lossy())),
+                    ext: Wide::prefixed(r"\\?\", plain.as_slice()),
                     plain,
                 });
             }
@@ -356,7 +351,7 @@ impl NtPath {
         }
         let plain = normalize_absolute(&Wide::from_path(&full));
         Ok(Self {
-            ext: Wide::new(&format!("\\\\?\\{}", plain.to_string_lossy())),
+            ext: Wide::prefixed(r"\\?\", plain.as_slice()),
             plain,
         })
     }
@@ -447,8 +442,8 @@ impl NtPath {
         self.ext.as_slice()[skip..]
             .split(|c| *c == b'\\' as u16)
             .filter(|c| !c.is_empty())
+            .find(|c| is_reserved_component_wide(c))
             .map(String::from_utf16_lossy)
-            .find(|c| is_reserved_name(c))
     }
 
     /// Длина обычного (без `\\?\`) пути в UTF-16 — именно её сравнивают с
@@ -521,9 +516,10 @@ pub fn is_reserved_name(name: &str) -> bool {
     // четыре байта, и `base[..3]` резал бы вторую букву посреди (паника).
     let bytes = base.as_bytes();
     for prefix in ["COM", "LPT"] {
-        if bytes.len() == prefix.len() + 1
+        if bytes.len() > prefix.len()
             && bytes[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
-            && bytes[prefix.len()].is_ascii_digit()
+            && (bytes[prefix.len()..].len() == 1 && bytes[prefix.len()].is_ascii_digit()
+                || matches!(&base[prefix.len()..], "¹" | "²" | "³"))
         {
             return true;
         }
@@ -533,19 +529,26 @@ pub fn is_reserved_name(name: &str) -> bool {
 
 /// Проверка с учётом надстрочных цифр (они многобайтовые в UTF-16).
 pub fn is_reserved_component_wide(name: &[u16]) -> bool {
-    let text = String::from_utf16_lossy(name);
-    if is_reserved_name(&text) {
-        return true;
-    }
-    // COM¹ COM² COM³ LPT¹ LPT² LPT³
-    for prefix in ["COM", "LPT"] {
-        if let Some(rest) = text.strip_prefix(prefix) {
-            if matches!(rest, "¹" | "²" | "³") {
-                return true;
-            }
+    let end = name.iter().position(|unit| *unit == b'.' as u16).unwrap_or(name.len());
+    let base = &name[..end];
+    let end = base.iter().rposition(|unit| *unit != b' ' as u16).map_or(0, |pos| pos + 1);
+    let base = &base[..end];
+    for device in [b"CON".as_slice(), b"PRN", b"AUX", b"NUL", b"CLOCK$", b"CONIN$", b"CONOUT$"] {
+        if wide_eq_ascii(base, device) {
+            return true;
         }
     }
-    false
+    base.len() == 4
+        && (wide_eq_ascii(&base[..3], b"COM") || wide_eq_ascii(&base[..3], b"LPT"))
+        && (matches!(base[3], 0x00B9 | 0x00B2 | 0x00B3)
+            || (b'0' as u16..=b'9' as u16).contains(&base[3]))
+}
+
+fn wide_eq_ascii(wide: &[u16], ascii: &[u8]) -> bool {
+    wide.len() == ascii.len()
+        && wide.iter().zip(ascii).all(|(unit, byte)| {
+            *unit <= 0x7F && (*unit as u8).eq_ignore_ascii_case(byte)
+        })
 }
 
 /// `X:\` — буква диска и разделитель. Голый `X:` сюда не входит: после
@@ -652,6 +655,14 @@ mod tests {
 
     fn nt(text: &str) -> NtPath {
         NtPath::new(Path::new(text)).expect("path parses")
+    }
+
+    #[test]
+    fn empty_wide_values_are_safe_win32_strings() {
+        for empty in [Wide::default(), Wide::new(""), Wide::from_path(Path::new(""))] {
+            assert!(unsafe { empty.pc().as_wide() }.is_empty());
+            assert_eq!(NtPath::from_wide(&empty).unwrap_err(), PathError::Empty);
+        }
     }
 
     #[test]
@@ -767,7 +778,10 @@ mod tests {
         assert!(!is_reserved_name("COM"));
         assert!(!is_reserved_name("NULL"));
         assert!(!is_reserved_name("NUL1.txt"));
-        assert!(is_reserved_component_wide(&Wide::new("COM¹").as_slice().to_vec()));
+        for name in ["COM¹", "com².txt", "Lpt³.log ", "nul.txt"] {
+            assert!(is_reserved_name(name), "{name}");
+            assert!(is_reserved_component_wide(Wide::new(name).as_slice()), "{name}");
+        }
 
         assert_eq!(nt(r"C:\dir\NUL").reserved_component().as_deref(), Some("NUL"));
         assert_eq!(

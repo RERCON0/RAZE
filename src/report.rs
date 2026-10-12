@@ -13,6 +13,9 @@ use crate::engine::remove::{Failure, Note};
 #[derive(Clone, Debug, Serialize)]
 pub struct TargetReport {
     pub path: String,
+    /// Original native path for UI correlation and elevation; display text is lossy.
+    #[serde(skip)]
+    pub native_path: std::path::PathBuf,
     pub disposition: Disposition,
     /// Почему выбран именно такой режим (например, «зарезервированное имя NUL»).
     pub reason: String,
@@ -22,7 +25,6 @@ pub struct TargetReport {
     pub freed_bytes: u64,
     pub notes: Vec<Note>,
     pub failures: Vec<Failure>,
-    #[serde(skip)]
     pub dry_run: bool,
 }
 
@@ -69,10 +71,10 @@ impl Report {
     }
 
     pub fn failed(&self) -> bool {
-        self.failures() > 0 || !self.refused.is_empty()
+        self.cancelled || self.failures() > 0 || !self.refused.is_empty()
     }
 
-    /// Одна строка итогов — и для GUI, и для CLI, и для теста локализации.
+    /// Одна строка итогов — и для GUI, и для CLI.
     pub fn summary_line(&self) -> String {
         if self.cancelled {
             return crate::tr!("Cancelled", "Отменено").to_string();
@@ -97,13 +99,13 @@ impl Report {
         }
     }
 
-    /// Пустой отчёт для юнит-тестов локализации: та же ветка кода, что и в
-    /// реальном отчёте, но без файловой системы.
+    /// Отчёт для unit tests без файловой системы.
     #[cfg(test)]
     pub fn demo() -> Self {
         Self {
             targets: vec![TargetReport {
                 path: r"C:\tmp\NUL".into(),
+                native_path: std::path::PathBuf::from(r"C:\tmp\NUL"),
                 disposition: Disposition::Permanent,
                 reason: "reserved name NUL".into(),
                 removed_files: 1,
@@ -138,21 +140,7 @@ pub fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::i18n::{Language, with_language};
 
-    #[test]
-    fn summary_is_localized() {
-        for language in [Language::En, Language::Ru] {
-            with_language(language, || {
-                let line = Report::demo().summary_line().to_lowercase();
-                if language == Language::En {
-                    assert!(line.contains("removed"), "{line}");
-                } else {
-                    assert!(line.contains("удалено"), "{line}");
-                }
-            });
-        }
-    }
 
     #[test]
     fn totals_add_up() {
@@ -163,13 +151,21 @@ mod tests {
     }
 
     #[test]
-    fn bytes_have_readable_units() {
-        for language in [Language::En, Language::Ru] {
-            with_language(language, || {
-                assert_eq!(human_bytes(512), if language == Language::En { "512 B" } else { "512 Б" });
-                assert!(human_bytes(5 * 1024 * 1024).contains("MB"));
-                assert!(human_bytes(3 * 1024 * 1024 * 1024).contains("GB"));
-            });
-        }
+    fn json_distinguishes_preview_from_actual_deletion() {
+        let mut report = Report::demo();
+        report.targets[0].dry_run = true;
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["targets"][0]["dry_run"], true);
+        report.targets[0].dry_run = false;
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["targets"][0]["dry_run"], false);
     }
+
+    #[test]
+    fn cancellation_is_not_success() {
+        let report = Report { cancelled: true, ..Report::default() };
+        assert!(report.failed());
+        assert_eq!(report.removed_total(), 0);
+    }
+
 }

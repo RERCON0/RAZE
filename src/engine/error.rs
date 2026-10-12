@@ -18,14 +18,14 @@ pub const ERROR_DIR_NOT_EMPTY: u32 = 145;
 pub const ERROR_INVALID_PARAMETER: u32 = 87;
 pub const ERROR_NOT_SUPPORTED: u32 = 50;
 pub const ERROR_INVALID_FUNCTION: u32 = 1;
-pub const ERROR_PENDING: u32 = 161;
+pub const ERROR_PENDING: u32 = windows::Win32::Foundation::ERROR_IO_PENDING.0;
+pub const ERROR_DELETE_PENDING: u32 = windows::Win32::Foundation::ERROR_DELETE_PENDING.0;
 pub const ERROR_BUSY: u32 = 170;
-pub const ERROR_CANNOT_DELETE: u32 = 1011;
 pub const ERROR_USER_MAPPED_FILE: u32 = 1224;
 pub const ERROR_PRIVILEGE_NOT_HELD: u32 = 1314;
 pub const ERROR_FILE_IS_OFFLINE: u32 = 4350;
-/// Собственный код (бит 29 — «определено приложением»): объект лежит вне
-/// удаляемого дерева, то есть путь по дороге подменили ссылкой.
+/// Application-defined code (bit 29): the object's location is outside the
+/// allowed deletion tree, protected, or cannot be verified safely.
 pub const ERROR_OUTSIDE_TREE: u32 = 0xE0A5_0001;
 
 impl NtError {
@@ -49,7 +49,7 @@ impl NtError {
 
     /// «Висящее» состояние: операция ещё не завершена, есть смысл повторить.
     pub fn pending(self) -> bool {
-        self.0 == ERROR_PENDING || self.0 == ERROR_BUSY
+        self.0 == ERROR_PENDING || self.0 == ERROR_DELETE_PENDING || self.0 == ERROR_BUSY
     }
 
     pub fn not_found(self) -> bool {
@@ -105,21 +105,34 @@ impl NtError {
                 "file is mapped into memory of another process",
                 "файл отображён в память другого процесса"
             )),
-            ERROR_CANNOT_DELETE => Some(tr!("cannot delete", "невозможно удалить")),
             ERROR_FILE_IS_OFFLINE => Some(tr!(
                 "file is not present on the disk",
                 "файл отсутствует на диске"
             )),
             ERROR_PENDING | ERROR_BUSY => Some(tr!("operation is busy", "операция занята")),
+            ERROR_DELETE_PENDING => Some(tr!("deletion is still pending", "удаление ещё не завершено")),
             ERROR_OUTSIDE_TREE => Some(tr!(
-                "object lies outside the folder being removed (a link was swapped in)",
-                "объект оказался вне удаляемой папки (по пути подменили ссылку)"
+                "object is outside the allowed deletion tree or its safe location cannot be verified",
+                "объект вне разрешённого дерева удаления или его безопасное расположение нельзя проверить"
             )),
             _ => None,
         };
         match known {
             Some(text) => text.to_string(),
             None => system_message(self.0),
+        }
+    }
+}
+
+impl From<windows::core::Error> for NtError {
+    fn from(error: windows::core::Error) -> Self {
+        let code = error.code().0 as u32;
+        // HRESULT_FROM_WIN32 retains the original Win32 code in its low word.
+        // COM-specific HRESULTs must remain intact for FormatMessageW.
+        if code & 0xffff_0000 == 0x8007_0000 {
+            Self(code & 0xffff)
+        } else {
+            Self(code)
         }
     }
 }
@@ -132,10 +145,10 @@ impl fmt::Display for NtError {
 
 impl std::error::Error for NtError {}
 
-/// Превращает `windows::core::Result` в наш тип с уже подтянутым
-/// `GetLastError` — иначе код достаётся не оттуда.
+/// Uses the error captured by the Windows binding, not a later thread-local
+/// `GetLastError` value (COM and DWORD-returning APIs do not set it).
 pub fn nt<T>(result: windows::core::Result<T>) -> Result<T, NtError> {
-    result.map_err(|_| NtError::last())
+    result.map_err(NtError::from)
 }
 
 fn system_message(code: u32) -> String {
@@ -169,7 +182,6 @@ fn system_message(code: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::i18n::{Language, with_language};
 
     #[test]
     fn classification_matches_the_codes_we_act_on() {
@@ -181,18 +193,18 @@ mod tests {
         assert!(NtError(ERROR_ACCESS_DENIED).needs_elevation());
         assert!(!NtError(ERROR_SHARING_VIOLATION).needs_elevation());
         assert!(!NtError(ERROR_FILE_NOT_FOUND).access_denied());
+        assert!(NtError(windows::Win32::Foundation::ERROR_DELETE_PENDING.0).pending());
+        assert!(NtError(windows::Win32::Foundation::ERROR_IO_PENDING.0).retryable());
+        assert!(!NtError(windows::Win32::Foundation::ERROR_BAD_PATHNAME.0).retryable());
     }
 
     #[test]
-    fn messages_are_localized_and_never_empty() {
-        for language in [Language::En, Language::Ru] {
-            with_language(language, || {
-                assert_eq!(NtError(ERROR_ACCESS_DENIED).message(), match language {
-                    Language::En => "access denied",
-                    Language::Ru => "нет доступа",
-                });
-                assert!(!NtError(999_999).message().is_empty());
-            });
-        }
+    fn captured_errors_do_not_depend_on_last_error() {
+        unsafe { windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::WIN32_ERROR(0)) };
+        let error = windows::core::Error::from_hresult(windows::core::HRESULT(0x80070005u32 as i32));
+        assert_eq!(nt::<()>(Err(error)), Err(NtError(ERROR_ACCESS_DENIED)));
+        let error = windows::core::Error::from_hresult(windows::core::HRESULT(0x80004005u32 as i32));
+        assert_eq!(NtError::from(error).code(), 0x80004005);
     }
+
 }

@@ -13,10 +13,6 @@ license = "GPL-3.0-or-later"
 name = "raze_rs"
 path = "src/lib.rs"
 
-[features]
-# Explicitly opt-in, read-only native screenshot harness; not in release builds.
-ui-preview = []
-
 [[bin]]
 name = "raze-app"
 path = "src/bin/raze-app.rs"
@@ -42,6 +38,7 @@ serde_json = "1"
 winreg = "0.56"
 windows = { version = "0.62", features = [
     "Foundation",
+    "Win32_Globalization",
     "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Security_Authorization",

@@ -41,15 +41,16 @@ Windows itself refuses these, and so does every normal tool:
 |---|---|
 | Reserved names (`NUL`, `CON`, `PRN`, `AUX`, `COM1`–`COM9`, `LPT1`–`LPT9`) | Extended paths (`\\?\...`) switch off name parsing, so `NUL` becomes an ordinary filename |
 | Paths longer than 260 characters | Extended paths lift the `MAX_PATH` limit |
-| Files held open by other programs | Restart Manager closes holders; optionally `WM_CLOSE` first (`-c`) |
+| Files held open by other programs | Restart Manager identifies holders; optionally `WM_CLOSE` to ordinary applications (`-c`) |
 | Ownership and ACL walls | Takes ownership and grants access — only after an actual `ACCESS_DENIED` |
 | Junctions, symlinks, other reparse points | Deletes the **link**, never follows or traverses it |
 | `ERROR_DELETE_PENDING` objects | Retries until the object is really gone |
 
-Deletion goes through **handles** (`CreateFileW` + `SetFileInformationByHandle`
-with `FILE_DISPOSITION_INFO_EX`), not through path-based APIs. There is no
-window between "look at the path" and "delete the path" for another process
-or a normalization surprise to abuse.
+Permanent deletion goes through **handles** (`CreateFileW` +
+`SetFileInformationByHandle` with `FILE_DISPOSITION_INFO_EX`), not path-based
+delete APIs. Each opened object is checked before deleting that same handle.
+The Recycle Bin uses the shell's path-based API; that operation is not atomic
+with RAZE's preceding path checks.
 
 **Honest dispositions:** recyclable objects go to the Recycle Bin and can be
 restored; objects the bin cannot hold (reserved names, extended paths) are
@@ -59,6 +60,11 @@ bin is full. For the same reason RAZE reads the drive's Recycle Bin settings
 ("don't move files to the Recycle Bin", the size limit, the policy) and plans
 such objects as permanent instead of reporting a Recycle Bin that never
 happened.
+The shell's completion callbacks determine the actual disposition; merely
+queueing an operation is not success. Cancelling a Recycle Bin operation stops
+the batch and never triggers a permanent-delete fallback. Moving to the bin
+does not count as freed space; permanent-delete byte counts are logical-size
+estimates, not measurements of filesystem allocation.
 
 **Safety rails:** volume roots (`C:\`), the system folders themselves
 (`C:\Windows`, `C:\Program Files`, `C:\ProgramData`, your profile and their
@@ -72,6 +78,10 @@ twice — as typed and as it really lies on disk — so `C:\PROGRA~1` and a path
 through a junction into `C:\Windows` are caught too, and the check is repeated
 right before deletion. Paths with `* ? " < > |` or an NTFS stream (`:`) are
 rejected: the shell would read the first as a mask.
+Protected locations come from Windows APIs, not mutable environment variables.
+If the safety anchors or the opened root's final path cannot be obtained,
+removal fails closed. Native UTF-16 paths are retained throughout deletion,
+including names that cannot be represented losslessly as Unicode text.
 
 While a tree is being removed every object is verified, through the very
 handle that is about to be deleted, to lie inside the target. If a folder was
@@ -116,7 +126,9 @@ This asks for administrator rights **once** (one UAC prompt) and installs RAZE
 into `%ProgramFiles%\RAZE`. That folder is writable only by administrators, which
 matters: elevation re-runs `raze.exe`, and a copy in a folder any of your own
 programs can overwrite could be swapped for something else before the prompt.
-A copy left by an earlier version in `%LOCALAPPDATA%\Programs\RAZE` is removed.
+An earlier copy in `%LOCALAPPDATA%\Programs\RAZE` is cleaned up with the original
+user's unelevated rights, never by elevated traversal of that user-writable
+tree. If that token is unavailable, the installer requests manual cleanup.
 
 The same run writes the classic verbs to `HKCU` and, when `RAZE.msix` and
 `RAZE.cer` are next to `raze.exe` (see [Development](#development)), registers
@@ -171,19 +183,28 @@ confirmation and prints a plan first — from the context menu it does not
 | `PATH` | Files and folders to remove |
 | `-n, --dry-run` | Show what would be removed, change nothing |
 | `-p, --permanent` | Remove permanently, bypassing the Recycle Bin |
-| `--recycle` | Force the Recycle Bin even where it normally refuses |
+| `--recycle` | Try the Recycle Bin where supported (the default); never bypass safety refusals |
 | `-y, --yes` | Do not ask for confirmation |
 | `-c, --close-locks` | Send `WM_CLOSE` to programs holding the files |
 | `--keep-owners` | Never take ownership or change access rights |
 | `-L, --find-locks` | Also list the processes holding each file (slower) |
-| `--json` | Machine-readable report on stdout |
+| `--json` | One final machine-readable report on stdout, without banners or a second plan |
+| `--plan-only` | Print the plan without deleting; with `--json`, emit one plan object |
 | `--lang en\|ru` | Interface language |
 | `-v` | More detail |
 
+In JSON mode RAZE does not hand off to an elevated child: failures set
+`needs_elevation` and return a nonzero exit code. Run the CLI elevated explicitly
+when needed. Human-mode UAC handoff reports that a child was launched, not that
+its deletion succeeded, and retries only failed targets.
+
 ### Language
 
-English is the default. Use the **EN / RU** button next to the theme button
-in the GUI title bar, or run:
+English is the default when no preference has been saved. The **EN / RU**
+button in the GUI title bar saves its choice immediately to
+`HKCU\Software\RAZE` (`Language`) and restores it on the next launch. The CLI
+uses the same saved default; `--lang` overrides it for that invocation without
+changing the saved choice:
 
 ```powershell
 raze --lang ru
@@ -213,7 +234,7 @@ resources:
 ```powershell
 packaging\build-package.ps1
 cargo build --release --workspace
-cargo test --lib --workspace
+cargo test --locked --workspace --all-targets --all-features
 ```
 
 `build-package.ps1` comes first: it packs and signs the sparse package that

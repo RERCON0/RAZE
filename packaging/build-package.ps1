@@ -37,7 +37,18 @@ if (-not $match) { throw 'Cannot read the package version from Cargo.toml.' }
 $version = '{0}.{1}.{2}.0' -f $match.Matches[0].Groups[1].Value, $match.Matches[0].Groups[2].Value, $match.Matches[0].Groups[3].Value
 
 # --- certificate --------------------------------------------------------------------------------
-$cert = Get-ChildItem Cert:\CurrentUser\My | Where-Object { $_.Subject -eq $subject -and $_.HasPrivateKey } | Select-Object -First 1
+$pinFile = Join-Path $PSScriptRoot 'cert-thumbprint.txt'
+$pinned = if (Test-Path $pinFile) { (Get-Content $pinFile -Raw).Trim() } else { '' }
+$now = Get-Date
+$cert = Get-ChildItem Cert:\CurrentUser\My |
+  Where-Object {
+    $_.Subject -eq $subject -and $_.HasPrivateKey -and
+    $_.NotBefore -le $now -and $_.NotAfter -gt $now -and
+    ($_.EnhancedKeyUsageList.ObjectId -contains '1.3.6.1.5.5.7.3.3')
+  } |
+  Sort-Object @{Expression = { $_.Thumbprint -eq $pinned }; Descending = $true},
+              @{Expression = { $_.NotAfter }; Descending = $true} |
+  Select-Object -First 1
 if (-not $cert) {
   $cert = New-SelfSignedCertificate -Type Custom -Subject $subject -KeyUsage DigitalSignature `
     -FriendlyName 'RAZE package signing' -CertStoreLocation 'Cert:\CurrentUser\My' -KeyExportPolicy NonExportable `
@@ -46,8 +57,6 @@ if (-not $cert) {
 }
 # raze.exe trusts only this thumbprint (compiled in from cert-thumbprint.txt). A certificate of your own
 # changes it: the file is rewritten here, and raze.exe has to be rebuilt afterwards.
-$pinFile = Join-Path $PSScriptRoot 'cert-thumbprint.txt'
-$pinned = if (Test-Path $pinFile) { (Get-Content $pinFile -Raw).Trim() } else { '' }
 if ($pinned -ne $cert.Thumbprint) {
   [System.IO.File]::WriteAllText($pinFile, $cert.Thumbprint)
   Write-Warning "Pinned certificate thumbprint changed ($pinned -> $($cert.Thumbprint)). Rebuild raze.exe (cargo build --release --workspace), otherwise its installer will refuse this certificate."

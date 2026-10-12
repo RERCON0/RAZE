@@ -3,21 +3,9 @@ use egui::{Align, Color32, RichText, Stroke};
 use raze_rs::engine::scan::EntryKind;
 use raze_rs::scrollbar::ScrollAreaExt;
 
-#[cfg(test)]
-#[derive(Default)]
-pub(super) struct Geometry {
-    pub add: Option<egui::Rect>,
-    pub primary: Option<egui::Rect>,
-    pub primary_enabled: bool,
-    pub modes: Vec<egui::Rect>,
-    pub cards: Vec<egui::Rect>,
-    pub confirm: Option<egui::Rect>,
-}
 
 impl RazeApp {
     pub(super) fn render(&mut self, ctx: &egui::Context) {
-        #[cfg(test)]
-        { self.geometry = Geometry::default(); }
         self.title_bar(ctx);
         // Panels must be declared before CentralPanel, which takes the space left.
         egui::TopBottomPanel::bottom("footer")
@@ -80,9 +68,18 @@ impl RazeApp {
                     if response.double_clicked() { self.toggle_maximized(ctx); }
                     else if response.drag_started() { ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag); }
                     // Both buttons name what a click switches *to*, as in SNATCH.
-                    if ui.add_sized([40.0, 38.0], egui::Button::new(tr!("RU", "EN")).frame(false))
+                    if ui.add_enabled(!self.phase.working(),
+                        egui::Button::new(tr!("RU", "EN")).frame(false).min_size(egui::vec2(40.0, 38.0)))
                         .on_hover_text(tr!("Switch to Russian", "Переключить на английский")).clicked() {
-                        i18n::set_language(i18n::language().toggled());
+                        let language = i18n::language().toggled();
+                        i18n::set_language(language);
+                        if let Err(error) = i18n::save_language(language) {
+                            self.status_error = true;
+                            self.status = Some(tr_format!(
+                                "Could not save language: {error}",
+                                "Не удалось сохранить язык: {error}"
+                            ));
+                        }
                     }
                     if ui.add_sized([style::THEME_BTN_WIDTH, 38.0], egui::Button::new(if self.dark { tr!("light", "день") } else { tr!("dark", "ночь") }).frame(false))
                         .on_hover_text(if self.dark { tr!("Light theme", "Светлая тема") } else { tr!("Dark theme", "Тёмная тема") }).clicked() {
@@ -127,15 +124,13 @@ impl RazeApp {
                 submit = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 let add = ui.add_enabled(!self.typed.trim().is_empty(),
                     egui::Button::new(tr!("add", "добавить")).min_size(egui::vec2(button_width, style::CONTROL_HEIGHT)));
-                #[cfg(test)]
-                { self.geometry.add = Some(add.rect); }
                 submit |= add.clicked();
             });
             ui.horizontal_wrapped(|ui| {
-                if ui.button(tr!("folder…", "папка…")).clicked() && !self.is_preview() {
+                if ui.button(tr!("folder…", "папка…")).clicked() {
                     if let Some(path) = rfd::FileDialog::new().pick_folder() { self.add_paths(ui.ctx(), vec![path]); }
                 }
-                if ui.button(tr!("files…", "файлы…")).clicked() && !self.is_preview() {
+                if ui.button(tr!("files…", "файлы…")).clicked() {
                     if let Some(paths) = rfd::FileDialog::new().pick_files() { self.add_paths(ui.ctx(), paths); }
                 }
                 ui.weak(RichText::new(tr!("or drop them into this window", "или перетащите их в окно")).size(11.5));
@@ -231,8 +226,6 @@ impl RazeApp {
                     }
                 });
             ui.painter().vline(card.response.rect.left() + 0.5, card.response.rect.y_range(), Stroke::new(2.0, color));
-            #[cfg(test)]
-            self.geometry.cards.push(card.response.rect);
             self.rows[index] = row;
             ui.add_space(4.0);
         }
@@ -251,8 +244,6 @@ impl RazeApp {
                     let active = if mode == Confirm::Permanent { ui.visuals().error_fg_color }
                         else { ui.visuals().hyperlink_color };
                     let response = style::choice(ui, label, self.mode == mode, active);
-                    #[cfg(test)]
-                    self.geometry.modes.push(response.rect);
                     if response.clicked() { self.mode = mode; }
                 }
             });
@@ -290,8 +281,6 @@ impl RazeApp {
         let primary = ui.add_enabled_ui(enabled, |ui| {
             ui.add_sized([ui.available_width(), 44.0], style::accent_button(tr!("▶ DELETE SELECTED", "▶ УДАЛИТЬ ВЫБРАННОЕ"), color))
         }).inner;
-        #[cfg(test)]
-        { self.geometry.primary = Some(primary.rect); self.geometry.primary_enabled = enabled; }
         if primary.clicked() { self.phase = Phase::Confirming(self.mode); }
         if self.phase.working() {
             ui.add_space(8.0);
@@ -335,7 +324,7 @@ impl RazeApp {
         let width = (screen.width() - 80.0).min(440.0);
         // Foreground: the dimmer above is a bare layer and would otherwise be
         // drawn over the dialog itself, dimming the one thing the user must read.
-        let window = egui::Window::new(style::window_title(tr!("Confirm deletion", "Подтвердите удаление")))
+        egui::Window::new(style::window_title(tr!("Confirm deletion", "Подтвердите удаление")))
             .id(egui::Id::new("delete-confirmation"))
             .order(egui::Order::Foreground)
             .collapsible(false).resizable(false).movable(false)
@@ -374,10 +363,6 @@ impl RazeApp {
                     }
                 });
             });
-        #[cfg(test)]
-        { self.geometry.confirm = window.map(|r| r.response.rect); }
-        #[cfg(not(test))]
-        let _ = window;
     }
 
     #[cfg(windows)]
@@ -409,15 +394,17 @@ fn render_entries(ui: &mut egui::Ui, target: &Target, index: usize) {
     egui::ScrollArea::vertical().id_salt(("entries",index)).max_height(220.0)
         .auto_shrink([false,false]).show_terminal_rows(ui, 46.0, target.entries.len(), |ui,range| {
             for entry in &target.entries[range] {
-                let name = match entry.kind { EntryKind::File => tr!("file", "файл"),
-                    EntryKind::Directory => tr!("folder", "папка"), EntryKind::Link => tr!("link", "ссылка") };
-                ui.add(egui::Label::new(RichText::new(format!("{name} / {}", entry.name))).truncate())
-                    .on_hover_text(entry.path.to_string_lossy());
-                let text = if entry.blockers.is_empty() { human_bytes(entry.size) }
-                    else { entry.blockers.iter().map(|b| b.label()).collect::<Vec<_>>().join(" · ") };
-                ui.add(egui::Label::new(RichText::new(&text).size(11.0).color(if entry.has_trouble() {
-                    ui.visuals().warn_fg_color } else { ui.visuals().weak_text_color() })).truncate()).on_hover_text(text);
-                ui.add_space(8.0);
+                ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 46.0),
+                    egui::Layout::top_down(Align::Min), |ui| {
+                        let name = match entry.kind { EntryKind::File => tr!("file", "файл"),
+                            EntryKind::Directory => tr!("folder", "папка"), EntryKind::Link => tr!("link", "ссылка") };
+                        ui.add(egui::Label::new(RichText::new(format!("{name} / {}", entry.name))).truncate())
+                            .on_hover_text(entry.path.to_string_lossy());
+                        let text = if entry.blockers.is_empty() { human_bytes(entry.size) }
+                            else { entry.blockers.iter().map(|b| b.label()).collect::<Vec<_>>().join(" · ") };
+                        ui.add(egui::Label::new(RichText::new(&text).size(11.0).color(if entry.has_trouble() {
+                            ui.visuals().warn_fg_color } else { ui.visuals().weak_text_color() })).truncate()).on_hover_text(text);
+                    });
             }
         });
 }

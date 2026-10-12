@@ -23,6 +23,8 @@ pub enum Reason {
     ProgramDirectory,
     /// Путь не является абсолютным — значит, мы не знаем, что именно удалим.
     NotAbsolute,
+    /// Системные каталоги не удалось определить доверенным API Windows.
+    SafetyUnavailable,
 }
 
 impl Reason {
@@ -52,6 +54,11 @@ impl Reason {
                 "путь не абсолютный — непонятно, что именно удалять"
             )
             .to_string(),
+            Reason::SafetyUnavailable => tr!(
+                "Windows safety locations could not be resolved; removal is refused",
+                "не удалось определить защищённые каталоги Windows; удаление запрещено"
+            )
+            .to_string(),
         }
     }
 }
@@ -69,18 +76,27 @@ pub fn check(path: &NtPath) -> Result<(), Reason> {
     // `NtPath::new` уже отсекает device-пространство (`\\.\`), потоки NTFS и
     // маски, поэтому здесь остаётся только проверка самих якорей.
 
+    let locations = Locations::load()?;
     let given = path.to_path();
-    check_location(&given)?;
+    check_location(&given, &locations)?;
 
     if let Some(real) = canonical_path(path) {
         if components_of(&real).len() <= 2 {
             return Err(Reason::VolumeRoot);
         }
         if components_of(&real) != components_of(&given) {
-            check_location(&real)?;
+            check_location(&real, &locations)?;
         }
     }
     Ok(())
+}
+
+/// Проверяет уже разрешённый путь дескриптора, не открывая его снова.
+pub(crate) fn check_resolved(path: &NtPath) -> Result<(), Reason> {
+    if path.is_volume_root() {
+        return Err(Reason::VolumeRoot);
+    }
+    check_location(&path.to_path(), &Locations::load()?)
 }
 
 /// Путь так, как он лежит на диске: короткие имена и регистр приведены к
@@ -105,23 +121,15 @@ fn canonical_path(path: &NtPath) -> Option<PathBuf> {
 }
 
 /// Проверка одной записи пути против якорей и защищённых поддеревьев.
-fn check_location(target: &Path) -> Result<(), Reason> {
-    let program_dir = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|p| p.to_path_buf()));
-    if let Some(dir) = program_dir {
-        if anchor_forms(&dir).iter().any(|form| would_take_anchor(target, form)) {
-            return Err(Reason::ProgramDirectory);
-        }
+fn check_location(target: &Path, locations: &Locations) -> Result<(), Reason> {
+    if anchor_forms(&locations.program_dir).iter().any(|form| would_take_anchor(target, form)) {
+        return Err(Reason::ProgramDirectory);
     }
 
-    for anchor in system_anchors() {
-        if anchor_forms(&anchor).iter().any(|form| would_take_anchor(target, form)) {
+    for (anchor, system) in &locations.anchors {
+        if anchor_forms(anchor).iter().any(|form| would_take_anchor(target, form)) {
             let label = anchor.to_string_lossy().to_string();
-            let system = SYSTEM_MARKERS
-                .iter()
-                .any(|marker| label.to_lowercase().contains(marker));
-            return Err(if system {
+            return Err(if *system {
                 Reason::SystemLocation { anchor: label }
             } else {
                 Reason::UserProfile { anchor: label }
@@ -129,7 +137,7 @@ fn check_location(target: &Path) -> Result<(), Reason> {
         }
     }
 
-    if let Some(anchor) = protected_interior(target) {
+    if let Some(anchor) = protected_interior(target, locations) {
         return Err(Reason::SystemLocation { anchor });
     }
     Ok(())
@@ -170,14 +178,12 @@ const SYSTEM_DRIVE_FOLDERS: [&str; 4] = ["system volume information", "recovery"
 
 /// `Some(якорь)`, если `target` лежит внутри системного каталога, который
 /// удалять нельзя, хотя сам по себе он ни предком, ни самим якорем не является.
-fn protected_interior(target: &Path) -> Option<String> {
+fn protected_interior(target: &Path, locations: &Locations) -> Option<String> {
     let parts = components_of(target);
 
     // 1. Внутри Windows можно только список выше.
-    for variable in ["SystemRoot", "windir"] {
-        let Ok(value) = std::env::var(variable) else { continue };
-        for base in anchor_forms(Path::new(&value)) {
-            if let Some(rest) = inside(&parts, &components_of(&base)) {
+    for base in anchor_forms(&locations.windows) {
+        if let Some(rest) = inside(&parts, &components_of(&base)) {
                 let disposable = WINDOWS_DISPOSABLE
                     .iter()
                     .any(|allowed| rest.len() >= allowed.len() && rest.iter().zip(allowed.iter()).all(|(a, b)| a.as_str() == *b));
@@ -185,14 +191,12 @@ fn protected_interior(target: &Path) -> Option<String> {
                     return Some(base.to_string_lossy().to_string());
                 }
             }
-        }
     }
 
     // 2. Program Files: приложения сносить можно, а то, что принадлежит самой
     //    Windows (Store-приложения, Defender, общие библиотеки), — нет.
-    for variable in ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"] {
-        let Ok(value) = std::env::var(variable) else { continue };
-        for base in anchor_forms(Path::new(&value)) {
+    for files in &locations.program_files {
+        for base in anchor_forms(files) {
             if let Some(rest) = inside(&parts, &components_of(&base)) {
                 let first = rest[0].as_str();
                 if first.starts_with("windows") || first == "common files" || first == "modifiablewindowsapps" {
@@ -203,7 +207,8 @@ fn protected_interior(target: &Path) -> Option<String> {
     }
 
     // 3. Служебные папки в корне системного диска.
-    if let Ok(drive) = std::env::var("SystemDrive") {
+    if let Some(drive) = locations.windows.components().next() {
+        let drive = drive.as_os_str().to_string_lossy();
         let root = components_of(Path::new(&format!("{drive}\\")));
         if let Some(rest) = inside(&parts, &root) {
             if SYSTEM_DRIVE_FOLDERS.contains(&rest[0].as_str()) {
@@ -223,36 +228,57 @@ fn inside<'a>(target: &'a [String], base: &[String]) -> Option<&'a [String]> {
     }
 }
 
-/// Части пути, по которым видно, что каталог системный.
-const SYSTEM_MARKERS: [&str; 6] = [
-    "\\windows",
-    "\\program files",
-    "\\program files (x86)",
-    "\\programdata",
-    "\\system volume information",
-    "\\$recycle.bin",
-];
+/// Защитные якоря берём из Windows, а не из изменяемого окружения процесса.
+struct Locations {
+    program_dir: PathBuf,
+    windows: PathBuf,
+    program_files: [PathBuf; 2],
+    anchors: Vec<(PathBuf, bool)>,
+}
 
-fn system_anchors() -> Vec<PathBuf> {
-    let mut anchors = Vec::new();
-    for variable in [
-        "SystemRoot",
-        "windir",
-        "ProgramFiles",
-        "ProgramFiles(x86)",
-        "ProgramData",
-        "UserProfile",
-        "LOCALAPPDATA",
-        "APPDATA",
-        "TEMP",
-    ] {
-        if let Ok(value) = std::env::var(variable) {
-            if !value.is_empty() {
-                anchors.push(PathBuf::from(value));
-            }
-        }
+impl Locations {
+    fn load() -> Result<Self, Reason> {
+        use windows::Win32::UI::Shell::{
+            FOLDERID_LocalAppData, FOLDERID_Profile, FOLDERID_ProgramData,
+            FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, FOLDERID_RoamingAppData,
+            FOLDERID_Windows,
+        };
+        let windows = known_folder(&FOLDERID_Windows)?;
+        let program_files = [
+            known_folder(&FOLDERID_ProgramFiles)?,
+            known_folder(&FOLDERID_ProgramFilesX86)?,
+        ];
+        let local = known_folder(&FOLDERID_LocalAppData)?;
+        let anchors = vec![
+            (windows.clone(), true),
+            (program_files[0].clone(), true),
+            (program_files[1].clone(), true),
+            (known_folder(&FOLDERID_ProgramData)?, true),
+            (known_folder(&FOLDERID_Profile)?, false),
+            (local.join("Temp"), false),
+            (local, false),
+            (known_folder(&FOLDERID_RoamingAppData)?, false),
+            (std::env::temp_dir(), false),
+        ];
+        let exe = std::env::current_exe().map_err(|_| Reason::SafetyUnavailable)?;
+        let program_dir = exe.parent().ok_or(Reason::SafetyUnavailable)?.to_path_buf();
+        Ok(Self { program_dir, windows, program_files, anchors })
     }
-    anchors
+}
+
+fn known_folder(id: &windows::core::GUID) -> Result<PathBuf, Reason> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{KF_FLAG_DEFAULT, SHGetKnownFolderPath};
+    let pointer = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) }
+        .map_err(|_| Reason::SafetyUnavailable)?;
+    let path = PathBuf::from(std::ffi::OsString::from_wide(unsafe { pointer.as_wide() }));
+    unsafe { CoTaskMemFree(Some(pointer.0.cast())); }
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Err(Reason::SafetyUnavailable)
+    }
 }
 
 /// `true`, если удаление `target` унесло бы `anchor` вместе с собой —
@@ -281,6 +307,29 @@ fn normalize(component: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spoofed_environment_cannot_disable_system_protection() {
+        const CHILD: &str = "RAZE_TEST_SPOOFED_PROTECTION";
+        if let Some(windows) = std::env::var_os(CHILD) {
+            let system = PathBuf::from(windows).join("System32");
+            assert!(check(&NtPath::new(&system).unwrap()).is_err());
+            return;
+        }
+        let fake = std::env::temp_dir().join("raze-not-the-system");
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact", "protect::tests::spoofed_environment_cannot_disable_system_protection",
+            "--nocapture",
+        ]).env(CHILD, known_folder(&windows::Win32::UI::Shell::FOLDERID_Windows).unwrap());
+        for variable in ["SystemRoot", "windir", "ProgramFiles", "ProgramFiles(x86)", "ProgramW6432", "ProgramData"] {
+            command.env(variable, &fake);
+        }
+        command.env("SystemDrive", "Z:");
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    }
+
 
     #[test]
     fn volume_roots_are_always_refused() {

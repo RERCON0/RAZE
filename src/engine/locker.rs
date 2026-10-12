@@ -10,8 +10,8 @@ use std::time::Duration;
 use serde::Serialize;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::RestartManager::{
-    RM_PROCESS_INFO, RmEndSession, RmGetList, RmRegisterResources,
-    RmStartSession,
+    RM_PROCESS_INFO, RmConsole, RmEndSession, RmGetList, RmMainWindow, RmOtherWindow, RmRegisterResources,
+    RmService, RmStartSession,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
@@ -26,6 +26,9 @@ pub struct Holder {
     pub name: String,
     /// Служба Windows держит файл — её не закрываем, но показываем.
     pub is_service: bool,
+    /// Only ordinary applications may receive WM_CLOSE; never the Shell,
+    /// services, critical processes, or an unknown RM application type.
+    pub can_close: bool,
 }
 
 const ERROR_MORE_DATA: u32 = 234;
@@ -39,7 +42,7 @@ pub fn processes_using(paths: &[std::path::PathBuf]) -> Vec<Holder> {
     let wide: Vec<Wide> = paths.iter().map(|p| Wide::from_path(p)).collect();
     let ptrs: Vec<windows::core::PCWSTR> = wide.iter().map(|p| p.pc()).collect();
 
-    let mut key = vec![0u16; CCH_RM_MAX_KEY];
+    let mut key = [0u16; CCH_RM_MAX_KEY];
     let mut session: u32 = 0;
     // SAFETY: Restart Manager возвращает код, а не Result; все выходные
     // буферы живут до конца функции.
@@ -53,31 +56,36 @@ pub fn processes_using(paths: &[std::path::PathBuf]) -> Vec<Holder> {
             let mut needed = 0u32;
             let mut count = 0u32;
             let mut reasons = 0u32;
-            // Первый вызов всегда «нужно больше данных» — так и узнаём размер.
-            let _ = RmGetList(session, &mut needed, &mut count, None, &mut reasons);
-            if needed > 0 {
-                let mut buffer: Vec<RM_PROCESS_INFO> =
-                    vec![RM_PROCESS_INFO::default(); needed as usize];
-                if RmGetList(
-                    session,
-                    &mut needed,
-                    &mut count,
-                    Some(buffer.as_mut_ptr()),
-                    &mut reasons,
-                )
-                .0
-                    != ERROR_MORE_DATA
-                    || count == 0
-                {
-                    holders = buffer
-                        .iter()
-                        .take(count as usize)
-                        .map(|info| Holder {
-                            pid: info.Process.dwProcessId,
-                            name: wide_string(&info.strAppName),
-                            is_service: info.ApplicationType.0 != 1,
-                        })
-                        .collect();
+            let result = RmGetList(session, &mut needed, &mut count, None, &mut reasons);
+            if result.0 == ERROR_MORE_DATA && needed > 0 {
+                let mut buffer = vec![RM_PROCESS_INFO::default(); needed as usize];
+                // The holder list can grow between the size query and the read.
+                for _ in 0..3 {
+                    count = buffer.len() as u32;
+                    let result = RmGetList(
+                        session,
+                        &mut needed,
+                        &mut count,
+                        Some(buffer.as_mut_ptr()),
+                        &mut reasons,
+                    );
+                    if result.0 == 0 {
+                        holders = buffer
+                            .iter()
+                            .take(count as usize)
+                            .map(|info| Holder {
+                                pid: info.Process.dwProcessId,
+                                name: wide_string(&info.strAppName),
+                                is_service: info.ApplicationType == RmService,
+                                can_close: [RmMainWindow, RmOtherWindow, RmConsole].contains(&info.ApplicationType),
+                            })
+                            .collect();
+                        break;
+                    }
+                    if result.0 != ERROR_MORE_DATA || needed as usize <= buffer.len() {
+                        break;
+                    }
+                    buffer.resize(needed as usize, RM_PROCESS_INFO::default());
                 }
             }
         }
@@ -103,6 +111,32 @@ thread_local! {
 }
 
 pub fn request_close(pid: u32) -> usize {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::Threading::{
+        IsProcessCritical, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
+    };
+    if pid <= 4 || pid == std::process::id() { return 0; }
+    let Ok(handle) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else { return 0; };
+    struct Process(HANDLE);
+    impl Drop for Process {
+        fn drop(&mut self) { unsafe { let _ = CloseHandle(self.0); } }
+    }
+    let process = Process(handle);
+    let mut critical = windows::core::BOOL(0);
+    if unsafe { IsProcessCritical(process.0, &mut critical) }.is_err() || critical.as_bool() { return 0; }
+    let mut image = [0u16; 1024];
+    let mut size = image.len() as u32;
+    if unsafe { QueryFullProcessImageNameW(
+        process.0, PROCESS_NAME_WIN32, windows::core::PWSTR(image.as_mut_ptr()), &mut size,
+    ) }.is_err() { return 0; }
+    let image = &image[..size as usize];
+    let name = &image[image.iter().rposition(|unit| *unit == b'\\' as u16).map_or(0, |index| index + 1)..];
+    if name.len() == b"explorer.exe".len()
+        && name.iter().zip(b"explorer.exe").all(|(unit, byte)| (*unit | 0x20) == u16::from(*byte))
+    {
+        return 0;
+    }
     CLOSE_STATE.with(|state| state.set((pid, 0)));
 
     unsafe extern "system" fn visit(hwnd: HWND, _param: LPARAM) -> windows::core::BOOL {
@@ -130,13 +164,12 @@ pub fn request_close(pid: u32) -> usize {
 /// пользователь в этот момент как раз закрывает программу.
 pub fn wait_for_release(paths: &[std::path::PathBuf], total: Duration) -> bool {
     let step = Duration::from_millis(150);
-    let mut waited = Duration::ZERO;
-    while waited < total {
+    let started = std::time::Instant::now();
+    while started.elapsed() < total {
         if processes_using(paths).is_empty() {
             return true;
         }
-        std::thread::sleep(step);
-        waited += step;
+        std::thread::sleep(step.min(total.saturating_sub(started.elapsed())));
     }
     processes_using(paths).is_empty()
 }
@@ -164,9 +197,30 @@ mod tests {
     }
 
     #[test]
-    fn closing_our_own_pid_is_a_no_op_for_counting() {
-        // У консольного процесса нет верхних окон — счётчик остаётся нулевым,
-        // зато мы проверяем, что EnumWindows не падает.
+    fn a_file_opened_without_delete_sharing_reports_its_holder() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "raze-lock-holder-{}-{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::write(&path, b"locked").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(windows::Win32::Storage::FileSystem::FILE_SHARE_READ.0)
+            .open(&path)
+            .unwrap();
+        let holders = processes_using(std::slice::from_ref(&path));
+        drop(file);
+        std::fs::remove_file(&path).unwrap();
+        assert!(holders.iter().any(|holder| holder.pid == std::process::id()), "{holders:?}");
+    }
+
+    #[test]
+    fn protected_or_missing_processes_are_never_asked_to_close() {
+        assert_eq!(request_close(std::process::id()), 0);
+        assert_eq!(request_close(0), 0);
+        assert_eq!(request_close(4), 0);
         assert_eq!(request_close(u32::MAX), 0);
     }
 }

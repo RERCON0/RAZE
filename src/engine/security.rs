@@ -9,7 +9,7 @@ use std::ptr;
 
 use windows::Win32::Foundation::{HLOCAL, LocalFree};
 use windows::Win32::Security::{
-    ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+    ACL, DACL_SECURITY_INFORMATION, NO_INHERITANCE, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
 };
 use windows::Win32::Security::Authorization::{
     ConvertStringSidToSidW, EXPLICIT_ACCESS_W, GetSecurityInfo, GRANT_ACCESS, SE_FILE_OBJECT,
@@ -19,7 +19,7 @@ use windows::Win32::Security::Authorization::{
 use windows::core::PWSTR;
 
 use super::error::{ERROR_OUTSIDE_TREE, NtError};
-use super::handle::{Containment, OwnedHandle, open_with, security_access};
+use super::handle::{Containment, OwnedHandle, open_with};
 use super::path::{NtPath, Wide};
 use super::privs;
 
@@ -37,26 +37,23 @@ impl Drop for LocalAcl {
     }
 }
 
-/// SID, полученный из `ConvertStringSidToSidW`, с освобождением. Хранит и
-/// указатель (для `TRUSTEE_W`), и копию байтов — длину SID можно узнать
-/// только из его заголовка.
-struct LocalSid(windows::Win32::Security::PSID, Vec<u8>);
+/// SID allocated by `ConvertStringSidToSidW`; trustees borrow its bytes.
+struct LocalSid(windows::Win32::Security::PSID, usize);
 
 impl LocalSid {
     fn from_string(text: &str) -> Result<Self, NtError> {
         let wide = Wide::new(text);
         let mut sid = windows::Win32::Security::PSID::default();
-        unsafe { ConvertStringSidToSidW(wide.pc(), &mut sid) }.map_err(|_| NtError::last())?;
+        unsafe { ConvertStringSidToSidW(wide.pc(), &mut sid) }.map_err(NtError::from)?;
         // SID = { BYTE Revision; BYTE SubAuthorityCount; BYTE Authority[6];
         //        DWORD SubAuthority[SubAuthorityCount] }
         let header = unsafe { std::slice::from_raw_parts(sid.0.cast::<u8>(), 2) };
         let length = 8 + 4 * header[1] as usize;
-        let copy = unsafe { std::slice::from_raw_parts(sid.0.cast::<u8>(), length) }.to_vec();
-        Ok(Self(sid, copy))
+        Ok(Self(sid, length))
     }
 
     fn as_slice(&self) -> &[u8] {
-        &self.1
+        unsafe { std::slice::from_raw_parts(self.0.0.cast::<u8>(), self.1) }
     }
 }
 
@@ -65,6 +62,13 @@ impl Drop for LocalSid {
         unsafe {
             let _ = LocalFree(Some(HLOCAL(self.0.0.cast())));
         }
+    }
+}
+
+struct LocalSecurityDescriptor(PSECURITY_DESCRIPTOR);
+impl Drop for LocalSecurityDescriptor {
+    fn drop(&mut self) {
+        unsafe { let _ = LocalFree(Some(HLOCAL(self.0.0))); }
     }
 }
 
@@ -82,13 +86,11 @@ fn ensure_inside(handle: &OwnedHandle, guard: Option<&Containment>) -> Result<()
 pub fn take_ownership(path: &NtPath, guard: Option<&Containment>) -> Result<(), NtError> {
     let _ = privs::enable_take_ownership();
     let owner = privs::current_user_sid()?;
-    // С привилегией достаточно права только на смену владельца; DELETE
-    // запрашиваем сразу, чтобы сразу попробовать и удалить.
+    // SeTakeOwnershipPrivilege grants WRITE_OWNER, not DELETE. Requesting
+    // DELETE here would prevent repairing precisely the ACL that denies it.
     let handle = open_with(
         path,
-        windows::Win32::Storage::FileSystem::WRITE_OWNER
-            | windows::Win32::Storage::FileSystem::DELETE
-            | windows::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES,
+        windows::Win32::Storage::FileSystem::WRITE_OWNER,
         windows::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS
             | windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
     )?;
@@ -96,7 +98,7 @@ pub fn take_ownership(path: &NtPath, guard: Option<&Containment>) -> Result<(), 
     // Раньше здесь стоял `GetSecurityInfo(OWNER)`: результат нигде не
     // использовался, а читать владельца без READ_CONTROL нельзя, так что вызов
     // мог только провалить смену владельца отказом в доступе.
-    unsafe {
+    let result = unsafe {
         SetSecurityInfo(
             handle.raw(),
             SE_FILE_OBJECT,
@@ -106,9 +108,8 @@ pub fn take_ownership(path: &NtPath, guard: Option<&Containment>) -> Result<(), 
             None,
             None,
         )
-        .ok()
-        .map_err(|_| NtError::last())
-    }
+    };
+    result.ok().map_err(|_| NtError(result.0))
 }
 
 /// Добавляет в DACL полный доступ для текущего пользователя, SYSTEM и
@@ -116,7 +117,12 @@ pub fn take_ownership(path: &NtPath, guard: Option<&Containment>) -> Result<(), 
 /// наследуют права от родителя, и сбрасывать их целиком нельзя.
 pub fn grant_full_control(path: &NtPath, guard: Option<&Containment>) -> Result<(), NtError> {
     let _ = privs::enable_take_ownership();
-    let handle: OwnedHandle = open_with(path, security_access(), backup_semantics())?;
+    let handle: OwnedHandle = open_with(
+        path,
+        windows::Win32::Storage::FileSystem::READ_CONTROL
+            | windows::Win32::Storage::FileSystem::WRITE_DAC,
+        backup_semantics(),
+    )?;
     ensure_inside(&handle, guard)?;
 
     // SID-ы живут до конца вызова: SetEntriesInAclW читает их по указателям
@@ -127,7 +133,8 @@ pub fn grant_full_control(path: &NtPath, guard: Option<&Containment>) -> Result<
 
     unsafe {
         let mut existing: *mut ACL = ptr::null_mut();
-        GetSecurityInfo(
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        let result = GetSecurityInfo(
             handle.raw(),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
@@ -135,10 +142,13 @@ pub fn grant_full_control(path: &NtPath, guard: Option<&Containment>) -> Result<
             None,
             Some(&mut existing),
             None,
-            None,
-        )
-        .ok()
-        .map_err(|_| NtError::last())?;
+            Some(&mut descriptor),
+        );
+        result.ok().map_err(|_| NtError(result.0))?;
+        let _descriptor = LocalSecurityDescriptor(descriptor);
+        // A NULL DACL already grants everybody full access; replacing it with
+        // just our trustees would revoke existing access rather than extend it.
+        if existing.is_null() { return Ok(()); }
 
         let entries = [
             entry(current.as_slice(), TRUSTEE_IS_USER),
@@ -147,12 +157,11 @@ pub fn grant_full_control(path: &NtPath, guard: Option<&Containment>) -> Result<
         ];
 
         let mut merged: *mut ACL = ptr::null_mut();
-        SetEntriesInAclW(Some(&entries), Some(existing), &mut merged)
-            .ok()
-            .map_err(|_| NtError::last())?;
+        let result = SetEntriesInAclW(Some(&entries), Some(existing), &mut merged);
+        result.ok().map_err(|_| NtError(result.0))?;
         let merged = LocalAcl(merged);
 
-        SetSecurityInfo(
+        let result = SetSecurityInfo(
             handle.raw(),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
@@ -160,9 +169,8 @@ pub fn grant_full_control(path: &NtPath, guard: Option<&Containment>) -> Result<
             None,
             Some(merged.0),
             None,
-        )
-        .ok()
-        .map_err(|_| NtError::last())
+        );
+        result.ok().map_err(|_| NtError(result.0))
     }
 }
 
@@ -178,7 +186,8 @@ fn entry(
     EXPLICIT_ACCESS_W {
         grfAccessPermissions: windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS.0,
         grfAccessMode: GRANT_ACCESS,
-        grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+        // Each child is repaired through its own containment-checked handle.
+        grfInheritance: NO_INHERITANCE,
         Trustee: TRUSTEE_W {
             pMultipleTrustee: ptr::null_mut(),
             MultipleTrusteeOperation: windows::Win32::Security::Authorization::NO_MULTIPLE_TRUSTEE,
@@ -186,5 +195,111 @@ fn entry(
             TrusteeType: trustee_type,
             ptstrName: PWSTR(sid.as_ptr() as *mut u16),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Security::PROTECTED_DACL_SECURITY_INFORMATION;
+    use windows::Win32::Storage::FileSystem::{
+        DELETE, FILE_ALL_ACCESS, FILE_DELETE_CHILD, FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC,
+        WRITE_OWNER,
+    };
+
+    fn restrict(path: &NtPath, rights: u32) -> OwnedHandle {
+        let handle = open_with(path, READ_CONTROL | WRITE_DAC, backup_semantics()).unwrap();
+        set_access(&handle, rights);
+        handle
+    }
+
+    fn set_access(handle: &OwnedHandle, rights: u32) {
+        let sid = privs::current_user_sid().unwrap();
+        let mut access = entry(&sid, TRUSTEE_IS_USER);
+        access.grfAccessPermissions = rights;
+        let mut acl = ptr::null_mut();
+        unsafe { SetEntriesInAclW(Some(&[access]), None, &mut acl) }.ok().unwrap();
+        let acl = LocalAcl(acl);
+        unsafe {
+            SetSecurityInfo(
+                handle.raw(), SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None, None, Some(acl.0), None,
+            )
+        }.ok().unwrap();
+    }
+
+    #[test]
+    fn ownership_and_acl_repair_do_not_require_delete_access() {
+        let base = std::env::temp_dir().join(format!(
+            "raze-acl-repair-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&base).unwrap();
+        let file = base.join("locked.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let root = NtPath::new(&base).unwrap();
+        let path = NtPath::new(&file).unwrap();
+        let guard = Containment::new(&root).unwrap();
+        // Neither the file nor its parent grants a deletion route.
+        // Win32 CreateFile also requires SYNCHRONIZE; omit DELETE, not this
+        // unrelated prerequisite for opening a synchronous file handle.
+        let file_access = restrict(&path, (READ_CONTROL | WRITE_DAC | WRITE_OWNER | FILE_READ_ATTRIBUTES | windows::Win32::Storage::FileSystem::SYNCHRONIZE).0);
+        let root_access = restrict(&root, FILE_ALL_ACCESS.0 & !FILE_DELETE_CHILD.0);
+        let denied = open_with(&path, DELETE, windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT).is_err();
+        let owner = take_ownership(&path, Some(&guard));
+        let grant = grant_full_control(&path, Some(&guard));
+        let deletable = open_with(&path, DELETE, windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT).is_ok();
+        // Restore access before assertions so a failed regression does not
+        // leave an ACL-restricted temporary object behind.
+        set_access(&file_access, FILE_ALL_ACCESS.0);
+        set_access(&root_access, FILE_ALL_ACCESS.0);
+        drop(file_access);
+        drop(root_access);
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(denied);
+        assert!(owner.is_ok(), "{owner:?}");
+        assert!(grant.is_ok(), "{grant:?}");
+        assert!(deletable);
+    }
+
+    #[test]
+    fn unreadable_subdirectories_are_counted_once_and_obey_the_display_budget() {
+        use crate::engine::scan::{scan, ScanOptions};
+        let base = std::env::temp_dir().join(format!(
+            "raze-acl-scan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir(&base).unwrap();
+        let root = NtPath::new(&base).unwrap();
+        let mut paths = Vec::new();
+        for index in 0..4 {
+            let path = base.join(format!("hidden-{index}"));
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("contents.txt"), b"x").unwrap();
+            let path = NtPath::new(&path).unwrap();
+            restrict(&path, FILE_ALL_ACCESS.0 & !windows::Win32::Storage::FileSystem::FILE_LIST_DIRECTORY.0);
+            paths.push(path);
+        }
+        let options = ScanOptions { max_listed: 1, probe_access: false, ..ScanOptions::default() };
+        let (listed, summary) = scan(&root, &options);
+        let (empty, zero) = scan(&root, &ScanOptions { max_listed: 0, ..options });
+        for path in paths { restrict(&path, FILE_ALL_ACCESS.0); }
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(summary.truncated);
+        assert_eq!((summary.directories, summary.troubled), (4, 4));
+        assert_eq!(listed.len() + summary.unlisted, summary.directories);
+        assert!(listed.len() <= options.max_listed * 2);
+        assert!(listed.iter().all(|entry| entry.blockers.iter().any(
+            |blocker| matches!(blocker, crate::engine::scan::Blocker::Unreadable { .. })
+        )));
+        let mut listed_paths: Vec<_> = listed.iter().map(|entry| &entry.path).collect();
+        listed_paths.sort();
+        listed_paths.dedup();
+        assert_eq!(listed_paths.len(), listed.len());
+        assert!(empty.is_empty());
+        assert_eq!((zero.directories, zero.troubled, zero.unlisted), (4, 4, 4));
     }
 }

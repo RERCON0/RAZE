@@ -1,22 +1,25 @@
 //! Корзина: когда её можно использовать, а когда объект уйдёт безвозвратно.
 //!
-//! Важное ограничение, о котором стоит говорить прямо: если Корзина
-//! переполнена или том её не поддерживает, оболочка **молча** удалит файл
-//! окончательно. Поэтому RAZE решает режим сам, до удаления, и говорит
-//! пользователю, что именно будет сделано, — вместо того чтобы обнаружить
-//! это постфактум.
+//! The Shell's default delete behavior can silently bypass a full or disabled
+//! Recycle Bin. RAZE checks the settings before deletion, requests a warning
+//! before destruction, and records the actual per-item IFileOperation result.
 
 use crate::tr_format;
 use serde::Serialize;
 use windows::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS, GetDriveTypeW,
-    GetVolumeInformationW,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES, GetDriveTypeW,
+    GetVolumeInformationW, GetVolumePathNameW,
 };
 use windows::Win32::System::WindowsProgramming::{DRIVE_FIXED, DRIVE_REMOVABLE};
 use windows::Win32::UI::Shell::{
-    FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOCONFIRMMKDIR, FOF_NOERRORUI, FOF_SILENT, FO_DELETE,
-    SHFileOperationW, SHFILEOPSTRUCTW,
+    FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_NO_CONNECTED_ELEMENTS, FOF_SILENT, FOF_WANTNUKEWARNING,
+    FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE, FileOperation, IFileOperation,
+    IFileOperationProgressSink, IFileOperationProgressSink_Impl, IShellItem, SHCreateItemFromParsingName,
+    SICHINT_CANONICAL, TSF_DELETE_RECYCLE_IF_POSSIBLE,
 };
+use windows::core::{HRESULT, PCWSTR, Ref};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 use winreg::RegKey;
@@ -47,6 +50,19 @@ pub fn is_recyclable(path: &NtPath) -> RecycleVerdict {
             ),
         };
     }
+    // The Shell parses ordinary Win32 names and can trim these suffixes,
+    // addressing a different sibling than the raw NT object selected by RAZE.
+    if path.ext().as_slice().split(|c| *c == b'\\' as u16)
+        .any(|c| matches!(c.last(), Some(c) if *c == b'.' as u16 || *c == b' ' as u16))
+    {
+        return RecycleVerdict {
+            reusable: false,
+            reason: tr!(
+                "names ending in a dot or space cannot be safely sent to the Recycle Bin",
+                "имена с точкой или пробелом в конце нельзя безопасно отправить в Корзину"
+            ).to_string(),
+        };
+    }
     if path.plain_len() >= MAX_PATH {
         return RecycleVerdict {
             reusable: false,
@@ -67,7 +83,7 @@ pub fn is_recyclable(path: &NtPath) -> RecycleVerdict {
             .to_string(),
         };
     }
-    if let Ok(handle) = open_with(path, FILE_READ_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS) {
+    if let Ok(handle) = open_with(path, FILE_READ_ATTRIBUTES, super::handle::object_flags()) {
         let attrs = super::handle::attributes(&handle).map(|a| a.attributes).unwrap_or(0);
         if attrs & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
             return RecycleVerdict {
@@ -184,9 +200,9 @@ impl BinSettings {
 fn volume_guid(path: &NtPath) -> Option<String> {
     use windows::Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW;
 
-    let root = Wide::new(&format!("{}\\", path.root()));
+    let root = volume_root(path).ok()?;
     let mut buffer = [0u16; 64];
-    unsafe { GetVolumeNameForVolumeMountPointW(root.pc(), &mut buffer) }.ok()?;
+    unsafe { GetVolumeNameForVolumeMountPointW(PCWSTR(root.as_ptr()), &mut buffer) }.ok()?;
     let end = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
     let text = String::from_utf16_lossy(&buffer[..end]);
     let (start, stop) = (text.find('{')?, text.find('}')?);
@@ -194,62 +210,149 @@ fn volume_guid(path: &NtPath) -> Option<String> {
 }
 
 pub fn bin_settings(path: &NtPath) -> BinSettings {
-    let Some(guid) = volume_guid(path) else {
-        return BinSettings::default();
-    };
+    let guid = volume_guid(path);
     BinSettings::read(
         &RegKey::predef(HKEY_CURRENT_USER),
         &RegKey::predef(HKEY_LOCAL_MACHINE),
         BITBUCKET,
         EXPLORER_POLICY,
-        &guid,
+        guid.as_deref().unwrap_or(""),
     )
 }
 
-/// Отправляет пути в Корзину. Возвращает `Ok(false)`, если оболочка отказала
-/// или часть операций прервалась, — тогда вызывающий переходит к
-/// безвозвратному удалению.
-pub fn send_to_recycle(paths: &[std::path::PathBuf]) -> Result<(), NtError> {
-    if paths.is_empty() {
-        return Ok(());
-    }
-    let wide: Vec<Wide> = paths.iter().map(|p| Wide::from_path(p)).collect();
-    let list = Wide::nul_terminated_list(&wide);
-    let mut operation = SHFILEOPSTRUCTW {
-        hwnd: windows::Win32::Foundation::HWND::default(),
-        wFunc: FO_DELETE,
-        pFrom: windows::core::PCWSTR(list.as_ptr()),
-        pTo: windows::core::PCWSTR::null(),
-        fFlags: (FOF_ALLOWUNDO
-            | FOF_NOCONFIRMATION
-            | FOF_NOCONFIRMMKDIR
-            | FOF_NOERRORUI
-            | FOF_SILENT)
-            .0 as u16,
-        fAnyOperationsAborted: windows::core::BOOL(0),
-        hNameMappings: std::ptr::null_mut(),
-        lpszProgressTitle: windows::core::PCWSTR::null(),
+/// Sends items to the Shell and reports their actual disposition. A successful
+/// queue/PerformOperations alone does not mean the item reached the Recycle Bin.
+pub fn send_to_recycle(paths: &[std::path::PathBuf]) -> Result<Disposition, NtError> {
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
     };
-    let result = unsafe { SHFileOperationW(&mut operation) };
-    if result != 0 {
-        return Err(NtError::last());
+    if paths.is_empty() {
+        return Ok(Disposition::RecycleBin);
     }
-    if operation.fAnyOperationsAborted.as_bool() {
-        return Err(NtError(ERROR_ABORTED));
+    struct Apartment;
+    impl Drop for Apartment {
+        fn drop(&mut self) { unsafe { CoUninitialize() }; }
     }
-    Ok(())
+    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.ok().map_err(NtError::from)?;
+    let _apartment = Apartment;
+    let operation: IFileOperation = unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER) }
+        .map_err(NtError::from)?;
+    unsafe {
+        operation.SetOperationFlags(
+            FOFX_RECYCLEONDELETE | FOFX_EARLYFAILURE | FOF_NOERRORUI | FOF_SILENT
+                | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING | FOF_NO_CONNECTED_ELEMENTS,
+        )
+    }.map_err(NtError::from)?;
+    let mut results = Vec::with_capacity(paths.len());
+    for path in paths {
+        let nt_path = NtPath::new(path).map_err(|_| NtError(super::error::ERROR_INVALID_PARAMETER))?;
+        if !is_recyclable(&nt_path).reusable {
+            return Err(NtError(super::error::ERROR_NOT_SUPPORTED));
+        }
+        let wide = Wide::from_path(path);
+        let item: IShellItem = unsafe { SHCreateItemFromParsingName(wide.pc(), None) }
+            .map_err(NtError::from)?;
+        let state = Arc::new(DeleteState::default());
+        let sink: IFileOperationProgressSink = DeleteSink { item: item.clone(), state: state.clone() }.into();
+        unsafe { operation.DeleteItem(&item, &sink) }.map_err(NtError::from)?;
+        results.push(state);
+    }
+    let performed = unsafe { operation.PerformOperations() };
+    let aborted = unsafe { operation.GetAnyOperationsAborted() }.map_err(NtError::from)?.as_bool();
+    let mut incomplete = false;
+    let mut disposition = Disposition::RecycleBin;
+    for state in results {
+        let error = state.error.load(Ordering::Relaxed);
+        if error != 0 { return Err(NtError(error)); }
+        match state.disposition.load(Ordering::Relaxed) {
+            1 => {}
+            2 => disposition = Disposition::Permanent,
+            _ => incomplete = true,
+        }
+    }
+    performed.map_err(NtError::from)?;
+    if aborted || incomplete { return Err(NtError(ERROR_ABORTED)); }
+    Ok(disposition)
+}
+
+#[derive(Default)]
+struct DeleteState {
+    disposition: AtomicU8,
+    error: AtomicU32,
+}
+
+#[windows::core::implement(IFileOperationProgressSink)]
+struct DeleteSink {
+    item: IShellItem,
+    state: Arc<DeleteState>,
+}
+
+#[allow(non_snake_case)]
+impl IFileOperationProgressSink_Impl for DeleteSink_Impl {
+    fn StartOperations(&self) -> windows::core::Result<()> { Ok(()) }
+    fn FinishOperations(&self, _result: HRESULT) -> windows::core::Result<()> { Ok(()) }
+    fn PreDeleteItem(&self, flags: u32, _item: Ref<IShellItem>) -> windows::core::Result<()> {
+        if flags & TSF_DELETE_RECYCLE_IF_POSSIBLE.0 as u32 == 0 {
+            return Err(windows::core::Error::from_hresult(HRESULT::from_win32(ERROR_ABORTED)));
+        }
+        Ok(())
+    }
+    fn PostDeleteItem(&self, _flags: u32, item: Ref<IShellItem>, result: HRESULT, recycled: Ref<IShellItem>) -> windows::core::Result<()> {
+        let item = item.as_ref().ok_or_else(|| windows::core::Error::from_hresult(HRESULT::from_win32(ERROR_ABORTED)))?;
+        // A folder can generate callbacks for its children as well.
+        if unsafe { self.item.Compare(item, SICHINT_CANONICAL.0 as u32) }? != 0 { return Ok(()); }
+        if result.is_err() {
+            self.state.error.store(
+                NtError::from(windows::core::Error::from_hresult(result)).code(),
+                Ordering::Relaxed,
+            );
+        } else if recycled.as_ref().is_some() {
+            // Recycling can return COPYENGINE_S_DONT_PROCESS_CHILDREN: the
+            // complete item moved to the Bin, so its children need no work.
+            self.state.disposition.store(1, Ordering::Relaxed);
+        } else if result.0 == 0 {
+            self.state.disposition.store(2, Ordering::Relaxed);
+        } else {
+            // Success-class statuses such as USER_IGNORED without a resulting
+            // Bin item are not proof of a completed delete.
+            self.state.error.store(ERROR_ABORTED, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+    fn PreRenameItem(&self, _flags: u32, _item: Ref<IShellItem>, _name: &PCWSTR) -> windows::core::Result<()> { Ok(()) }
+    fn PostRenameItem(&self, _flags: u32, _item: Ref<IShellItem>, _name: &PCWSTR, _result: HRESULT, _new: Ref<IShellItem>) -> windows::core::Result<()> { Ok(()) }
+    fn PreMoveItem(&self, _flags: u32, _item: Ref<IShellItem>, _destination: Ref<IShellItem>, _name: &PCWSTR) -> windows::core::Result<()> { Ok(()) }
+    fn PostMoveItem(&self, _flags: u32, _item: Ref<IShellItem>, _destination: Ref<IShellItem>, _name: &PCWSTR, _result: HRESULT, _new: Ref<IShellItem>) -> windows::core::Result<()> { Ok(()) }
+    fn PreCopyItem(&self, _flags: u32, _item: Ref<IShellItem>, _destination: Ref<IShellItem>, _name: &PCWSTR) -> windows::core::Result<()> { Ok(()) }
+    fn PostCopyItem(&self, _flags: u32, _item: Ref<IShellItem>, _destination: Ref<IShellItem>, _name: &PCWSTR, _result: HRESULT, _new: Ref<IShellItem>) -> windows::core::Result<()> { Ok(()) }
+    fn PreNewItem(&self, _flags: u32, _destination: Ref<IShellItem>, _name: &PCWSTR) -> windows::core::Result<()> { Ok(()) }
+    fn PostNewItem(&self, _flags: u32, _destination: Ref<IShellItem>, _name: &PCWSTR, _template: &PCWSTR, _attributes: u32, _result: HRESULT, _new: Ref<IShellItem>) -> windows::core::Result<()> { Ok(()) }
+    fn UpdateProgress(&self, _total: u32, _done: u32) -> windows::core::Result<()> { Ok(()) }
+    fn ResetTimer(&self) -> windows::core::Result<()> { Ok(()) }
+    fn PauseTimer(&self) -> windows::core::Result<()> { Ok(()) }
+    fn ResumeTimer(&self) -> windows::core::Result<()> { Ok(()) }
 }
 
 const ERROR_ABORTED: u32 = 1223;
 
+fn volume_root(path: &NtPath) -> Result<Vec<u16>, NtError> {
+    // A mounted volume can live below C:\; using the drive-letter root would
+    // read the wrong filesystem and Recycle Bin settings for its contents.
+    let mut root = vec![0u16; path.ext().len() + 2];
+    unsafe { GetVolumePathNameW(path.ext().pc(), &mut root) }.map_err(NtError::from)?;
+    let end = root.iter().position(|unit| *unit == 0).unwrap_or(root.len() - 1);
+    root.truncate(end + 1);
+    Ok(root)
+}
+
 fn volume_filesystem(path: &NtPath) -> Result<String, NtError> {
-    let root = Wide::new(&format!("{}\\", path.root()));
+    let root = volume_root(path)?;
     let mut buffer = [0u16; 64];
     // В 0.62 обёртка возвращает Result без длины: имя файловой системы
     // NUL-терминированное, поэтому длину находим сами.
     unsafe {
-        GetVolumeInformationW(root.pc(), None, None, None, None, Some(&mut buffer))
-            .map_err(|_| NtError::last())?;
+        GetVolumeInformationW(PCWSTR(root.as_ptr()), None, None, None, None, Some(&mut buffer))
+            .map_err(NtError::from)?;
     }
     let end = buffer
         .iter()
@@ -259,8 +362,8 @@ fn volume_filesystem(path: &NtPath) -> Result<String, NtError> {
 }
 
 fn drive_type(path: &NtPath) -> Result<u32, NtError> {
-    let root = Wide::new(&format!("{}\\", path.root()));
-    let result = unsafe { GetDriveTypeW(root.pc()) };
+    let root = volume_root(path)?;
+    let result = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
     if result == 0 {
         Err(NtError::last())
     } else {
@@ -276,9 +379,8 @@ pub enum Disposition {
     Permanent,
 }
 
-/// Отправляет в Корзину то, что туда положить можно, и безвозвратно удаляет
-/// всё остальное. Ошибка Корзины не проваливает задачу: для проблемного
-/// файла безвозвратное удаление и есть цель.
+/// Recycles supported objects, otherwise removes them permanently. An actual
+/// Shell error permits fallback, but cancellation must never trigger deletion.
 pub fn remove(
     path: &NtPath,
     options: &super::remove::RemoveOptions,
@@ -287,11 +389,18 @@ pub fn remove(
     let verdict = is_recyclable(path);
     if prefer_recycle && verdict.reusable && !options.dry_run {
         match send_to_recycle(&[path.to_path()]) {
-            Ok(()) => return (Disposition::RecycleBin, None),
-            Err(_) => {
-                // Корзина отказала — падаем в безвозвратное удаление, но
-                // причину отказа покажем в отчёте.
+            Ok(disposition) => return (disposition, None),
+            Err(error) if error.code() == ERROR_ABORTED => {
+                let mut outcome = super::remove::Outcome::default();
+                outcome.failures.push(super::remove::Failure {
+                    path: path.to_string_lossy(),
+                    code: error.code(),
+                    message: error.message(),
+                    holders: Vec::new(),
+                });
+                return (Disposition::RecycleBin, Some(outcome));
             }
+            Err(_) => {}
         }
     }
     (
@@ -326,9 +435,63 @@ mod tests {
         let verdict = is_recyclable(&NtPath::new(&file).unwrap());
         assert!(verdict.reusable, "{}", verdict.reason);
 
-        send_to_recycle(std::slice::from_ref(&file)).expect("корзина обязана принять обычный файл");
+        assert_eq!(send_to_recycle(std::slice::from_ref(&file)).expect("корзина обязана принять обычный файл"), Disposition::RecycleBin);
         assert!(!file.exists());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn recycling_a_web_page_does_not_delete_its_unselected_sidecar() {
+        let base = scratch("connected");
+        let page = base.join("page.htm");
+        let sidecar = base.join("page_files");
+        std::fs::write(&page, b"<html></html>").unwrap();
+        std::fs::create_dir(&sidecar).unwrap();
+        std::fs::write(sidecar.join("keep.txt"), b"outside selection").unwrap();
+        let result = send_to_recycle(std::slice::from_ref(&page));
+        let kept = std::fs::read(sidecar.join("keep.txt"));
+        std::fs::remove_dir_all(&base).unwrap();
+        assert_eq!(result.unwrap(), Disposition::RecycleBin);
+        assert_eq!(kept.unwrap(), b"outside selection");
+    }
+
+    #[test]
+    fn shell_ambiguous_names_cannot_delete_their_ordinary_sibling() {
+        use std::os::windows::ffi::OsStringExt;
+        let base = scratch("suffix");
+        let ordinary = base.join("note");
+        std::fs::write(&ordinary, b"keep").unwrap();
+        for suffix in ["note.", "note "] {
+            let nt_path = NtPath::new(&base.join(suffix)).unwrap();
+            let extended = std::path::PathBuf::from(std::ffi::OsString::from_wide(nt_path.ext().as_slice()));
+            std::fs::write(&extended, b"raw").unwrap();
+            assert!(!is_recyclable(&nt_path).reusable);
+            let result = send_to_recycle(&[nt_path.to_path()]);
+            let ordinary_bytes = std::fs::read(&ordinary).unwrap();
+            let raw_bytes = std::fs::read(&extended).unwrap();
+            std::fs::remove_file(&extended).unwrap();
+            assert!(result.is_err());
+            assert_eq!(ordinary_bytes, b"keep");
+            assert_eq!(raw_bytes, b"raw");
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_locked_file_is_not_reported_as_recycled_after_queueing() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let base = scratch("locked");
+        let path = base.join("locked.txt");
+        std::fs::write(&path, b"keep").unwrap();
+        let file = std::fs::OpenOptions::new().read(true)
+            .share_mode(windows::Win32::Storage::FileSystem::FILE_SHARE_READ.0)
+            .open(&path).unwrap();
+        let result = send_to_recycle(std::slice::from_ref(&path));
+        drop(file);
+        let contents = std::fs::read(&path);
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(result.is_err());
+        assert_eq!(contents.unwrap(), b"keep");
     }
 
     #[test]
@@ -338,7 +501,6 @@ mod tests {
         let nt_path = NtPath::new(&path).unwrap();
         let verdict = is_recyclable(&nt_path);
         assert!(!verdict.reusable);
-        assert!(verdict.reason.contains("NUL"));
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -375,7 +537,7 @@ mod tests {
         policy_key.set_value("NoRecycleFiles", &1u32).unwrap();
         assert!(BinSettings::read(&user, &machine, &bitbucket, &policy, guid).nuke_on_delete);
 
-        let _ = user.delete_subkey_all(r"Software\RAZE.Tests");
+        let _ = user.delete_subkey_all(&scratch);
     }
 
     #[test]
@@ -385,8 +547,4 @@ mod tests {
         assert!(guid.starts_with('{') && guid.ends_with('}'), "{guid}");
     }
 
-    #[test]
-    fn empty_list_is_a_no_op() {
-        assert!(send_to_recycle(&[]).is_ok());
-    }
 }

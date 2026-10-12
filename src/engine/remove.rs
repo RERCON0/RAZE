@@ -23,10 +23,10 @@ use windows::Win32::Storage::FileSystem::{
 use super::dir;
 use super::error::{ERROR_OUTSIDE_TREE, NtError};
 use super::handle::{
-    Containment, attributes, clear_read_only, open_for_delete, open_for_read, privileged_access,
+    Containment, attributes, clear_read_only, open_for_delete, open_for_read,
 };
 use super::locker::{self, Holder};
-use super::path::{NtPath, Wide};
+use super::path::NtPath;
 use super::privs;
 use super::scan::EntryKind;
 use super::security;
@@ -145,21 +145,13 @@ pub fn remove_tree(root: &NtPath, options: &RemoveOptions) -> Outcome {
         privs::enable_backup_restore();
     }
 
-    // Корень-файл или корень-ссылка: обход не нужен —
-    // удаляем одним шагом. Корень-каталог идёт снизу вверх.
-    if let Some((kind, size)) = classify_root(root) {
-        if kind != EntryKind::Directory {
-            remove_leaf(root, kind, size, options, None, &mut outcome, true);
-            return outcome;
-        }
-    }
 
     // Пробный прогон ничего не меняет, и защищать в нём нечего.
     let guard = if options.dry_run {
         None
     } else {
         match Containment::new(root) {
-            Ok(guard) => guard,
+            Ok(guard) => Some(guard),
             Err(error) if error.not_found() => {
                 outcome.notes.push(Note::Vanished {
                     path: root.to_string_lossy(),
@@ -175,6 +167,15 @@ pub fn remove_tree(root: &NtPath, options: &RemoveOptions) -> Outcome {
         }
     };
     let guard = guard.as_ref();
+
+    // Файл и ссылка тоже проверяются по удаляемому дескриптору:
+    // подмена родителя после проверки плана не должна менять цель.
+    if let Some((kind, size)) = classify_root(root) {
+        if kind != EntryKind::Directory {
+            remove_leaf(root, kind, size, options, guard, &mut outcome, true);
+            return outcome;
+        }
+    }
 
     let mut stack: Vec<Frame> = Vec::new();
     match Frame::enter(root, options, guard, &mut outcome) {
@@ -418,15 +419,14 @@ fn remove_leaf(
                         for holder in &holders {
                             // Службы не трогаем: это антивирусы и драйверы,
                             // они всё равно не закроются по WM_CLOSE.
-                            if !holder.is_service {
-                                locker::request_close(holder.pid);
+                            if holder.can_close && locker::request_close(holder.pid) > 0 {
+                                outcome.notes.push(Note::ProcessCloseRequested {
+                                    pid: holder.pid,
+                                    name: holder.name.clone(),
+                                });
                             }
-                            outcome.notes.push(Note::ProcessCloseRequested {
-                                pid: holder.pid,
-                                name: holder.name.clone(),
-                            });
                         }
-                        if locker::wait_for_release(
+                        if attempt < options.retries && locker::wait_for_release(
                             &[path.to_path()],
                             options.lock_timeout.min(Duration::from_millis(400) * attempt),
                         ) {
@@ -465,7 +465,7 @@ fn try_delete(
     guard: Option<&Containment>,
     outcome: &mut Outcome,
 ) -> DeleteStep {
-    let handle = match open_for_delete(path) {
+    let mut handle = match open_for_delete(path) {
         Ok(handle) => handle,
         Err(error) if error.not_found() => return DeleteStep::AlreadyGone,
         Err(error) if error.access_denied() => {
@@ -502,23 +502,33 @@ fn try_delete(
         }
     }
 
-    if let Ok(attrs) = attributes(&handle) {
-        if attrs.is_read_only() {
-            match clear_read_only(&handle) {
-                Ok(()) => outcome.notes.push(Note::ReadOnlyCleared {
-                    path: path.to_string_lossy(),
-                }),
-                Err(error) => return DeleteStep::Retry(error),
-            }
-        }
-    }
 
     match mark_for_delete(&handle) {
         Ok(()) => {}
         Err(error) if error.unsupported() => {
-            // Файловая система не знает про FileDispositionInformationEx —
-            // пробуем классический способ. Он не снимает read-only, но мы уже
-            // сняли его выше.
+            // Старый API не умеет игнорировать read-only. Только для этого
+            // fallback запрашиваем дополнительные права, не мешая обычному
+            // удалению файлов, у которых есть DELETE, но нет WRITE_ATTRIBUTES.
+            if attributes(&handle).is_ok_and(|attrs| attrs.is_read_only()) {
+                use windows::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
+                handle = match super::handle::open_with(
+                    path,
+                    super::handle::delete_access() | FILE_WRITE_ATTRIBUTES,
+                    super::handle::object_flags(),
+                ) {
+                    Ok(handle) => handle,
+                    Err(error) => return DeleteStep::Retry(error),
+                };
+                if guard.is_some_and(|guard| !guard.holds(&handle)) {
+                    return DeleteStep::Refused(NtError(ERROR_OUTSIDE_TREE));
+                }
+                if let Err(error) = clear_read_only(&handle) {
+                    return DeleteStep::Retry(error);
+                }
+                outcome.notes.push(Note::ReadOnlyCleared {
+                    path: path.to_string_lossy(),
+                });
+            }
             if let Err(error) = mark_for_delete_legacy(&handle) {
                 return DeleteStep::Retry(error);
             }
@@ -530,10 +540,11 @@ fn try_delete(
     // дескриптора. Раньше проверять бессмысленно.
     drop(handle);
 
-    if still_there(path) {
+    if present(path) {
         outcome.notes.push(Note::DeletePending {
             path: path.to_string_lossy(),
         });
+        return DeleteStep::Retry(NtError(windows::Win32::Foundation::ERROR_DELETE_PENDING.0));
     }
     DeleteStep::Done
 }
@@ -570,47 +581,7 @@ fn mark_for_delete_legacy(handle: &super::handle::OwnedHandle) -> Result<(), NtE
     })
 }
 
-/// Проверка «а точно пропало?». Открытие с нулевым доступом не меняет объект,
-/// но честно отвечает, существует ли он.
-fn still_there(path: &NtPath) -> bool {
-    super::handle::try_open(
-        path,
-        windows::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES,
-        windows::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS,
-    )
-    .is_some()
-}
 
-/// Полный путь удаления для произвольного набора целей с учётом того,
-/// что часть из них может лежать внутри других. Возвращает нормализованный
-/// список без вложенностей: если выбраны `A` и `A\B`, достаточно удалить `A`.
-pub fn flatten_targets(mut targets: Vec<Wide>) -> Vec<Wide> {
-    targets.sort_by_key(|p| p.len());
-    let mut kept: Vec<Wide> = Vec::new();
-    for candidate in targets {
-        let text = candidate.to_string_lossy().to_lowercase();
-        let covered = kept.iter().any(|parent| {
-            let parent = parent.to_string_lossy().to_lowercase();
-            text.len() > parent.len() && text.starts_with(&parent) && text[parent.len()..].starts_with('\\')
-        });
-        if !covered {
-            kept.push(candidate);
-        }
-    }
-    kept
-}
-
-/// Открыть объект с привилегиями — нужно там, где дескриптор не удалось
-/// получить обычным `open_for_delete` даже после правки DACL.
-pub fn open_privileged(path: &NtPath) -> Result<super::handle::OwnedHandle, NtError> {
-    let _ = privs::enable_backup_restore();
-    super::handle::open_with(
-        path,
-        privileged_access(),
-        windows::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS
-            | windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
-    )
-}
 
 /// Тихая проверка существования для отчёта.
 pub fn exists(path: &NtPath) -> bool {
@@ -660,6 +631,48 @@ mod tests {
         assert_eq!(outcome.removed_files, 2);
         assert!(outcome.removed_directories >= 2);
         assert!(!exists(&root));
+    }
+
+    #[test]
+    fn readonly_file_is_removed_without_changing_ownership() {
+        let base = scratch("readonly");
+        let file = base.join("readonly.txt");
+        std::fs::write(&file, b"readonly").unwrap();
+        let mut permissions = std::fs::metadata(&file).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&file, permissions).unwrap();
+        let outcome = remove_tree(
+            &NtPath::new(&file).unwrap(),
+            &RemoveOptions { take_ownership: false, ..Default::default() },
+        );
+        assert!(!outcome.failed(), "{:?}", outcome.failures);
+        assert!(!file.exists(), "readonly file must be removed");
+        assert!(base.exists(), "the containing directory must be preserved");
+        assert_eq!(outcome.removed_files, 1);
+        assert!(!outcome.notes.iter().any(|note| matches!(
+            note, Note::OwnershipTaken { .. } | Note::AccessGranted { .. }
+        )));
+        std::fs::remove_dir(base).unwrap();
+    }
+
+    #[test]
+    fn legacy_removal_clears_a_lone_readonly_attribute() {
+        use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_READONLY, FILE_WRITE_ATTRIBUTES, SetFileAttributesW};
+        let base = scratch("legacy-readonly");
+        let file = base.join("one.bin");
+        std::fs::write(&file, b"legacy").unwrap();
+        let path = NtPath::new(&file).unwrap();
+        unsafe { SetFileAttributesW(path.ext().pc(), FILE_ATTRIBUTE_READONLY) }.unwrap();
+        let handle = super::super::handle::open_with(
+            &path,
+            super::super::handle::delete_access() | FILE_WRITE_ATTRIBUTES,
+            super::super::handle::object_flags(),
+        ).unwrap();
+        clear_read_only(&handle).unwrap();
+        mark_for_delete_legacy(&handle).unwrap();
+        drop(handle);
+        assert!(!present(&path), "legacy fallback must remove the readonly file");
+        std::fs::remove_dir(base).unwrap();
     }
 
     #[test]
@@ -759,9 +772,7 @@ mod tests {
             return;
         }
 
-        let guard = Containment::new(&NtPath::new(&work).unwrap())
-            .unwrap()
-            .expect("NTFS reports the final path");
+        let guard = Containment::new(&NtPath::new(&work).unwrap()).unwrap();
         let through_link = NtPath::new(&link.join("victim.txt")).unwrap();
         let options = RemoveOptions::default();
 
@@ -810,22 +821,4 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    #[test]
-    fn flatten_drops_children_of_selected_parents() {
-        let list = vec![
-            Wide::new("C:\\a"),
-            Wide::new("C:\\a\\b"),
-            Wide::new("C:\\ab"),
-            Wide::new("C:\\c"),
-        ];
-        let flat = flatten_targets(list);
-        let names: Vec<String> = flat.iter().map(|p| p.to_string_lossy()).collect();
-        assert!(names.contains(&"C:\\a".to_string()));
-        assert!(!names.contains(&"C:\\a\\b".to_string()));
-        assert!(
-            names.contains(&"C:\\ab".to_string()),
-            "похожий по имени, но не вложенный путь должен остаться"
-        );
-        assert!(names.contains(&"C:\\c".to_string()));
-    }
 }

@@ -11,15 +11,13 @@ use serde::Serialize;
 use crate::engine::path::NtPath;
 use crate::engine::privs;
 use crate::engine::recycle::{self, Disposition, RecycleVerdict};
-use crate::engine::remove::{self, Note, Outcome, RemoveOptions};
+use crate::engine::remove::{self, Failure, Outcome, RemoveOptions};
 use crate::engine::scan::{self, Entry, ScanOptions, ScanSummary};
 use crate::protect;
 use crate::report::{Refused, Report, TargetReport};
 
 #[derive(Clone, Debug)]
 pub struct Options {
-    /// Сначала пробовать Корзину; для непереносимых объектов — безвозвратно.
-    pub prefer_recycle: bool,
     /// Никогда не отправлять в Корзину.
     pub permanent: bool,
     /// Забирать владение и выдавать права при ACCESS_DENIED.
@@ -35,7 +33,6 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            prefer_recycle: true,
             permanent: false,
             take_ownership: true,
             close_locks: false,
@@ -75,7 +72,10 @@ pub struct Target {
 
 impl Target {
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.summary.files == 0 && self.summary.directories == 0
+        self.entries.is_empty()
+            && self.summary.files == 0
+            && self.summary.directories == 0
+            && self.summary.links == 0
     }
 
     fn refusal(display: String, reason: String) -> Self {
@@ -253,8 +253,13 @@ pub fn execute(targets: &[Target], options: &Options) -> Report {
 
         let mut target_report = TargetReport {
             path: target.display.clone(),
-            disposition: mode_of(target),
-            reason: target.verdict.reason.clone(),
+            native_path: path.to_path(),
+            disposition: if options.permanent { Disposition::Permanent } else { mode_of(target) },
+            reason: if options.permanent {
+                crate::tr!("permanent removal was requested", "выбрано безвозвратное удаление").to_string()
+            } else {
+                target.verdict.reason.clone()
+            },
             removed_files: 0,
             removed_directories: 0,
             removed_links: 0,
@@ -266,15 +271,31 @@ pub fn execute(targets: &[Target], options: &Options) -> Report {
 
         let outcome = if target.verdict.reusable && !options.permanent && !options.dry_run {
             match recycle::send_to_recycle(&[path.to_path()]) {
-                Ok(()) => {
+                Ok(disposition) => {
+                    target_report.disposition = disposition;
                     // Считаем, что ушло всё содержимое цели: Корзина
                     // работает по дереву, а не пофайлово.
-                    let scan_entries = target.summary.files + target.summary.directories;
                     target_report.removed_files = target.summary.files;
-                    target_report.removed_directories =
-                        scan_entries.saturating_sub(target.summary.files);
-                    target_report.freed_bytes = target.summary.bytes;
+                    target_report.removed_directories = target.summary.directories;
+                    target_report.removed_links = target.summary.links;
+                    // Перенос в Корзину сохраняет данные на диске.
+                    if disposition == Disposition::Permanent {
+                        target_report.freed_bytes = target.summary.bytes;
+                    }
                     Outcome::default()
+                }
+                Err(error) if error.code() == windows::Win32::Foundation::ERROR_CANCELLED.0 => {
+                    // Отказ от операции Корзины — не разрешение стереть насовсем.
+                    report.cancelled = true;
+                    Outcome {
+                        failures: vec![Failure {
+                            path: target.display.clone(),
+                            code: error.code(),
+                            message: error.message(),
+                            holders: Vec::new(),
+                        }],
+                        ..Default::default()
+                    }
                 }
                 Err(_) => {
                     // Корзина отказала — уходим в безвозвратное удаление.
@@ -292,6 +313,9 @@ pub fn execute(targets: &[Target], options: &Options) -> Report {
             .iter()
             .any(|f| crate::engine::error::NtError(f.code).needs_elevation());
         report.targets.push(target_report);
+        if report.cancelled {
+            break;
+        }
     }
     report
 }
@@ -301,14 +325,7 @@ fn absorb(target: &mut TargetReport, outcome: Outcome) {
     target.removed_directories += outcome.removed_directories;
     target.removed_links += outcome.removed_links;
     target.freed_bytes += outcome.freed_bytes;
-    for note in outcome.notes {
-        match &note {
-            // Корзина и безвозвратное удаление оставили разный след в
-            // журнале: показываем пользователю именно то, что он выбрал.
-            Note::Vanished { .. } => target.notes.push(note),
-            _ => target.notes.push(note),
-        }
-    }
+    target.notes.extend(outcome.notes);
     target.failures.extend(outcome.failures);
 }
 
@@ -351,7 +368,7 @@ mod tests {
         paths.push(PathBuf::from("C:\\"));
         let targets = plan(&paths, &options);
         assert!(targets[1].refused.is_some(), "корень тома обязан быть отклонён");
-        assert!(!has_work(&targets[1..].to_vec()));
+        assert!(!has_work(&targets[1..]));
     }
 
     #[test]
@@ -368,6 +385,26 @@ mod tests {
         assert!(base.join("f.txt").exists());
         assert!(report.targets[0].dry_run);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_recycled_file_does_not_report_freed_space() {
+        let base = scratch("recycle-accounting");
+        let file = base.join("one.bin");
+        std::fs::write(&file, b"occupied in bin").unwrap();
+        let options = Options::default();
+        let targets = plan(std::slice::from_ref(&file), &options);
+        assert!(targets[0].verdict.reusable, "{}", targets[0].verdict.reason);
+
+        let report = execute(&targets, &options);
+        let removed = !file.exists();
+        std::fs::remove_dir_all(base).unwrap();
+        assert!(!report.failed(), "{:?}", report.targets);
+        assert!(removed);
+        assert_eq!(report.targets[0].disposition, Disposition::RecycleBin);
+        assert_eq!(report.targets[0].removed_files, 1);
+        assert_eq!(report.targets[0].freed_bytes, 0);
+        assert_eq!(report.freed_bytes(), 0);
     }
 
     #[test]
@@ -435,6 +472,39 @@ mod tests {
         let report = execute(&[forged], &options);
         assert_eq!(report.refused.len(), 1);
         assert!(report.targets.is_empty());
+    }
+
+    #[test]
+    fn raw_utf16_target_preserves_a_replacement_character_sibling() {
+        use std::os::windows::ffi::OsStringExt;
+        let base = scratch("raw-utf16");
+        let file = base.join(std::ffi::OsString::from_wide(&[
+            b'r' as u16, b'a' as u16, b'w' as u16, 0xD800,
+        ]));
+        let sibling = base.join("raw\u{FFFD}");
+        std::fs::write(&file, b"intended").unwrap();
+        std::fs::write(&sibling, b"preserve").unwrap();
+        let options = Options { permanent: true, ..Default::default() };
+        let targets = plan(&[file.clone()], &options);
+        let report = execute(&targets, &options);
+        assert!(!report.failed(), "{:?}", report.targets);
+        assert!(!file.exists());
+        assert_eq!(std::fs::read(&sibling).unwrap(), b"preserve");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn current_permanent_option_overrides_an_old_recycle_plan() {
+        let base = scratch("changed-mode");
+        let file = base.join("one.bin");
+        std::fs::write(&file, b"keep during preview").unwrap();
+        let mut targets = plan(&[file.clone()], &Options::default());
+        targets[0].verdict.reusable = true;
+        let options = Options { permanent: true, dry_run: true, ..Default::default() };
+        let report = execute(&targets, &options);
+        assert_eq!(report.targets[0].disposition, Disposition::Permanent);
+        assert!(file.exists());
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

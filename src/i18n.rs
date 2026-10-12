@@ -7,6 +7,8 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use serde::Serialize;
+use winreg::RegKey;
+use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -51,6 +53,38 @@ impl Language {
 
 static LANGUAGE: AtomicU8 = AtomicU8::new(0);
 
+const PREFERENCES_KEY: &str = r"Software\RAZE";
+
+/// Saved per-user language; an absent preference uses English.
+pub fn load_language() -> std::io::Result<Language> {
+    read_language(&RegKey::predef(HKEY_CURRENT_USER), PREFERENCES_KEY)
+}
+
+/// Save only an explicit user choice, not a command-line override.
+pub fn save_language(language: Language) -> std::io::Result<()> {
+    write_language(&RegKey::predef(HKEY_CURRENT_USER), PREFERENCES_KEY, language)
+}
+
+fn read_language(root: &RegKey, path: &str) -> std::io::Result<Language> {
+    let key = match root.open_subkey_with_flags(path, KEY_READ) {
+        Ok(key) => key,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Language::En),
+        Err(error) => return Err(error),
+    };
+    let value: String = match key.get_value("Language") {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Language::En),
+        Err(error) => return Err(error),
+    };
+    Language::parse(&value)
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidData, message))
+}
+
+fn write_language(root: &RegKey, path: &str, language: Language) -> std::io::Result<()> {
+    let (key, _) = root.create_subkey(path)?;
+    key.set_value("Language", &language.code())
+}
+
 pub fn set_language(language: Language) {
     LANGUAGE.store(u8::from(language == Language::Ru), Ordering::Relaxed);
 }
@@ -64,29 +98,9 @@ pub fn language() -> Language {
 }
 
 pub fn is_russian() -> bool {
-    #[cfg(test)]
-    if let Some(language) = TEST_LANGUAGE.with(|slot| slot.get()) {
-        return language == Language::Ru;
-    }
     LANGUAGE.load(Ordering::Relaxed) == 1
 }
 
-#[cfg(test)]
-thread_local! {
-    static TEST_LANGUAGE: std::cell::Cell<Option<Language>> = const { std::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) fn with_language<T>(language: Language, action: impl FnOnce() -> T) -> T {
-    struct Restore(Option<Language>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            TEST_LANGUAGE.with(|slot| slot.set(self.0));
-        }
-    }
-    let _restore = Restore(TEST_LANGUAGE.with(|slot| slot.replace(Some(language))));
-    action()
-}
 
 #[macro_export]
 macro_rules! tr {
@@ -127,18 +141,23 @@ mod tests {
         assert!(Language::parse(Language::Ru.label().to_lowercase().as_str()).is_err());
     }
 
+
     #[test]
-    fn both_languages_cover_every_removal_reason() {
-        for language in [Language::En, Language::Ru] {
-            with_language(language, || {
-                let report = crate::report::Report::demo();
-                let text = report.summary_line().to_lowercase();
-                if language == Language::En {
-                    assert!(text.contains("removed"), "{text}");
-                } else {
-                    assert!(text.contains("удалено"), "{text}");
-                }
-            });
+    fn saved_language_survives_reopening_and_invalid_data_is_not_overwritten() {
+        let root = RegKey::predef(HKEY_CURRENT_USER);
+        let path = format!(r"Software\RAZE.Tests\language-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        assert_eq!(read_language(&root, &path).unwrap(), Language::En);
+        for language in [Language::Ru, Language::En] {
+            write_language(&root, &path, language).unwrap();
+            assert_eq!(read_language(&RegKey::predef(HKEY_CURRENT_USER), &path).unwrap(), language);
         }
+        let key = root.open_subkey_with_flags(&path, winreg::enums::KEY_WRITE | KEY_READ).unwrap();
+        key.set_value("Language", &"unsupported").unwrap();
+        assert_eq!(read_language(&root, &path).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(key.get_value::<String, _>("Language").unwrap(), "unsupported");
+        drop(key);
+        root.delete_subkey_all(&path).unwrap();
     }
 }

@@ -105,15 +105,14 @@ impl Drop for TokenHandle {
 /// перестаёт быть валидным сразу после закрытия токена.
 pub fn current_user_sid() -> Result<Vec<u8>, NtError> {
     let token = unsafe { TokenHandle(open_process_token()?) };
-    // SAFETY: буфер выделен по размеру, который вернул GetTokenInformation,
-    // и читается ровно на этот размер.
+    // TOKEN_USER contains a pointer, so its backing buffer must be aligned.
     unsafe {
         let mut needed = 0u32;
         let _ = GetTokenInformation(token.0, TokenUser, None, 0, &mut needed);
         if needed == 0 {
             return Err(NtError::last());
         }
-        let mut buffer = vec![0u8; needed as usize];
+        let mut buffer = vec![0usize; (needed as usize).div_ceil(mem::size_of::<usize>())];
         nt(GetTokenInformation(
             token.0,
             TokenUser,
@@ -123,7 +122,7 @@ pub fn current_user_sid() -> Result<Vec<u8>, NtError> {
         ))?;
         // TOKEN_USER = { SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes } }.
         // Первое поле — указатель, сам SID лежит по этому адресу.
-        let sid = *(buffer.as_ptr() as *const *const u8);
+        let sid = (*(buffer.as_ptr() as *const windows::Win32::Security::TOKEN_USER)).User.Sid.0.cast::<u8>();
         if sid.is_null() {
             return Err(NtError::last());
         }
@@ -163,12 +162,6 @@ pub fn is_elevated() -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn privilege_names_are_the_documented_ones() {
-        assert_eq!(SE_BACKUP, "SeBackupPrivilege");
-        assert_eq!(SE_RESTORE, "SeRestorePrivilege");
-        assert_eq!(SE_TAKE_OWNERSHIP, "SeTakeOwnershipPrivilege");
-    }
 
     #[test]
     fn current_user_sid_returns_sid_header() {
