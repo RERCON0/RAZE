@@ -22,7 +22,9 @@ use windows::Win32::Storage::FileSystem::{
 
 use super::dir;
 use super::error::{NtError, ERROR_OUTSIDE_TREE};
-use super::handle::{attributes, clear_read_only, open_for_delete, open_for_read, Containment};
+use super::handle::{
+    attributes, clear_read_only, hard_links, open_for_delete, open_for_read, Containment,
+};
 use super::locker::{self, Holder};
 use super::path::NtPath;
 use super::privs;
@@ -80,6 +82,15 @@ pub enum Note {
     DeletePending {
         path: String,
     },
+    /// Корзина отказала, и было явное согласие на безвозвратное удаление.
+    RecycleRefused {
+        reason: String,
+    },
+    /// Файл с несколькими жёсткими ссылками не тронут: удаление открыто
+    /// через родительский каталог (`FILE_DELETE_CHILD`).
+    DeleteViaParent {
+        path: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -124,7 +135,7 @@ impl Outcome {
         }
     }
 
-    fn fail(&mut self, path: &NtPath, error: NtError, holders: Vec<Holder>) {
+    pub(crate) fn fail(&mut self, path: &NtPath, error: NtError, holders: Vec<Holder>) {
         if error.needs_elevation() {
             self.needs_elevation = true;
         }
@@ -357,7 +368,7 @@ pub fn remove_selected(targets: &[(NtPath, EntryKind, u64)], options: &RemoveOpt
 /// Тип и размер корня: файл и ссылка удаляются без обхода,
 /// а каталог — снизу вверх. `None` — корень не открылся;
 /// обход сам доложит `Vanished` или ошибку доступа.
-fn classify_root(root: &NtPath) -> Option<(EntryKind, u64)> {
+pub(crate) fn classify_root(root: &NtPath) -> Option<(EntryKind, u64)> {
     use windows::Win32::Storage::FileSystem::{
         FileStandardInfo, GetFileInformationByHandleEx, FILE_STANDARD_INFO,
     };
@@ -386,7 +397,7 @@ fn classify_root(root: &NtPath) -> Option<(EntryKind, u64)> {
     Some((kind, size))
 }
 
-fn kind_of(attributes: u32) -> EntryKind {
+pub(crate) fn kind_of(attributes: u32) -> EntryKind {
     if attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
         EntryKind::Link
     } else if attributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0 {
@@ -423,12 +434,12 @@ fn remove_leaf(
                 return;
             }
             DeleteStep::AlreadyGone => {
+                // Объект исчез не нашими руками: ни в счётчики удалённого, ни
+                // в освобождённые байты он не писался. Раньше писался в оба —
+                // отчёт приписывал RAZE чужое исчезновение.
                 outcome.notes.push(Note::Vanished {
                     path: path.to_string_lossy(),
                 });
-                if record {
-                    outcome.record(kind, size);
-                }
                 return;
             }
             DeleteStep::Refused(error) => {
@@ -499,17 +510,34 @@ fn try_delete(
             if !options.take_ownership {
                 return DeleteStep::Retry(error);
             }
-            // Сначала владение, потом права: без владения WRITE_DAC
-            // недоступен, и второй шаг был бы пустой тратой времени.
-            if security::take_ownership(path, guard).is_ok() {
-                outcome.notes.push(Note::OwnershipTaken {
-                    path: path.to_string_lossy(),
-                });
-            }
-            if security::grant_full_control(path, guard).is_ok() {
-                outcome.notes.push(Note::AccessGranted {
-                    path: path.to_string_lossy(),
-                });
+            // Жёсткая ссылка — второе имя того же файла: владелец, DACL и
+            // атрибуты принадлежат файлу, а не имени, и смена задела бы все
+            // ссылки, включая лежащие вне цели. У файла с несколькими
+            // ссылками права не меняются вовсе — удаление открывается через
+            // родительский каталог: `FILE_DELETE_CHILD` разрешает убрать имя,
+            // не трогая сам файл, а каталог жёсткой ссылкой быть не может.
+            match link_count_of(path) {
+                Some(1) => {
+                    // Сначала владение, потом права: без владения WRITE_DAC
+                    // недоступен, и второй шаг был бы пустой тратой времени.
+                    if security::take_ownership(path, guard).is_ok() {
+                        outcome.notes.push(Note::OwnershipTaken {
+                            path: path.to_string_lossy(),
+                        });
+                    }
+                    if security::grant_full_control(path, guard).is_ok() {
+                        outcome.notes.push(Note::AccessGranted {
+                            path: path.to_string_lossy(),
+                        });
+                    }
+                }
+                _ => {
+                    if let Some(parent) = repair_parent(path, guard) {
+                        outcome.notes.push(Note::DeleteViaParent {
+                            path: parent.to_string_lossy(),
+                        });
+                    }
+                }
             }
             match open_for_delete(path) {
                 Ok(handle) => handle,
@@ -536,6 +564,13 @@ fn try_delete(
             // fallback запрашиваем дополнительные права, не мешая обычному
             // удалению файлов, у которых есть DELETE, но нет WRITE_ATTRIBUTES.
             if attributes(&handle).is_ok_and(|attrs| attrs.is_read_only()) {
+                // Снятие read-only тоже общее на все ссылки: у файла с
+                // несколькими именами атрибут не трогаем вовсе. Современный
+                // путь (EX с IGNORE_READONLY) сюда не доходит, поэтому отказ
+                // честнее правки чужих ссылок.
+                if hard_links(&handle).is_none_or(|links| links > 1) {
+                    return DeleteStep::Retry(NtError(super::error::ERROR_SHARED_LINKS));
+                }
                 use windows::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
                 handle = match super::handle::open_with(
                     path,
@@ -573,6 +608,36 @@ fn try_delete(
         return DeleteStep::Retry(NtError(windows::Win32::Foundation::ERROR_DELETE_PENDING.0));
     }
     DeleteStep::Done
+}
+
+/// Число жёстких ссылок файла. `None` — определить не удалось, и тогда файл
+/// тоже не трогаем: в вопросах общих прав неизвестность опаснее отказа.
+fn link_count_of(path: &NtPath) -> Option<u32> {
+    let handle = open_for_read(path).ok()?;
+    hard_links(&handle)
+}
+
+/// Даёт родительскому каталогу право удалять своих детей. Возвращает
+/// каталог, если доступ выдан. Маршрут применим, только когда родитель
+/// лежит внутри цели: у файла-цели родитель снаружи, и его DACL менять
+/// нельзя. Владение каталогом меняется лишь если без него не выдать права —
+/// каталоги жёсткими ссылками не бывают.
+fn repair_parent(path: &NtPath, guard: Option<&Containment>) -> Option<NtPath> {
+    let parent = path.parent(1)?;
+    let guard = guard?;
+    let handle = open_for_read(&parent).ok()?;
+    if !guard.holds(&handle) {
+        return None;
+    }
+    if security::grant_delete_child(&parent, Some(guard)).is_ok() {
+        return Some(parent);
+    }
+    if security::take_ownership(&parent, Some(guard)).is_ok()
+        && security::grant_delete_child(&parent, Some(guard)).is_ok()
+    {
+        return Some(parent);
+    }
+    None
 }
 
 /// POSIX-вариант: снимает read-only сам, поэтому работает с защищёнными
@@ -725,6 +790,115 @@ mod tests {
         assert!(base.join("a.txt").exists());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_file_that_vanished_early_is_not_counted_as_removed() {
+        // Регрессия отчётности: файл исчез между сканированием и удалением по
+        // чужой воле — RAZE не удаляла его и не освобождала его байты.
+        let base = scratch("vanished-count");
+        let file = base.join("gone.txt");
+        std::fs::write(&file, b"here").unwrap();
+        let path = NtPath::new(&file).unwrap();
+        std::fs::remove_file(&file).unwrap();
+
+        let mut outcome = Outcome::default();
+        remove_leaf(
+            &path,
+            EntryKind::File,
+            4,
+            &RemoveOptions::default(),
+            None,
+            &mut outcome,
+            true,
+        );
+        assert!(!outcome.failed());
+        assert!(matches!(outcome.notes.first(), Some(Note::Vanished { .. })));
+        assert_eq!(outcome.removed_files, 0);
+        assert_eq!(outcome.freed_bytes, 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn hard_link_count_is_visible_on_the_handle() {
+        let base = scratch("links-count");
+        let one = base.join("one.txt");
+        std::fs::write(&one, b"x").unwrap();
+        let path = NtPath::new(&one).unwrap();
+        assert_eq!(link_count_of(&path), Some(1));
+        if std::fs::hard_link(&one, base.join("two.txt")).is_ok() {
+            assert_eq!(link_count_of(&path), Some(2));
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_hard_link_is_deleted_without_touching_the_shared_file() {
+        // «Системный файл» вне цели и жёсткая ссылка на него внутри.
+        // Файл защищён от удаления, а его DACL менять нельзя: он общий.
+        // RAZE обязан открыть удаление через родителя ссылки, не трогая файл.
+        use windows::Win32::Storage::FileSystem::{
+            FILE_ALL_ACCESS, FILE_DELETE_CHILD, FILE_GENERIC_READ, WRITE_DAC, WRITE_OWNER,
+        };
+        let base = scratch("hardlink-shared");
+        let tree = base.join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        let victim = base.join("victim.txt");
+        std::fs::write(&victim, b"important").unwrap();
+        let link = tree.join("link.txt");
+        if std::fs::hard_link(&victim, &link).is_err() {
+            // Без жёсткой ссылки тест не имеет смысла и должен это сказать.
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+
+        let victim_path = NtPath::new(&victim).unwrap();
+        let base_path = NtPath::new(&base).unwrap();
+        let tree_path = NtPath::new(&tree).unwrap();
+        // Файл: только чтение плюс право править DACL (чтобы тест мог вернуть
+        // всё назад). У родителя цели забран DELETE_CHILD — первый заход
+        // упрётся в ACCESS_DENIED. У внешнего каталога тоже: иначе проверка
+        // «файл остался защищённым» ничего не доказывала бы. Порядок важен:
+        // защищённый DACL ребёнка замораживает наследование, и только потом
+        // можно урезать родителя — иначе NTFS снесёт у ребёнка наследуемые
+        // ACE вместе с его правами.
+        let file_rights = FILE_GENERIC_READ.0 | WRITE_DAC.0 | WRITE_OWNER.0;
+        security::set_test_dacl(&victim_path, file_rights);
+        security::set_test_dacl(&tree_path, FILE_ALL_ACCESS.0 & !FILE_DELETE_CHILD.0);
+        security::set_test_dacl(&base_path, FILE_ALL_ACCESS.0 & !FILE_DELETE_CHILD.0);
+
+        let outcome = remove_tree(&tree_path, &RemoveOptions::default());
+
+        // Наблюдаемые факты — до восстановления прав, чтобы регрессия не
+        // оставляла после себя ACL-стены.
+        let victim_still_locked = open_for_delete(&victim_path).is_err();
+        security::set_test_dacl(&base_path, FILE_ALL_ACCESS.0);
+        if tree.exists() {
+            security::set_test_dacl(&tree_path, FILE_ALL_ACCESS.0);
+        }
+        security::set_test_dacl(&victim_path, FILE_ALL_ACCESS.0);
+        let bytes = std::fs::read(&victim);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert!(!outcome.failed(), "{:?}", outcome.failures);
+        assert!(!link.exists(), "ссылка обязана исчезнуть");
+        assert!(
+            outcome
+                .notes
+                .iter()
+                .any(|note| matches!(note, Note::DeleteViaParent { .. })),
+            "{:?}",
+            outcome.notes
+        );
+        assert!(!outcome.notes.iter().any(|note| matches!(
+            note,
+            Note::OwnershipTaken { .. } | Note::AccessGranted { .. }
+        )));
+        assert_eq!(bytes.unwrap(), b"important", "второе имя сохранило данные");
+        assert!(
+            victim_still_locked,
+            "DACL общего файла не должен был расшириться"
+        );
     }
 
     #[test]

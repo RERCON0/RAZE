@@ -337,8 +337,10 @@ def release_readme(version: str, commit: str) -> bytes:
             "Run raze-app.exe for the GUI, or raze.exe in a terminal.\n"
             "Windows 11 context menu: raze --install asks for administrator rights once, copies these\n"
             "files into %ProgramFiles%\\RAZE, trusts the pinned package certificate and registers\n"
-            'the "Delete with RAZE" menu entry; raze --uninstall reverts every change.\n'
-            "Dry run: raze -n <path>. Permanent deletion: raze --permanent <path>.\n\n"
+            'the "Delete with RAZE" menu entry (objects that cannot go to the Recycle Bin ask\n'
+            "for confirmation first); raze --uninstall reverts every change.\n"
+            "Dry run: raze -n <path>. Permanent deletion: raze --permanent <path>.\n"
+            "Delete at the next Windows restart: raze --reboot <path>.\n\n"
             "The EXEs have no Authenticode signature. SmartScreen may show 'Windows protected your PC'.\n"
             "For a trusted download from official Releases, choose More info -> Run anyway.\n"
             "RAZE.msix is signed with a self-signed certificate (CN=RERCON RAZE, pinned in raze.exe);\n"
@@ -354,8 +356,10 @@ def release_readme(version: str, commit: str) -> bytes:
             "Запустите raze-app.exe для окна приложения или raze.exe в терминале.\n"
             "Меню Windows 11: raze --install один раз попросит права администратора, скопирует эти\n"
             "файлы в %ProgramFiles%\\RAZE, добавит доверие закреплённому сертификату пакета\n"
-            'и зарегистрирует пункт "Delete with RAZE"; raze --uninstall отменяет всё это.\n'
-            "Сухой прогон: raze -n <путь>. Удаление мимо корзины: raze --permanent <путь>.\n\n"
+            'и зарегистрирует пункт "Delete with RAZE" (безвозвратные объекты сначала спрашивают\n'
+            "подтверждение); raze --uninstall отменяет всё это.\n"
+            "Сухой прогон: raze -n <путь>. Удаление мимо корзины: raze --permanent <путь>.\n"
+            "Удаление при следующей перезагрузке: raze --reboot <путь>.\n\n"
             "EXE пока без Authenticode-подписи. SmartScreen может показать «Windows защитила ваш\n"
             "компьютер»; для доверенного архива из официальных Releases нажмите\n"
             "Подробнее -> Выполнить в любом случае.\n"

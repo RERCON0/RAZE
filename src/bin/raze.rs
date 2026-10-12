@@ -14,8 +14,9 @@ use raze_rs::engine::elevation::{
     build_arguments, is_elevated, needs_elevation, relaunch_elevated, run_elevated_and_wait,
 };
 use raze_rs::engine::path::NtPath;
+use raze_rs::engine::recycle::Disposition;
 use raze_rs::engine::scan::ScanOptions;
-use raze_rs::job::{self, Options};
+use raze_rs::job::{self, Options, RecycleFallback};
 use raze_rs::report::{human_bytes, Report};
 use raze_rs::shell;
 use raze_rs::{banner, i18n, tr, tr_format, TELEGRAM_URL, VERSION};
@@ -44,6 +45,14 @@ struct Cli {
     /// Explicitly request the default Recycle Bin mode where possible.
     #[arg(long, conflicts_with = "permanent")]
     recycle: bool,
+
+    /// Schedule deletion at the next reboot instead of deleting now.
+    #[arg(long, conflicts_with_all = ["permanent", "recycle"])]
+    reboot: bool,
+
+    /// Erase permanently if the Recycle Bin refuses an item; never silent.
+    #[arg(long, conflicts_with_all = ["permanent", "reboot"])]
+    permanent_on_bin_failure: bool,
 
     /// Do not ask for confirmation.
     #[arg(short = 'y', long)]
@@ -171,6 +180,12 @@ fn run(cli: Cli) -> i32 {
 
     let options = Options {
         permanent: cli.permanent,
+        reboot: cli.reboot,
+        recycle_fallback: if cli.permanent_on_bin_failure {
+            RecycleFallback::Permanent
+        } else {
+            RecycleFallback::Never
+        },
         take_ownership: !cli.keep_owners,
         close_locks: cli.close_locks,
         dry_run: cli.dry_run,
@@ -212,8 +227,10 @@ fn run(cli: Cli) -> i32 {
     }
 
     // Подтверждение: из контекстного меню и с --yes вопросов не задаём.
-    // Пробный прогон ничего не меняет, спрашивать нечего.
-    if !cli.dry_run && !cli.yes && !cli.from_shell && !confirm(&planned) {
+    // Пробный прогон ничего не меняет, спрашивать нечего. Из меню клик
+    // остаётся подтверждением только для восстановимых объектов:
+    // безвозвратные и отложенные RAZE показывает диалогом.
+    if !cli.dry_run && !cli.yes && !confirm_before(&cli, &planned) {
         if cli.json {
             let report = Report {
                 cancelled: true,
@@ -545,6 +562,8 @@ fn elevation_arguments<'a>(
     let mut args: Vec<OsString> = vec!["--elevated".into(), "--yes".into()];
     for (enabled, flag) in [
         (cli.permanent, "--permanent"),
+        (cli.reboot, "--reboot"),
+        (cli.permanent_on_bin_failure, "--permanent-on-bin-failure"),
         (cli.recycle, "--recycle"),
         (cli.close_locks, "--close-locks"),
         (cli.keep_owners, "--keep-owners"),
@@ -580,8 +599,9 @@ fn print_plan(targets: &[job::Target], summary: &job::Summary, verbose: u8) {
     println!("\n{}", banner());
     for target in &summary.targets {
         let mode = match target.mode {
-            raze_rs::engine::recycle::Disposition::RecycleBin => tr!("Recycle Bin", "Корзина"),
-            raze_rs::engine::recycle::Disposition::Permanent => tr!("permanent", "безвозвратно"),
+            Disposition::RecycleBin => tr!("Recycle Bin", "Корзина"),
+            Disposition::Permanent => tr!("permanent", "безвозвратно"),
+            Disposition::Reboot => tr!("at the next reboot", "при следующей перезагрузке"),
         };
         println!(
             "{}",
@@ -625,18 +645,20 @@ fn print_plan(targets: &[job::Target], summary: &job::Summary, verbose: u8) {
 fn print_report(report: &Report) {
     for target in &report.targets {
         let mode = match target.disposition {
-            raze_rs::engine::recycle::Disposition::RecycleBin => tr!("Recycle Bin", "Корзина"),
-            raze_rs::engine::recycle::Disposition::Permanent => tr!("permanently", "безвозвратно"),
+            Disposition::RecycleBin => tr!("Recycle Bin", "Корзина"),
+            Disposition::Permanent => tr!("permanently", "безвозвратно"),
+            Disposition::Reboot => tr!("at the next reboot", "при следующей перезагрузке"),
         };
-        let removed = if target.dry_run {
-            tr!("would remove", "будет удалено")
-        } else {
-            tr!("removed", "удалено")
+        let scheduled = target.disposition == Disposition::Reboot;
+        let removed = match (target.dry_run, scheduled) {
+            (true, _) => tr!("would remove", "будет удалено"),
+            (false, true) => tr!("will remove at reboot", "будет удалено при перезагрузке"),
+            (false, false) => tr!("removed", "удалено"),
         };
-        let freed = if target.dry_run {
-            tr!("would free", "будет освобождено")
-        } else {
-            tr!("freed", "освобождено")
+        let freed = match (target.dry_run, scheduled) {
+            (true, _) => tr!("would free", "будет освобождено"),
+            (false, true) => tr!("will free at reboot", "освободится при перезагрузке"),
+            (false, false) => tr!("freed", "освобождено"),
         };
         println!(
             "{}",
@@ -677,6 +699,65 @@ fn print_report(report: &Report) {
         }
     }
     println!("{}", report.summary_line());
+}
+
+/// Подтверждение перед удалением. Интерактивный CLI спрашивает в терминале,
+/// вызов из контекстного меню — диалогом и только о безвозвратных объектах:
+/// клик по меню остаётся подтверждением для того, что попадает в Корзину.
+fn confirm_before(cli: &Cli, targets: &[job::Target]) -> bool {
+    if cli.from_shell {
+        let irreversible: Vec<&job::Target> = targets
+            .iter()
+            .filter(|target| target.refused.is_none() && target.mode != Disposition::RecycleBin)
+            .collect();
+        if irreversible.is_empty() {
+            return true;
+        }
+        return message_box_confirm(&irreversible);
+    }
+    confirm(targets)
+}
+
+/// Диалог подтверждения для безвозвратных целей из контекстного меню:
+/// у отсоединённого процесса нет консоли, поэтому вопрос задаётся окном.
+fn message_box_confirm(targets: &[&job::Target]) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNO,
+    };
+
+    // Показываем первые несколько путей: остальное — счётчиком.
+    let listed = 6;
+    let mut list = String::new();
+    for target in targets.iter().take(listed) {
+        list.push_str(&target.display);
+        list.push('\n');
+    }
+    if targets.len() > listed {
+        list.push_str(&tr_format!(
+            "… and {n} more\n",
+            "… и ещё {n}\n",
+            n = targets.len() - listed
+        ));
+    }
+    let text = tr_format!(
+        "These objects cannot go to the Recycle Bin and will be deleted permanently:\n\n{list}\nDelete them?",
+        "Эти объекты нельзя отправить в Корзину: они будут удалены безвозвратно:\n\n{list}\nУдалить?",
+        list = list
+    );
+    let text = wide(&text);
+    let title = wide("RAZE");
+    unsafe {
+        MessageBoxW(
+            None,
+            windows::core::PCWSTR(text.as_ptr()),
+            windows::core::PCWSTR(title.as_ptr()),
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND | MB_TOPMOST,
+        ) == IDYES
+    }
+}
+
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// Подтверждение показывает ровно то, что будет удалено, и требует явного
@@ -813,6 +894,31 @@ mod tests {
     }
 
     #[test]
+    fn reboot_and_bin_fallback_are_forwarded_to_the_elevated_copy() {
+        let empty: Vec<job::Target> = Vec::new();
+        let cli = Cli::parse_from(["raze", "--reboot", "target"]);
+        let args = elevation_arguments(&cli, &empty);
+        assert!(args.iter().any(|a| a == "--reboot"), "{args:?}");
+
+        let cli = Cli::parse_from(["raze", "--permanent-on-bin-failure", "target"]);
+        let args = elevation_arguments(&cli, &empty);
+        assert!(
+            args.iter().any(|a| a == "--permanent-on-bin-failure"),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn irreconcilable_modes_cannot_be_combined() {
+        assert!(Cli::try_parse_from(["raze", "--reboot", "--permanent", "x"]).is_err());
+        assert!(Cli::try_parse_from(["raze", "--reboot", "--recycle", "x"]).is_err());
+        assert!(
+            Cli::try_parse_from(["raze", "--permanent", "--permanent-on-bin-failure", "x"])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn install_and_uninstall_accept_the_internal_report_file() {
         // Повышенная копия запускается как `--install --lang xx --report-file PATH`:
         // раньше `--install` был exclusive и такой вызов не разбирался.
@@ -883,6 +989,7 @@ mod tests {
                 reusable: true,
                 reason: String::new(),
             },
+            mode: Disposition::RecycleBin,
             refused: None,
         }];
         let cli = Cli::parse_from(["raze", "-y"]);

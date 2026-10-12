@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Format, clippy, tests and release build (Windows x64)
+    runs-on: windows-2025
+    timeout-minutes: 40
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Ensure the required Rust components
+        run: rustup component add rustfmt clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check all targets without warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Check the release tooling for syntax errors
+        run: python -m py_compile scripts/release.py
+      - name: Test the engine, CLI and GUI
+        run: cargo test --locked --workspace --all-targets
+      - name: Build the release executables and the shell extension
+        run: cargo build --locked --release --workspace --target x86_64-pc-windows-msvc
+      - name: Check architecture, subsystem, ASLR, DEP and static CRT
+        run: python scripts/release.py check-binaries target/x86_64-pc-windows-msvc/release

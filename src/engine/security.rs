@@ -121,6 +121,26 @@ pub fn take_ownership(path: &NtPath, guard: Option<&Containment>) -> Result<(), 
 /// администраторов, **не трогая** уже существующие записи: файлы часто
 /// наследуют права от родителя, и сбрасывать их целиком нельзя.
 pub fn grant_full_control(path: &NtPath, guard: Option<&Containment>) -> Result<(), NtError> {
+    grant_rights(
+        path,
+        guard,
+        windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS.0,
+    )
+}
+
+/// Открывает удаление детей каталога: единственный безопасный маршрут для
+/// файла с несколькими жёсткими ссылками, у которого менять DACL нельзя —
+/// владелец и права принадлежат файлу, а не имени. `FILE_DELETE_CHILD` на
+/// родителе разрешает удалить имя, не трогая сам файл.
+pub fn grant_delete_child(path: &NtPath, guard: Option<&Containment>) -> Result<(), NtError> {
+    grant_rights(
+        path,
+        guard,
+        windows::Win32::Storage::FileSystem::FILE_DELETE_CHILD.0,
+    )
+}
+
+fn grant_rights(path: &NtPath, guard: Option<&Containment>, rights: u32) -> Result<(), NtError> {
     let _ = privs::enable_take_ownership();
     let handle: OwnedHandle = open_with(
         path,
@@ -158,9 +178,9 @@ pub fn grant_full_control(path: &NtPath, guard: Option<&Containment>) -> Result<
         }
 
         let entries = [
-            entry(current.as_slice(), TRUSTEE_IS_USER),
-            entry(system.as_slice(), TRUSTEE_IS_WELL_KNOWN_GROUP),
-            entry(administrators.as_slice(), TRUSTEE_IS_ALIAS),
+            entry(current.as_slice(), TRUSTEE_IS_USER, rights),
+            entry(system.as_slice(), TRUSTEE_IS_WELL_KNOWN_GROUP, rights),
+            entry(administrators.as_slice(), TRUSTEE_IS_ALIAS, rights),
         ];
 
         let mut merged: *mut ACL = ptr::null_mut();
@@ -189,9 +209,10 @@ fn backup_semantics() -> windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATT
 fn entry(
     sid: &[u8],
     trustee_type: windows::Win32::Security::Authorization::TRUSTEE_TYPE,
+    rights: u32,
 ) -> EXPLICIT_ACCESS_W {
     EXPLICIT_ACCESS_W {
-        grfAccessPermissions: windows::Win32::Storage::FileSystem::FILE_ALL_ACCESS.0,
+        grfAccessPermissions: rights,
         grfAccessMode: GRANT_ACCESS,
         // Each child is repaired through its own containment-checked handle.
         grfInheritance: NO_INHERITANCE,
@@ -203,6 +224,47 @@ fn entry(
             ptstrName: PWSTR(sid.as_ptr() as *mut u16),
         },
     }
+}
+
+/// Тестовый помощник: защищённый DACL, где у текущего пользователя ровно
+/// перечисленные права. Тесты удаления получают настоящий отказ, а не
+/// смоделированный.
+#[cfg(test)]
+pub(crate) fn set_test_dacl(path: &NtPath, rights: u32) {
+    let open_failed = |error: NtError| {
+        panic!(
+            "set_test_dacl {} ({rights:#x}): {error}",
+            path.to_string_lossy()
+        )
+    };
+    let handle = open_with(
+        path,
+        windows::Win32::Storage::FileSystem::READ_CONTROL
+            | windows::Win32::Storage::FileSystem::WRITE_DAC,
+        backup_semantics(),
+    )
+    .unwrap_or_else(open_failed);
+    let sid = privs::current_user_sid().unwrap();
+    let access = entry(sid.as_slice(), TRUSTEE_IS_USER, rights);
+    let mut acl = ptr::null_mut();
+    unsafe { SetEntriesInAclW(Some(&[access]), None, &mut acl) }
+        .ok()
+        .unwrap();
+    let acl = LocalAcl(acl);
+    unsafe {
+        SetSecurityInfo(
+            handle.raw(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION
+                | windows::Win32::Security::PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(acl.0),
+            None,
+        )
+    }
+    .ok()
+    .unwrap();
 }
 
 #[cfg(test)]
@@ -222,8 +284,7 @@ mod tests {
 
     fn set_access(handle: &OwnedHandle, rights: u32) {
         let sid = privs::current_user_sid().unwrap();
-        let mut access = entry(&sid, TRUSTEE_IS_USER);
-        access.grfAccessPermissions = rights;
+        let access = entry(&sid, TRUSTEE_IS_USER, rights);
         let mut acl = ptr::null_mut();
         unsafe { SetEntriesInAclW(Some(&[access]), None, &mut acl) }
             .ok()

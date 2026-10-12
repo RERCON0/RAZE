@@ -19,9 +19,15 @@ pub struct TargetReport {
     pub disposition: Disposition,
     /// Почему выбран именно такой режим (например, «зарезервированное имя NUL»).
     pub reason: String,
+    /// Корзина отказала: ничего не удалено, согласия на безвозвратное удаление
+    /// не было. Причина — здесь; повтор с явным разрешением выполняет фронтенд.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bin_refused: Option<String>,
     pub removed_files: usize,
     pub removed_directories: usize,
     pub removed_links: usize,
+    /// Освобождено байт. В режиме `reboot` — сколько освободится при
+    /// перезагрузке: сейчас ничего не удалено.
     pub freed_bytes: u64,
     pub notes: Vec<Note>,
     pub failures: Vec<Failure>,
@@ -80,11 +86,19 @@ impl Report {
             return crate::tr!("Cancelled", "Отменено").to_string();
         }
         let dry = self.targets.first().map(|t| t.dry_run).unwrap_or(false);
+        let reboot = self
+            .targets
+            .iter()
+            .any(|t| t.disposition == Disposition::Reboot);
         let failed = self.failures() + self.refused.len();
-        let verb = if dry {
-            crate::tr!("Would remove", "Будет удалено")
-        } else {
-            crate::tr!("Removed", "Удалено")
+        let verb = match (dry, reboot) {
+            (true, true) => crate::tr!(
+                "Would schedule for reboot",
+                "Будет запланировано к перезагрузке"
+            ),
+            (false, true) => crate::tr!("Scheduled for reboot", "Запланировано к перезагрузке"),
+            (true, false) => crate::tr!("Would remove", "Будет удалено"),
+            (false, false) => crate::tr!("Removed", "Удалено"),
         };
         if failed == 0 {
             crate::tr_format!(
@@ -113,6 +127,7 @@ impl Report {
                 native_path: std::path::PathBuf::from(r"C:\tmp\NUL"),
                 disposition: Disposition::Permanent,
                 reason: "reserved name NUL".into(),
+                bin_refused: None,
                 removed_files: 1,
                 removed_directories: 0,
                 removed_links: 0,

@@ -129,6 +129,19 @@ pub fn attributes(handle: &OwnedHandle) -> Result<Attributes, NtError> {
     })
 }
 
+/// Число жёстких ссылок объекта по открытому дескриптору. `None` — система не
+/// ответила; вызывающий обязан трактовать такой объект как общий и не менять
+/// его владельца, DACL или атрибуты: они принадлежат файлу, а не имени, и
+/// правка задела бы все ссылки, включая лежащие вне цели.
+pub fn hard_links(handle: &OwnedHandle) -> Option<u32> {
+    use windows::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(handle.raw(), &mut info) }.ok()?;
+    Some(info.nNumberOfLinks)
+}
+
 /// Окончательный путь объекта по его дескриптору: промежуточные junction и
 /// symlink раскрыты, 8.3-имена и регистр приведены к тем, что лежат на диске.
 /// Дескриптор открыт с `OPEN_REPARSE_POINT`, поэтому у самой ссылки это путь

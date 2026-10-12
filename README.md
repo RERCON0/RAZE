@@ -41,9 +41,10 @@
 > [!TIP]
 > **One click in Explorer, done.** Install the context-menu integration
 > (`raze --install`), right-click any stubborn folder or file, and choose
-> **Delete with RAZE**. The click is the confirmation: nothing else is asked and
-> the main window does not open. The UAC prompt appears only when the object
-> really needs admin rights.
+> **Delete with RAZE**. For anything headed to the Recycle Bin the click is the
+> confirmation: nothing else is asked and the main window does not open. Objects
+> that can only be deleted permanently ask for confirmation first. The UAC
+> prompt appears only when the object really needs admin rights.
 
 > [!NOTE]
 > The `raze` CLI and `raze-app` GUI share the same engine
@@ -78,10 +79,12 @@ bin is full. For the same reason RAZE reads the drive's Recycle Bin settings
 such objects as permanent instead of reporting a Recycle Bin that never
 happened.
 The shell's completion callbacks determine the actual disposition; merely
-queueing an operation is not success. Cancelling a Recycle Bin operation stops
-the batch and never triggers a permanent-delete fallback. Moving to the bin
-does not count as freed space; permanent-delete byte counts are logical-size
-estimates, not measurements of filesystem allocation.
+queueing an operation is not success. A Recycle Bin refusal — cancellation or
+any other shell error — leaves the target in place: without explicit consent
+(`--permanent-on-bin-failure`, or the dialog in the GUI) nothing is deleted
+permanently in its stead. Moving to the bin does not count as freed space;
+permanent-delete byte counts are logical-size estimates, not measurements of
+filesystem allocation.
 
 **Safety rails:** volume roots (`C:\`), the system folders themselves
 (`C:\Windows`, `C:\Program Files`, `C:\ProgramData`, your profile and their
@@ -113,6 +116,9 @@ deleted.
 - **Point-and-select:** pick individual files and folders, not only whole trees.
 - **Preview mode** (`-n`): see the plan — files, folders, links, bytes, problems —
   change nothing.
+- **Deferred removal:** `--reboot` schedules objects for deletion at the next
+  Windows restart — for what cannot be removed right now (Session Manager
+  entries; needs administrator rights).
 - **Elevation on demand:** unprivileged first; a UAC relaunch happens only on
   real `ACCESS_DENIED`.
 - **GUI and CLI, one brain:** egui window with drag-and-drop, per-target
@@ -131,9 +137,12 @@ deleted.
 
 ## Installation
 
-Build the Windows x64 binaries using the [development instructions](#development),
-then run `raze-app.exe` or `raze.exe` straight from the build folder. To add
-**RAZE delete** to Explorer's right-click menu:
+Signed builds are on the [Releases](https://github.com/RERCON0/RAZE/releases)
+page: `raze-windows-x64.zip` with an Ed25519-signed manifest (verify with
+`python scripts/release.py verify`). Building from source also works — see the
+[development instructions](#development). The unpacked `raze-app.exe` or
+`raze.exe` runs straight from its folder. To add
+**Delete with RAZE** to Explorer's right-click menu:
 
 ```powershell
 raze --install
@@ -187,13 +196,17 @@ raze --permanent "D:\old\build"
 # Close programs that hold the files, then remove
 raze -c "C:\temp\locked"
 
+# Schedule removal for the next Windows restart
+raze --reboot "C:\temp\locked"
+
 # Who holds this file?
 raze -L -n "C:\temp\still-in-use.txt"
 ```
 
 Multiple paths at once; quote paths with spaces. Without `-y` RAZE asks for
 confirmation and prints a plan first — from the context menu it does not
-(your click was the confirmation).
+(your click is the confirmation), except for objects that can only be deleted
+permanently: those get a confirmation dialog.
 
 | Argument | Purpose |
 |---|---|
@@ -201,6 +214,8 @@ confirmation and prints a plan first — from the context menu it does not
 | `-n, --dry-run` | Show what would be removed, change nothing |
 | `-p, --permanent` | Remove permanently, bypassing the Recycle Bin |
 | `--recycle` | Try the Recycle Bin where supported (the default); never bypass safety refusals |
+| `--reboot` | Delete at the next Windows restart instead of now (Session Manager entry; needs administrator rights) |
+| `--permanent-on-bin-failure` | Erase permanently if the Recycle Bin refuses an item (by default the target stays) |
 | `-y, --yes` | Do not ask for confirmation |
 | `-c, --close-locks` | Send `WM_CLOSE` to programs holding the files |
 | `--keep-owners` | Never take ownership or change access rights |

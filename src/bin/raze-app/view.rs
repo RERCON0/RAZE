@@ -29,7 +29,7 @@ impl RazeApp {
                     .inner_margin(egui::Margin::symmetric(26.0, 18.0)),
             )
             .show(ctx, |ui| {
-                if matches!(self.phase, Phase::Confirming(_)) {
+                if matches!(self.phase, Phase::Confirming(_) | Phase::ConfirmingFallback) {
                     ui.disable();
                 }
                 let width = ui.available_width().min(style::CONTENT_WIDTH);
@@ -57,8 +57,10 @@ impl RazeApp {
                     );
                 });
             });
-        if let Phase::Confirming(confirm) = self.phase {
-            self.render_confirm(ctx, confirm);
+        match self.phase {
+            Phase::Confirming(confirm) => self.render_confirm(ctx, confirm),
+            Phase::ConfirmingFallback => self.render_fallback(ctx),
+            _ => {}
         }
         #[cfg(windows)]
         self.resize_edges(ctx);
@@ -381,20 +383,20 @@ impl RazeApp {
                                 ))
                                 .size(11.5),
                             );
-                            style::badge(
-                                ui,
-                                if target.verdict.reusable {
-                                    tr!("recycle", "корзина")
-                                } else {
-                                    tr!("permanent", "навсегда")
-                                },
-                                if target.verdict.reusable {
-                                    ui.visuals().weak_text_color()
-                                } else {
-                                    ui.visuals().warn_fg_color
-                                },
-                            )
-                            .on_hover_text(&target.verdict.reason);
+                            let (badge, badge_color) = match target.mode {
+                                Disposition::RecycleBin => {
+                                    (tr!("recycle", "корзина"), ui.visuals().weak_text_color())
+                                }
+                                Disposition::Permanent => {
+                                    (tr!("permanent", "навсегда"), ui.visuals().warn_fg_color)
+                                }
+                                Disposition::Reboot => (
+                                    tr!("at next reboot", "при перезагрузке"),
+                                    ui.visuals().warn_fg_color,
+                                ),
+                            };
+                            style::badge(ui, badge, badge_color)
+                                .on_hover_text(&target.verdict.reason);
                             if target.summary.troubled > 0 {
                                 style::badge(
                                     ui,
@@ -456,19 +458,20 @@ impl RazeApp {
         let enabled = idle && total.targets > 0;
         style::tag(ui, tr!("removal mode", "режим удаления"));
         ui.add_enabled_ui(idle, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 for (mode, label) in [
                     (
                         Confirm::Recycle,
                         tr!("recycle if possible", "корзина, если возможно"),
                     ),
+                    (Confirm::Reboot, tr!("at next reboot", "при перезагрузке")),
                     (Confirm::Permanent, tr!("permanent", "безвозвратно")),
                 ] {
-                    // The irreversible choice reads red when picked.
-                    let active = if mode == Confirm::Permanent {
-                        ui.visuals().error_fg_color
-                    } else {
-                        ui.visuals().hyperlink_color
+                    // Необратимые и отложенные режимы читаются тревожно, когда выбраны.
+                    let active = match mode {
+                        Confirm::Recycle => ui.visuals().hyperlink_color,
+                        Confirm::Reboot => ui.visuals().warn_fg_color,
+                        Confirm::Permanent => ui.visuals().error_fg_color,
                     };
                     let response = style::choice(ui, label, self.mode == mode, active);
                     if response.clicked() {
@@ -496,6 +499,12 @@ impl RazeApp {
                 "Без Корзины. Отменить удаление нельзя."
             )
             .to_string()
+        } else if self.mode == Confirm::Reboot {
+            tr!(
+                "Objects will be deleted at the next Windows restart. Nothing changes until then.",
+                "Объекты будут удалены при следующей перезагрузке Windows. До неё ничего не меняется."
+            )
+            .to_string()
         } else if total.permanent > 0 {
             tr_format!(
                 "Cannot be recycled: {n} target(s). These will be deleted permanently.",
@@ -509,17 +518,13 @@ impl RazeApp {
             )
             .to_string()
         };
-        ui.label(
-            RichText::new(warning)
-                .size(11.5)
-                .color(if self.mode == Confirm::Permanent {
-                    ui.visuals().error_fg_color
-                } else if total.permanent > 0 {
-                    ui.visuals().warn_fg_color
-                } else {
-                    ui.visuals().weak_text_color()
-                }),
-        );
+        let warning_color = match self.mode {
+            Confirm::Permanent => ui.visuals().error_fg_color,
+            Confirm::Reboot => ui.visuals().warn_fg_color,
+            Confirm::Recycle if total.permanent > 0 => ui.visuals().warn_fg_color,
+            Confirm::Recycle => ui.visuals().weak_text_color(),
+        };
+        ui.label(RichText::new(warning).size(11.5).color(warning_color));
         ui.add_space(12.0);
         ui.horizontal_wrapped(|ui| {
             ui.label(tr_format!(
@@ -554,10 +559,10 @@ impl RazeApp {
         ui.add_space(6.0);
         // A disabled button keeps its accent and egui fades it: painting it in the
         // hairline colour made the main action all but invisible until a target was added.
-        let color = if self.mode == Confirm::Permanent {
-            ui.visuals().error_fg_color
-        } else {
-            ui.visuals().hyperlink_color
+        let color = match self.mode {
+            Confirm::Permanent => ui.visuals().error_fg_color,
+            Confirm::Reboot => ui.visuals().warn_fg_color,
+            Confirm::Recycle => ui.visuals().hyperlink_color,
         };
         // add_sized centres the label, as SNATCH's "▶ DOWNLOAD"; min_size would leave it left-aligned.
         let primary = ui
@@ -694,43 +699,56 @@ impl RazeApp {
                         }
                         ui.add(egui::Label::new(&target.display).truncate())
                             .on_hover_text(&target.display);
-                        let permanent = confirm == Confirm::Permanent || !target.verdict.reusable;
-                        ui.label(
-                            RichText::new(if permanent {
-                                tr!("→ permanent", "→ навсегда")
-                            } else {
-                                tr!("→ Recycle Bin", "→ в Корзину")
-                            })
-                            .size(11.5)
-                            .color(if permanent {
-                                ui.visuals().error_fg_color
-                            } else {
-                                ui.visuals().hyperlink_color
-                            }),
-                        );
+                        let (line, line_color) = match confirm {
+                            Confirm::Reboot => (
+                                tr!("→ at next reboot", "→ при следующей перезагрузке"),
+                                ui.visuals().warn_fg_color,
+                            ),
+                            Confirm::Permanent => (
+                                tr!("→ permanent", "→ навсегда"),
+                                ui.visuals().error_fg_color,
+                            ),
+                            Confirm::Recycle if !target.verdict.reusable => (
+                                tr!("→ permanent", "→ навсегда"),
+                                ui.visuals().error_fg_color,
+                            ),
+                            Confirm::Recycle => (
+                                tr!("→ Recycle Bin", "→ в Корзину"),
+                                ui.visuals().hyperlink_color,
+                            ),
+                        };
+                        ui.label(RichText::new(line).size(11.5).color(line_color));
                         ui.add_space(4.0);
                     }
                 });
             ui.add_space(8.0);
             let irreversible = confirm == Confirm::Permanent || total.permanent > 0;
-            ui.label(
-                RichText::new(if irreversible {
+            let (warning, warning_color) = if confirm == Confirm::Reboot {
+                (
+                    tr!(
+                        "Objects will be deleted at the next Windows restart. Until then nothing changes.",
+                        "Объекты будут удалены при следующей перезагрузке Windows. До неё ничего не меняется."
+                    ),
+                    ui.visuals().warn_fg_color,
+                )
+            } else if irreversible {
+                (
                     tr!(
                         "Permanently deleted objects cannot be restored from the Recycle Bin.",
                         "Удалённые навсегда объекты нельзя восстановить из Корзины."
-                    )
-                } else {
+                    ),
+                    ui.visuals().error_fg_color,
+                )
+            } else {
+                (
                     tr!(
                         "Selected targets will be sent to the Recycle Bin.",
                         "Выбранные цели будут отправлены в Корзину."
-                    )
-                })
-                .color(if irreversible {
-                    ui.visuals().error_fg_color
-                } else {
-                    ui.visuals().weak_text_color()
-                }),
-            );
+                    ),
+                    ui.visuals().weak_text_color(),
+                )
+            };
+            ui.label(RichText::new(warning).color(warning_color));
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 let width = (ui.available_width() - 8.0) / 2.0;
@@ -740,10 +758,11 @@ impl RazeApp {
                 {
                     self.phase = Phase::Idle;
                 }
-                let color = if irreversible {
-                    ui.visuals().error_fg_color
-                } else {
-                    ui.visuals().hyperlink_color
+                let color = match confirm {
+                    Confirm::Permanent => ui.visuals().error_fg_color,
+                    Confirm::Reboot => ui.visuals().warn_fg_color,
+                    Confirm::Recycle if irreversible => ui.visuals().error_fg_color,
+                    Confirm::Recycle => ui.visuals().hyperlink_color,
                 };
                 if ui
                     .add_sized(
@@ -759,6 +778,99 @@ impl RazeApp {
                             ..self.base_options()
                         },
                     );
+                }
+            });
+        });
+    }
+
+    /// Корзина отказала: ничего не удалено, спросить о безвозвратном удалении.
+    /// Те же цели, что не приняла оболочка, — остальные в плане не тронуты.
+    fn render_fallback(&mut self, ctx: &egui::Context) {
+        let screen = ctx.screen_rect();
+        let layer = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::new("modal-dimmer"),
+        ));
+        layer.rect_filled(
+            screen,
+            0.0,
+            Color32::from_black_alpha(if self.dark { 170 } else { 75 }),
+        );
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.dismiss_fallback();
+            return;
+        }
+        let width = (screen.width() - 80.0).min(440.0);
+        egui::Window::new(style::window_title(tr!(
+            "Recycle Bin refused",
+            "Корзина отказала"
+        )))
+        .id(egui::Id::new("bin-refused"))
+        .order(egui::Order::Foreground)
+        .collapsible(false)
+        .resizable(false)
+        .movable(false)
+        .default_width(width)
+        .max_width(width)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new(tr_format!(
+                    "{n} target(s) could not be sent to the Recycle Bin. Nothing has been deleted.",
+                    "{n} целей не удалось отправить в Корзину. Ничего не удалено.",
+                    n = self.fallback.len()
+                ))
+                .size(15.0),
+            );
+            ui.add_space(8.0);
+            egui::ScrollArea::vertical()
+                .id_salt("fallback-targets")
+                .max_height((screen.height() * 0.25).min(180.0))
+                .show_terminal(ui, |ui| {
+                    for target in &self.plan {
+                        let listed = target
+                            .path
+                            .as_ref()
+                            .is_some_and(|p| self.fallback.contains(&p.to_path()));
+                        if !listed {
+                            continue;
+                        }
+                        ui.add(egui::Label::new(&target.display).truncate())
+                            .on_hover_text(&target.display);
+                        ui.add_space(4.0);
+                    }
+                });
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(tr!(
+                    "Deleting them permanently cannot be undone.",
+                    "Безвозвратное удаление отменить нельзя."
+                ))
+                .color(ui.visuals().error_fg_color),
+            );
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let width = (ui.available_width() - 8.0) / 2.0;
+                if ui
+                    .add_sized(
+                        [width, 40.0],
+                        egui::Button::new(tr!("leave as is", "оставить как есть")),
+                    )
+                    .clicked()
+                {
+                    self.dismiss_fallback();
+                }
+                if ui
+                    .add_sized(
+                        [width, 40.0],
+                        style::accent_button(
+                            tr!("delete permanently", "удалить безвозвратно"),
+                            ui.visuals().error_fg_color,
+                        ),
+                    )
+                    .clicked()
+                {
+                    self.confirm_fallback(ctx);
                 }
             });
         });

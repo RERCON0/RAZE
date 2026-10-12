@@ -24,6 +24,13 @@ pub const ERROR_BUSY: u32 = 170;
 pub const ERROR_USER_MAPPED_FILE: u32 = 1224;
 pub const ERROR_PRIVILEGE_NOT_HELD: u32 = 1314;
 pub const ERROR_FILE_IS_OFFLINE: u32 = 4350;
+/// Объектов больше, чем влезает в значение реестра при отложенном удалении.
+pub const ERROR_FILE_TOO_LARGE: u32 = 223;
+/// Значение реестра не той формы, которую мы готовы дополнить.
+pub const ERROR_INVALID_DATA: u32 = 13;
+/// Файл с несколькими жёсткими ссылками: общие владелец, DACL и атрибуты
+/// принадлежат файлу целиком, а не имени, и менять их нельзя.
+pub const ERROR_SHARED_LINKS: u32 = 0xE0A5_0002;
 /// Application-defined code (bit 29): the object's location is outside the
 /// allowed deletion tree, protected, or cannot be verified safely.
 pub const ERROR_OUTSIDE_TREE: u32 = 0xE0A5_0001;
@@ -108,6 +115,14 @@ impl NtError {
             ERROR_FILE_IS_OFFLINE => Some(tr!(
                 "file is not present on the disk",
                 "файл отсутствует на диске"
+            )),
+            ERROR_FILE_TOO_LARGE => Some(tr!(
+                "too many objects to schedule for the next reboot",
+                "слишком много объектов для удаления при следующей перезагрузке"
+            )),
+            ERROR_SHARED_LINKS => Some(tr!(
+                "the file has multiple hard links; its owner, ACL and attributes are not modified",
+                "у файла несколько жёстких ссылок: владелец, права и атрибуты не меняются"
             )),
             ERROR_PENDING | ERROR_BUSY => Some(tr!("operation is busy", "операция занята")),
             ERROR_DELETE_PENDING => Some(tr!("deletion is still pending", "удаление ещё не завершено")),

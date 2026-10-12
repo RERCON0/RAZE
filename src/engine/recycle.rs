@@ -511,42 +511,14 @@ fn drive_type(path: &NtPath) -> Result<u32, NtError> {
     }
 }
 
-/// Что RAZE сделала с объектом: убрала в Корзину или стёрла безвозвратно.
+/// Что RAZE сделала с объектом: убрала в Корзину, стёрла безвозвратно или
+/// назначила удаление при следующей перезагрузке.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Disposition {
     RecycleBin,
     Permanent,
-}
-
-/// Recycles supported objects, otherwise removes them permanently. An actual
-/// Shell error permits fallback, but cancellation must never trigger deletion.
-pub fn remove(
-    path: &NtPath,
-    options: &super::remove::RemoveOptions,
-    prefer_recycle: bool,
-) -> (Disposition, Option<super::remove::Outcome>) {
-    let verdict = is_recyclable(path);
-    if prefer_recycle && verdict.reusable && !options.dry_run {
-        match send_to_recycle(&[path.to_path()]) {
-            Ok(disposition) => return (disposition, None),
-            Err(error) if error.code() == ERROR_ABORTED => {
-                let mut outcome = super::remove::Outcome::default();
-                outcome.failures.push(super::remove::Failure {
-                    path: path.to_string_lossy(),
-                    code: error.code(),
-                    message: error.message(),
-                    holders: Vec::new(),
-                });
-                return (Disposition::RecycleBin, Some(outcome));
-            }
-            Err(_) => {}
-        }
-    }
-    (
-        Disposition::Permanent,
-        Some(super::remove::remove_tree(path, options)),
-    )
+    Reboot,
 }
 
 #[cfg(test)]

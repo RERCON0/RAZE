@@ -7,6 +7,7 @@ pub mod handle;
 pub mod locker;
 pub mod path;
 pub mod privs;
+pub mod reboot;
 pub mod recycle;
 pub mod remove;
 pub mod scan;

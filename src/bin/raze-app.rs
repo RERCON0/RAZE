@@ -10,7 +10,7 @@ use eframe::egui;
 use raze_rs::engine::elevation::{build_arguments, is_elevated, relaunch_elevated};
 use raze_rs::engine::path::NtPath;
 use raze_rs::engine::recycle::Disposition;
-use raze_rs::job::{self, Options, Target};
+use raze_rs::job::{self, Options, RecycleFallback, Target};
 use raze_rs::report::{human_bytes, Report};
 use raze_rs::{i18n, tr, tr_format, TELEGRAM_URL, VERSION};
 
@@ -54,6 +54,7 @@ fn fatal_dialog(title: &str, text: &str) {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Confirm {
     Recycle,
+    Reboot,
     Permanent,
 }
 
@@ -62,6 +63,8 @@ enum Phase {
     Idle,
     Planning,
     Confirming(Confirm),
+    /// Корзина отказала: без согласия ничего не удалено, спросить о безвозвратном.
+    ConfirmingFallback,
     Removing,
 }
 
@@ -106,6 +109,8 @@ struct RazeApp {
     status_error: bool,
     show_log: bool,
     close_locks: bool,
+    /// Цели, которые Корзина отказалась принять: ждут решения пользователя.
+    fallback: Vec<PathBuf>,
     running_options: Options,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
@@ -144,6 +149,7 @@ impl RazeApp {
             status_error,
             show_log: false,
             close_locks: false,
+            fallback: Vec::new(),
             running_options: Options::default(),
             tx,
             rx,
@@ -224,14 +230,21 @@ impl RazeApp {
             .iter()
             .zip(&self.rows)
             .filter(|(t, r)| r.selected && t.refused.is_none())
-            .map(|(t, _)| Target {
-                display: t.display.clone(),
-                path: t.path.clone(),
-                entries: Vec::new(),
-                summary: t.summary.clone(),
-                verdict: t.verdict.clone(),
-                refused: t.refused.clone(),
+            .map(|(t, _)| clone_target(t))
+            .collect()
+    }
+
+    /// Цели, которым Корзина отказала: именно их предлагается стереть
+    /// безвозвратно после явного согласия.
+    fn fallback_targets(&self) -> Vec<Target> {
+        self.plan
+            .iter()
+            .filter(|t| {
+                t.path
+                    .as_ref()
+                    .is_some_and(|p| self.fallback.contains(&p.to_path()))
             })
+            .map(clone_target)
             .collect()
     }
 
@@ -255,16 +268,26 @@ impl RazeApp {
     fn base_options(&self) -> Options {
         Options {
             permanent: self.mode == Confirm::Permanent,
+            reboot: self.mode == Confirm::Reboot,
             close_locks: self.close_locks,
             ..Options::default()
         }
     }
 
     fn start_removal(&mut self, ctx: &egui::Context, options: Options) {
+        let targets = self.selected_targets();
+        self.start_removal_targets(ctx, targets, options);
+    }
+
+    fn start_removal_targets(
+        &mut self,
+        ctx: &egui::Context,
+        targets: Vec<Target>,
+        options: Options,
+    ) {
         if self.phase.working() {
             return;
         }
-        let targets = self.selected_targets();
         if targets.is_empty() {
             self.phase = Phase::Idle;
             return;
@@ -290,6 +313,7 @@ impl RazeApp {
             let disposition = match target.disposition {
                 Disposition::RecycleBin => tr!("Recycle Bin", "Корзина"),
                 Disposition::Permanent => tr!("permanent", "безвозвратно"),
+                Disposition::Reboot => tr!("at the next reboot", "при следующей перезагрузке"),
             };
             self.log(tr_format!(
                 "{path} — {mode}: {files} files, {dirs} folders, {size}",
@@ -357,6 +381,42 @@ impl RazeApp {
             self.plan = kept;
             self.rows = rows;
         }
+
+        // Корзина отказала: без явного согласия объект остался на месте.
+        // Предлагаем решение диалогом, а не удаляем за спиной пользователя.
+        if !self.running_options.dry_run
+            && !report.cancelled
+            && self.running_options.recycle_fallback == RecycleFallback::Never
+        {
+            let refused: Vec<PathBuf> = report
+                .targets
+                .iter()
+                .filter(|target| target.bin_refused.is_some())
+                .map(|target| target.native_path.clone())
+                .collect();
+            if !refused.is_empty() {
+                self.fallback = refused;
+                self.phase = Phase::ConfirmingFallback;
+            }
+        }
+    }
+
+    /// Согласие на безвозвратное удаление целей, которым отказала Корзина.
+    fn confirm_fallback(&mut self, ctx: &egui::Context) {
+        let targets = self.fallback_targets();
+        self.fallback.clear();
+        self.phase = Phase::Idle;
+        let options = Options {
+            permanent: true,
+            recycle_fallback: RecycleFallback::Never,
+            ..self.running_options.clone()
+        };
+        self.start_removal_targets(ctx, targets, options);
+    }
+
+    fn dismiss_fallback(&mut self) {
+        self.fallback.clear();
+        self.phase = Phase::Idle;
     }
 
     fn relaunch_as_admin(&mut self, paths: &[PathBuf]) {
@@ -434,6 +494,12 @@ fn elevation_arguments(paths: &[PathBuf], options: &Options) -> OsString {
     if options.permanent {
         args.push("--permanent".into());
     }
+    if options.reboot {
+        args.push("--reboot".into());
+    }
+    if options.recycle_fallback == RecycleFallback::Permanent {
+        args.push("--permanent-on-bin-failure".into());
+    }
     if options.close_locks {
         args.push("--close-locks".into());
     }
@@ -443,6 +509,18 @@ fn elevation_arguments(paths: &[PathBuf], options: &Options) -> OsString {
     args.extend(["--lang".into(), i18n::language().code().into(), "--".into()]);
     args.extend(paths.iter().map(|p| p.as_os_str().to_os_string()));
     build_arguments(&args)
+}
+
+fn clone_target(target: &Target) -> Target {
+    Target {
+        display: target.display.clone(),
+        path: target.path.clone(),
+        entries: Vec::new(),
+        summary: target.summary.clone(),
+        verdict: target.verdict.clone(),
+        mode: target.mode,
+        refused: target.refused.clone(),
+    }
 }
 
 fn note_display(note: &raze_rs::engine::remove::Note) -> String {
@@ -465,6 +543,14 @@ fn note_display(note: &raze_rs::engine::remove::Note) -> String {
         Note::DeletePending { path } => {
             tr_format!("Delete pending: {path}", "Ожидает удаления: {path}")
         }
+        Note::RecycleRefused { reason } => tr_format!(
+            "Recycle Bin refused: {reason}",
+            "Корзина отказала: {reason}"
+        ),
+        Note::DeleteViaParent { path } => tr_format!(
+            "Deletion allowed via the parent folder: {path}",
+            "Удаление разрешено через папку: {path}"
+        ),
     }
 }
 
@@ -545,6 +631,7 @@ mod tests {
                 reusable: true,
                 reason: String::new(),
             },
+            mode: Disposition::RecycleBin,
             refused: None,
         }
     }
@@ -555,6 +642,7 @@ mod tests {
             native_path: target.path.as_ref().unwrap().to_path(),
             disposition: Disposition::RecycleBin,
             reason: String::new(),
+            bin_refused: None,
             removed_files: 1,
             removed_directories: 0,
             removed_links: 0,
@@ -628,6 +716,36 @@ mod tests {
         assert_eq!(app.plan.len(), 1);
         assert!(app.rows[0].selected && app.rows[0].expanded);
         assert!(matches!(app.phase, Phase::Idle));
+    }
+
+    #[test]
+    fn a_refused_recycle_bin_asks_before_permanent_deletion() {
+        let mut app = RazeApp::new(&egui::Context::default());
+        app.plan
+            .push(target(PathBuf::from(r"C:\raze-ui-test\bin-refused")));
+        app.rows.push(RowState {
+            selected: true,
+            expanded: false,
+        });
+        let mut report = completed(&app.plan[0], false);
+        report.removed_files = 0;
+        report.freed_bytes = 0;
+        report.bin_refused = Some("denied".into());
+        report.failures.push(raze_rs::engine::remove::Failure {
+            path: report.path.clone(),
+            code: 31,
+            message: String::new(),
+            holders: Vec::new(),
+        });
+        app.handle_report(Report {
+            targets: vec![report],
+            ..Default::default()
+        });
+
+        assert!(matches!(app.phase, Phase::ConfirmingFallback));
+        assert_eq!(app.fallback.len(), 1);
+        assert_eq!(app.plan.len(), 1, "цель остаётся для повтора");
+        assert!(app.status_error);
     }
 
     #[test]
