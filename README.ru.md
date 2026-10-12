@@ -261,7 +261,7 @@ raze --lang ru --help
 
 ## Разработка
 
-Windows x64, Rust 1.88+, Visual Studio Build Tools (MSVC + Windows SDK
+Windows x64, Rust 1.99.0 (закреплён в `rust-toolchain.toml`), Visual Studio Build Tools (MSVC + Windows SDK
 10.0.26100) и `windres` (входит в MSYS2/MinGW-w64) для ресурсов иконок:
 
 ```powershell

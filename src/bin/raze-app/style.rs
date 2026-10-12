@@ -149,7 +149,7 @@ pub fn terminal_visuals(dark: bool) -> egui::Visuals {
     v.window_rounding = egui::Rounding::ZERO;
     v.menu_rounding = egui::Rounding::ZERO;
     v.window_fill = bg_lift;
-    v.window_stroke = Stroke::new(1.0, line);
+    v.window_stroke = Stroke::new(1.0_f32, line);
     v.window_shadow = egui::Shadow::NONE;
     v.popup_shadow = egui::Shadow::NONE;
     v.panel_fill = bg;
@@ -160,7 +160,7 @@ pub fn terminal_visuals(dark: bool) -> egui::Visuals {
     v.warn_fg_color = warn;
     v.error_fg_color = err;
     v.selection.bg_fill = Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 45);
-    v.selection.stroke = Stroke::new(1.0, accent);
+    v.selection.stroke = Stroke::new(1.0_f32, accent);
     for widget in [
         &mut v.widgets.noninteractive,
         &mut v.widgets.inactive,
@@ -178,24 +178,24 @@ pub fn terminal_visuals(dark: bool) -> egui::Visuals {
     // to be the page background: a transparent fill tints towards black and
     // makes weak text *darker* than normal text in the light theme.
     v.widgets.noninteractive.weak_bg_fill = bg;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, line);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text_dim);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, line);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, text_dim);
 
     v.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, line);
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, text_dim);
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, line);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, text_dim);
 
     v.widgets.hovered.weak_bg_fill = Color32::TRANSPARENT;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, line_bright);
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0, text);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, line_bright);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, text);
 
     v.widgets.active.weak_bg_fill = field;
-    v.widgets.active.bg_stroke = Stroke::new(1.0, accent);
-    v.widgets.active.fg_stroke = Stroke::new(1.0, text);
+    v.widgets.active.bg_stroke = Stroke::new(1.0_f32, accent);
+    v.widgets.active.fg_stroke = Stroke::new(1.0_f32, text);
 
     v.widgets.open.weak_bg_fill = Color32::TRANSPARENT;
-    v.widgets.open.bg_stroke = Stroke::new(1.0, line_bright);
-    v.widgets.open.fg_stroke = Stroke::new(1.0, text);
+    v.widgets.open.bg_stroke = Stroke::new(1.0_f32, line_bright);
+    v.widgets.open.fg_stroke = Stroke::new(1.0_f32, text);
     v
 }
 
@@ -211,7 +211,7 @@ pub fn window_title(text: &str) -> RichText {
 
 pub fn accent_button(text: &str, accent: Color32) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text.to_owned()).color(accent))
-        .stroke(Stroke::new(1.0, accent))
+        .stroke(Stroke::new(1.0_f32, accent))
         .fill(Color32::TRANSPARENT)
 }
 
@@ -280,7 +280,7 @@ pub fn slow_spinner(ui: &mut egui::Ui) {
         .collect();
     ui.painter().add(egui::Shape::line(
         points,
-        Stroke::new(3.0, ui.visuals().strong_text_color()),
+        Stroke::new(3.0_f32, ui.visuals().strong_text_color()),
     ));
 }
 
@@ -292,7 +292,7 @@ pub fn tag(ui: &mut egui::Ui, text: &str) {
 pub fn rule(ui: &mut egui::Ui) {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
-    let stroke = Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
+    let stroke = Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color);
     let (dash, gap) = (4.0, 3.0);
     let mut x = rect.left();
     while x < rect.right() {
@@ -310,7 +310,7 @@ pub fn rule(ui: &mut egui::Ui) {
 
 pub fn badge(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
     egui::Frame::none()
-        .stroke(Stroke::new(1.0, color.gamma_multiply(0.5)))
+        .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.5)))
         .inner_margin(egui::Margin::symmetric(6.0, 2.0))
         .show(ui, |ui| {
             ui.label(RichText::new(text).size(11.0).color(color))

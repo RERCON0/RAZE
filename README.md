@@ -259,7 +259,7 @@ raze --lang ru --help
 
 ## Development
 
-Windows x64, Rust 1.88+, Visual Studio Build Tools (MSVC + Windows SDK
+Windows x64, Rust 1.99.0 (pinned in `rust-toolchain.toml`), Visual Studio Build Tools (MSVC + Windows SDK
 10.0.26100), and `windres` (bundled with MSYS2/MinGW-w64) for the icon
 resources:
 

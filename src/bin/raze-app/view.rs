@@ -274,7 +274,7 @@ impl RazeApp {
         if self.plan.is_empty() {
             egui::Frame::none()
                 .stroke(Stroke::new(
-                    1.0,
+                    1.0_f32,
                     if hovering {
                         ui.visuals().hyperlink_color
                     } else {
@@ -322,7 +322,7 @@ impl RazeApp {
             let card = egui::Frame::none()
                 .fill(ui.visuals().window_fill)
                 .stroke(Stroke::new(
-                    1.0,
+                    1.0_f32,
                     ui.visuals().widgets.inactive.bg_stroke.color,
                 ))
                 .inner_margin(egui::Margin::symmetric(12.0, 10.0))
@@ -445,7 +445,7 @@ impl RazeApp {
             ui.painter().vline(
                 card.response.rect.left() + 0.5,
                 card.response.rect.y_range(),
-                Stroke::new(2.0, color),
+                Stroke::new(2.0_f32, color),
             );
             self.rows[index] = row;
             ui.add_space(4.0);

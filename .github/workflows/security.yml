@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: rustup toolchain install stable --profile minimal
+      - run: rustup toolchain install 1.99.0 --profile minimal
       - name: Install reviewed audit tool with its lockfile
         run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Audit the complete committed dependency graph

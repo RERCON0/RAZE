@@ -487,7 +487,7 @@ mod tests {
             dry_run: true,
             ..Default::default()
         };
-        let targets = plan(&[base.clone()], &options);
+        let targets = plan(std::slice::from_ref(&base), &options);
         let report = execute(&targets, &options);
         assert_eq!(report.removed_total(), 1);
         assert!(base.join("f.txt").exists());
@@ -527,7 +527,7 @@ mod tests {
             ..Default::default()
         };
 
-        let targets = plan(&[file.clone()], &options);
+        let targets = plan(std::slice::from_ref(&file), &options);
         assert_eq!(targets[0].summary.files, 1);
         assert_eq!(targets[0].summary.directories, 0);
         assert_eq!(targets[0].summary.bytes, 5);
@@ -552,7 +552,7 @@ mod tests {
             ..Default::default()
         };
 
-        let targets = plan(&[empty.clone()], &options);
+        let targets = plan(std::slice::from_ref(&empty), &options);
         assert!(has_work(&targets));
         let report = execute(&targets, &options);
         assert!(!report.failed(), "{:?}", report.targets);
@@ -606,7 +606,7 @@ mod tests {
             permanent: true,
             ..Default::default()
         };
-        let targets = plan(&[file.clone()], &options);
+        let targets = plan(std::slice::from_ref(&file), &options);
         let report = execute(&targets, &options);
         assert!(!report.failed(), "{:?}", report.targets);
         assert!(!file.exists());
@@ -619,7 +619,7 @@ mod tests {
         let base = scratch("changed-mode");
         let file = base.join("one.bin");
         std::fs::write(&file, b"keep during preview").unwrap();
-        let mut targets = plan(&[file.clone()], &Options::default());
+        let mut targets = plan(std::slice::from_ref(&file), &Options::default());
         targets[0].verdict.reusable = true;
         let options = Options {
             permanent: true,
@@ -637,7 +637,7 @@ mod tests {
         let base = scratch("problems");
         std::fs::create_dir_all(base.join("sub")).unwrap();
         std::fs::write(base.join("sub/ok.txt"), b"x").unwrap();
-        let targets = plan(&[base.clone()], &Options::default());
+        let targets = plan(std::slice::from_ref(&base), &Options::default());
         let summary = describe(&targets);
         assert_eq!(summary.targets[0].files, 1);
         assert!(summary.targets[0].bytes > 0);
@@ -692,7 +692,7 @@ mod tests {
             reboot: true,
             ..Default::default()
         };
-        let targets = plan(&[base.clone()], &options);
+        let targets = plan(std::slice::from_ref(&base), &options);
         assert!(targets[0].refused.is_none());
         assert_eq!(targets[0].mode, Disposition::Reboot);
 

@@ -239,7 +239,7 @@ impl IClassFactory_Impl for RazeFactory_Impl {
             SERVER_LOCKS.fetch_add(1, Ordering::SeqCst);
         } else {
             // An unmatched unlock must not wrap the counter and pin the DLL forever.
-            let _ = SERVER_LOCKS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |locks| {
+            let _ = SERVER_LOCKS.try_update(Ordering::SeqCst, Ordering::SeqCst, |locks| {
                 locks.checked_sub(1)
             });
         }
@@ -366,7 +366,7 @@ fn module_path() -> Option<PathBuf> {
     // или dllhost.exe), а не эту DLL, и `raze.exe` искался бы не там. Поэтому
     // модуль находится по адресу собственной функции.
     let mut module = HMODULE::default();
-    let anchor = module_path as usize as *const u16;
+    let anchor = module_path as fn() -> Option<PathBuf> as usize as *const u16;
     unsafe {
         GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,

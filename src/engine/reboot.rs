@@ -330,12 +330,12 @@ fn registry_error(error: std::io::Error) -> NtError {
 /// значения, а не строка; пустые строки внутри списка значимы: у пары
 /// «удалить» цель как раз пустая.
 fn parse_multi_sz(bytes: &[u8]) -> Result<Vec<Vec<u16>>, NtError> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(NtError(ERROR_INVALID_DATA));
     }
     let mut items: Vec<Vec<u16>> = Vec::new();
     let mut current: Vec<u16> = Vec::new();
-    for chunk in bytes.chunks_exact(2) {
+    for chunk in bytes.as_chunks::<2>().0 {
         let unit = u16::from_le_bytes([chunk[0], chunk[1]]);
         if unit == 0 {
             items.push(std::mem::take(&mut current));
@@ -351,7 +351,7 @@ fn parse_multi_sz(bytes: &[u8]) -> Result<Vec<Vec<u16>>, NtError> {
     // Записи идут парами «источник, цель»: нечётное число строк — значение
     // не того вида, и дописывание сдвинуло бы пары (чужой источник получил бы
     // нашу цель и был бы переименован, а не удалён).
-    if items.len() % 2 != 0 {
+    if !items.len().is_multiple_of(2) {
         return Err(NtError(ERROR_INVALID_DATA));
     }
     Ok(items)
