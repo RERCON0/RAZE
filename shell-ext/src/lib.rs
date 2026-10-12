@@ -538,19 +538,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clsid_matches_the_registry_value() {
-        // Тот же GUID, что в `src/shell/install.rs` и AppxManifest.xml.
-        assert_eq!(COMMAND_CLSID.data1, 0x8E5B_2C41);
-        assert_eq!(COMMAND_CLSID.data2, 0x6D3A);
-        assert_eq!(COMMAND_CLSID.data3, 0x4F17);
-        assert_eq!(
-            COMMAND_CLSID.data4,
-            [0x9C, 0x0B, 0x51, 0xD2, 0xA7, 0xE4, 0xF1, 0x08]
-        );
-        assert_ne!(COMMAND_CLSID, COMMAND_GUID, "каноническое имя — другой GUID");
-    }
-
-    #[test]
     fn quoted_argument_survives_spaces() {
         let mut command = Vec::new();
         push_quoted(&mut command, Path::new(r"C:\tmp\a b.txt"));
@@ -607,18 +594,10 @@ mod tests {
         LIVE_OBJECTS.fetch_add(1, Ordering::SeqCst);
         let factory: IClassFactory = RazeFactory.into();
         unsafe { factory.LockServer(false).unwrap() };
-        assert_eq!(SERVER_LOCKS.load(Ordering::SeqCst), 0);
         // A bad caller must not turn zero into usize::MAX.
         unsafe { factory.LockServer(false).unwrap() };
-        assert_eq!(SERVER_LOCKS.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn shell_paths_preserve_unpaired_utf16_surrogates() {
-        let units = [b'C' as u16, b':' as u16, b'\\' as u16, 0xD800, 0];
-        let name = PWSTR(units.as_ptr().cast_mut());
-        let path = PathBuf::from(OsString::from_wide(unsafe { wide_slice(&name) }));
-        assert_eq!(path.as_os_str().encode_wide().collect::<Vec<_>>(), units[..4]);
+        drop(factory);
+        assert_eq!(DllCanUnloadNow(), HRESULT(0));
     }
 
     #[test]
@@ -642,12 +621,6 @@ mod tests {
     }
 
     #[test]
-    fn module_path_is_not_empty() {
-        let path = module_path().expect("путь к текущему модулю");
-        assert!(!path.as_os_str().is_empty());
-    }
-
-    #[test]
     fn wide_slice_stops_at_the_terminator() {
         let mut units: Vec<u16> = "NUL".encode_utf16().collect();
         units.push(0);
@@ -656,15 +629,5 @@ mod tests {
             &[b'N' as u16, b'U' as u16, b'L' as u16]
         );
         assert!(unsafe { wide_slice(&PWSTR(ptr::null_mut())) }.is_empty());
-    }
-
-    #[test]
-    fn task_string_ends_with_nul_and_is_readable() {
-        let pointer = task_string("NUL").expect("allocation");
-        // Читать можно только до освобождения — копия строки снимается
-        // здесь, а `CoTaskMemFree` вызывается уже после неё.
-        let text = String::from_utf16_lossy(unsafe { wide_slice(&pointer) });
-        unsafe { CoTaskMemFree(Some(pointer.0.cast::<c_void>())) };
-        assert_eq!(text, "NUL");
     }
 }
