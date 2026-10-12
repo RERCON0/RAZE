@@ -16,7 +16,9 @@
 </p>
 
 <p align="center">
-  <a href="#development"><strong>Build for Windows</strong></a> ·
+  <a href="https://github.com/RERCON0/RAZE/releases"><strong>Download for Windows</strong></a> ·
+  <a href="#installation">Installation</a> ·
+  <a href="#development">Build from source</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="SECURITY.md">Security</a>
 </p>
@@ -40,7 +42,8 @@
 
 > [!TIP]
 > **One click in Explorer, done.** Install the context-menu integration
-> (`raze --install`), right-click any stubborn folder or file, and choose
+> (`.\raze.exe --install` from the extracted folder; see [Installation](#installation)),
+> right-click any stubborn folder or file, and choose
 > **Delete with RAZE**. For anything headed to the Recycle Bin the click is the
 > confirmation: nothing else is asked and the main window does not open. Objects
 > that can only be deleted permanently ask for confirmation first. The UAC
@@ -137,19 +140,41 @@ deleted.
 
 ## Installation
 
-Signed builds are on the [Releases](https://github.com/RERCON0/RAZE/releases)
-page: `raze-windows-x64.zip` with an Ed25519-signed manifest (verify with
-`python scripts/release.py verify`). Building from source also works — see the
-[development instructions](#development). The unpacked `raze-app.exe` or
-`raze.exe` runs straight from its folder. To add
-**Delete with RAZE** to Explorer's right-click menu:
+### Download and install the Explorer menu
+
+1. Download **raze-windows-x64.zip** from [Releases](https://github.com/RERCON0/RAZE/releases).
+2. Extract the **whole archive** into a folder. Keep `raze.exe`, `raze-app.exe`,
+   `raze_shell.dll`, `RAZE.msix` and `RAZE.cer` together; do not run them from inside the ZIP.
+3. Open that folder in Explorer, right-click an empty area and choose **Open in Terminal**.
+   Select **PowerShell** if your terminal opens a different shell.
+4. Run the command below and confirm the Windows administrator prompt:
 
 ```powershell
-raze --install
+.\raze.exe --install
 ```
 
-This asks for administrator rights **once** (one UAC prompt) and installs RAZE
-into `%ProgramFiles%\RAZE`. That folder is writable only by administrators, which
+**The `.\` prefix means “run the executable in this folder”.** PowerShell does
+not search the current folder for a bare `raze` command, and RAZE's installer
+does not add it to `PATH`. Keep using `.\raze.exe` from the extracted folder,
+or specify the installed executable's full path:
+
+```powershell
+& "$env:ProgramFiles\RAZE\raze.exe" --help
+```
+
+The install asks for administrator rights **once** (one UAC prompt), copies
+RAZE into `%ProgramFiles%\RAZE` and registers **Delete with RAZE** in Explorer.
+Open a new Explorer window to check the entry on a file or folder. If the menu
+has not refreshed, sign out of Windows and back in.
+
+The download has an Ed25519-signed manifest; see [release verification](docs/RELEASING.md).
+The EXEs have no Authenticode signature, so SmartScreen may show **Windows protected
+your PC**. For a trusted download from the official Releases page, choose **More info →
+Run anyway**. The ZIP signature and self-signed MSIX do not remove that warning.
+
+### What installation changes
+
+The install folder is writable only by administrators, which
 matters: elevation re-runs `raze.exe`, and a copy in a folder any of your own
 programs can overwrite could be swapped for something else before the prompt.
 An earlier copy in `%LOCALAPPDATA%\Programs\RAZE` is cleaned up with the original
@@ -166,16 +191,36 @@ Windows only accepts menu extensions from signed packages. RAZE's package is
 signed with a self-signed certificate (`CN=RERCON RAZE`), so the install adds
 its **public** part to `LocalMachine\TrustedPeople` — and only if its
 thumbprint matches the one compiled into `raze.exe` (`packaging\cert-thumbprint.txt`).
-Nothing else is changed, and no private key is involved. To repeat just that
-step: `raze --register-package`. (If you would rather not trust a certificate,
-skip `RAZE.msix`/`RAZE.cer`: the classic menu entry works without them.)
-
-To remove everything — the package, the classic verbs, that certificate and the
-installed files (one UAC prompt):
+No private key is involved. To repeat just that package-registration step:
 
 ```powershell
-raze --uninstall
+& "$env:ProgramFiles\RAZE\raze.exe" --register-package
 ```
+
+(If you would rather not trust a certificate,
+skip `RAZE.msix`/`RAZE.cer`: the classic menu entry works without them.)
+
+### Update or uninstall
+
+To update, extract the new release into a separate folder and run
+`.\raze.exe --install` **from that new folder**. Close the RAZE application first.
+
+To uninstall, run this from the extracted folder:
+
+```powershell
+.\raze.exe --uninstall
+```
+
+If you no longer have that folder, use the installed copy from any PowerShell window:
+
+```powershell
+& "$env:ProgramFiles\RAZE\raze.exe" --uninstall
+```
+
+This removes the package, classic menu entries, trusted public certificate and
+installed files with one UAC prompt. When uninstalling from the installed copy,
+its running executable is removed after it exits. Your downloaded ZIP and extracted
+folder are left in place.
 
 The extension never deletes anything itself — it just launches `raze.exe` with
 the selected paths, so a crash in Explorer can never corrupt a deletion in
@@ -183,24 +228,28 @@ progress. `raze_shell.dll` and `raze.exe` must stay in the same folder.
 
 ## Quick start
 
+For portable use, double-click `raze-app.exe` to open the GUI; installing the
+Explorer menu is optional. Run the CLI examples below in PowerShell **from the
+extracted folder**. Replace each example path with your own target.
+
 ```powershell
 # Preview what would happen
-raze -n "C:\Users\name\Desktop\Seller"
+.\raze.exe -n "C:\temp\raze-demo"
 
 # Remove a folder with a NUL inside — Explorer cannot even select it
-raze "C:\Users\name\Desktop\Seller"
+.\raze.exe "C:\temp\raze-demo"
 
 # Permanent removal, no Recycle Bin
-raze --permanent "D:\old\build"
+.\raze.exe --permanent "C:\temp\old-build"
 
 # Close programs that hold the files, then remove
-raze -c "C:\temp\locked"
+.\raze.exe -c "C:\temp\locked"
 
 # Schedule removal for the next Windows restart
-raze --reboot "C:\temp\locked"
+.\raze.exe --reboot "C:\temp\locked"
 
 # Who holds this file?
-raze -L -n "C:\temp\still-in-use.txt"
+.\raze.exe -L -n "C:\temp\still-in-use.txt"
 ```
 
 Multiple paths at once; quote paths with spaces. Without `-y` RAZE asks for
@@ -239,8 +288,8 @@ uses the same saved default; `--lang` overrides it for that invocation without
 changing the saved choice:
 
 ```powershell
-raze --lang ru
-raze --lang ru --help
+.\raze.exe --lang ru
+.\raze.exe --lang ru --help
 ```
 
 ## How deletion works
@@ -259,13 +308,12 @@ raze --lang ru --help
 
 ## Development
 
-Windows x64, Rust 1.99.0 (pinned in `rust-toolchain.toml`), Visual Studio Build Tools (MSVC + Windows SDK
-10.0.26100), and `windres` (bundled with MSYS2/MinGW-w64) for the icon
-resources:
+Windows x64, Rust 1.99.0 (pinned in `rust-toolchain.toml`) and Visual Studio Build
+Tools (MSVC + Windows SDK 10.0.26100). Icon resources use the SDK's `rc.exe`:
 
 ```powershell
-packaging\build-package.ps1
-cargo build --release --workspace
+.\packaging\build-package.ps1
+cargo build --locked --release --workspace
 cargo test --locked --workspace --all-targets --all-features
 ```
 
@@ -286,6 +334,12 @@ Artifacts in `target\release`:
 | `raze-app.exe` | GUI |
 | `raze_shell.dll` | COM shell extension for the modern Windows 11 menu |
 | `RAZE.msix`, `RAZE.cer` | Signed sparse package and its public certificate (from `build-package.ps1`) |
+
+To install the Explorer menu from a source build, run this **from the repository root**:
+
+```powershell
+.\target\release\raze.exe --install
+```
 
 The shell extension is a `cdylib` loaded into `explorer.exe`: it has no
 `unwrap`/`expect` in shared paths, cannot panic, and `Invoke` only spawns

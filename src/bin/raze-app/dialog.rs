@@ -46,17 +46,19 @@ fn wrapped(text: &str, size: f32, color: Color32) -> egui::text::LayoutJob {
     job
 }
 
-fn render(ctx: &egui::Context, spec: &Spec) -> Frame {
+fn render(ui: &mut egui::Ui, spec: &Spec) -> Frame {
+    let ctx = ui.ctx().clone();
+    let ctx = &ctx;
     let mut answer = None;
-    egui::TopBottomPanel::top("titlebar")
-        .exact_height(TITLE_BAR)
+    egui::Panel::top("titlebar")
+        .exact_size(TITLE_BAR)
         .show_separator_line(true)
         .frame(
-            egui::Frame::none()
-                .fill(ctx.style().visuals.window_fill)
-                .inner_margin(egui::Margin::symmetric(14.0, 0.0)),
+            egui::Frame::NONE
+                .fill(ctx.global_style().visuals.window_fill)
+                .inner_margin(egui::Margin::symmetric(14, 0)),
         )
-        .show(ctx, |ui| {
+        .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 let width = (ui.available_width() - 40.0).max(0.0);
@@ -87,11 +89,11 @@ fn render(ctx: &egui::Context, spec: &Spec) -> Frame {
     let mut content_height = 0.0;
     egui::CentralPanel::default()
         .frame(
-            egui::Frame::none()
-                .fill(ctx.style().visuals.panel_fill)
-                .inner_margin(egui::Margin::symmetric(MARGIN.x, MARGIN.y)),
+            egui::Frame::NONE
+                .fill(ctx.global_style().visuals.panel_fill)
+                .inner_margin(egui::Margin::symmetric(MARGIN.x as i8, MARGIN.y as i8)),
         )
-        .show(ctx, |ui| {
+        .show(ui, |ui| {
             let top = ui.cursor().top();
             let tone = tone_color(ui, spec.tone);
             ui.label(RichText::new(&spec.head).size(14.0));
@@ -165,9 +167,11 @@ fn measure(spec: &Spec) -> f32 {
     // Шрифты и стиль вступают в силу с началом прохода, поэтому проходов два.
     let mut height = 0.0;
     for _ in 0..2 {
-        let _ = ctx.run(input.clone(), |ctx| {
-            height = render(ctx, spec).content_height;
+        let mut output = ctx.run_ui(input.clone(), |ui| {
+            height = render(ui, spec).content_height;
         });
+        // Measuring headlessly has no GPU to apply the generated font textures.
+        output.textures_delta.clear();
     }
     TITLE_BAR + 1.0 + 2.0 * MARGIN.y + height + SLACK
 }
@@ -180,7 +184,9 @@ struct DialogApp {
 }
 
 impl eframe::App for DialogApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         // ОС сообщает свой масштаб на каждом кадре; размер окна — в точках egui.
         if style::pin_scale_only(ctx) {
             ctx.send_viewport_cmd(ViewportCommand::InnerSize(egui::vec2(WIDTH, self.height)));
@@ -195,7 +201,7 @@ impl eframe::App for DialogApp {
             ctx.request_repaint();
         }
 
-        let mut answer = render(ctx, &self.spec).answer;
+        let mut answer = render(ui, &self.spec).answer;
         if ctx.input(|input| input.key_pressed(Key::Escape)) {
             answer = Some(false);
         } else if self.spec.no.is_none() && ctx.input(|input| input.key_pressed(Key::Enter)) {

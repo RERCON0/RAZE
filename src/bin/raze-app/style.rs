@@ -55,10 +55,12 @@ pub fn setup_fonts(ctx: &egui::Context) {
         let key = format!("cascadia-{name}");
         fonts.font_data.insert(
             key.clone(),
-            egui::FontData::from_static(MONO).tweak(egui::FontTweak {
-                y_offset_factor: offset,
-                ..Default::default()
-            }),
+            egui::FontData::from_static(MONO)
+                .tweak(egui::FontTweak {
+                    y_offset_factor: offset,
+                    ..Default::default()
+                })
+                .into(),
         );
         fonts
             .families
@@ -85,7 +87,7 @@ pub fn setup_theme(ctx: &egui::Context, dark: bool) {
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         style.spacing.button_padding = egui::vec2(12.0, 10.0);
         style.spacing.interact_size.y = 28.0;
-        style.spacing.window_margin = egui::Margin::symmetric(10.0, 15.0);
+        style.spacing.window_margin = egui::Margin::symmetric(10, 15);
         style.spacing.scroll = egui::style::ScrollStyle {
             foreground_color: true,
             ..egui::style::ScrollStyle::solid()
@@ -146,8 +148,8 @@ pub fn terminal_visuals(dark: bool) -> egui::Visuals {
     } else {
         egui::Visuals::light()
     };
-    v.window_rounding = egui::Rounding::ZERO;
-    v.menu_rounding = egui::Rounding::ZERO;
+    v.window_corner_radius = egui::CornerRadius::ZERO;
+    v.menu_corner_radius = egui::CornerRadius::ZERO;
     v.window_fill = bg_lift;
     v.window_stroke = Stroke::new(1.0_f32, line);
     v.window_shadow = egui::Shadow::NONE;
@@ -168,7 +170,7 @@ pub fn terminal_visuals(dark: bool) -> egui::Visuals {
         &mut v.widgets.active,
         &mut v.widgets.open,
     ] {
-        widget.rounding = egui::Rounding::ZERO;
+        widget.corner_radius = egui::CornerRadius::ZERO;
         // bg_fill backs checkboxes and must stay visible; weak_bg_fill backs
         // plain buttons, which is what makes them "ghost" (border only).
         widget.bg_fill = field;
@@ -309,9 +311,9 @@ pub fn rule(ui: &mut egui::Ui) {
 }
 
 pub fn badge(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
-    egui::Frame::none()
+    egui::Frame::NONE
         .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.5)))
-        .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+        .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {
             ui.label(RichText::new(text).size(11.0).color(color))
         })
@@ -328,7 +330,7 @@ pub fn wordmark(ui: &mut egui::Ui) {
         .lines()
         .collect();
     let measure = |ui: &egui::Ui, text: &str, size: f32| -> egui::Vec2 {
-        ui.fonts(|fonts| {
+        ui.fonts_mut(|fonts| {
             fonts
                 .layout_job(egui::text::LayoutJob::single_section(
                     text.to_string(),

@@ -526,11 +526,17 @@ fn clone_target(target: &Target) -> Target {
 }
 
 impl eframe::App for RazeApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Worker results must also be consumed while the window is minimized.
+        self.drain_messages();
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         // eframe re-applies the OS scale factor on DPI/monitor changes, so the
         // pin is re-asserted every frame, not just at startup.
         style::pin_pixel_scale(ctx, false);
-        self.drain_messages();
         if ctx.input(|i| i.viewport().close_requested()) && self.phase.working() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
@@ -538,11 +544,11 @@ impl eframe::App for RazeApp {
             i.raw
                 .dropped_files
                 .iter()
-                .filter_map(|f| f.path.clone())
+                .map(|f| f.path().to_path_buf())
                 .collect()
         });
         self.add_paths(ctx, dropped);
-        self.render(ctx);
+        self.render(ui);
     }
 }
 

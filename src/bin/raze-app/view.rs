@@ -4,17 +4,19 @@ use raze_rs::engine::scan::EntryKind;
 use raze_rs::scrollbar::ScrollAreaExt;
 
 impl RazeApp {
-    pub(super) fn render(&mut self, ctx: &egui::Context) {
-        self.title_bar(ctx);
+    pub(super) fn render(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
+        self.title_bar(ui);
         // Panels must be declared before CentralPanel, which takes the space left.
-        egui::TopBottomPanel::bottom("footer")
+        egui::Panel::bottom("footer")
             .frame(
-                egui::Frame::none()
-                    .fill(ctx.style().visuals.window_fill)
-                    .inner_margin(egui::Margin::symmetric(26.0, 10.0)),
+                egui::Frame::NONE
+                    .fill(ctx.global_style().visuals.window_fill)
+                    .inner_margin(egui::Margin::symmetric(26, 10)),
             )
             .show_separator_line(true)
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.weak(RichText::new(format!("raze {VERSION} — by rercon prod.")).size(11.0));
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
@@ -24,11 +26,11 @@ impl RazeApp {
             });
         egui::CentralPanel::default()
             .frame(
-                egui::Frame::none()
-                    .fill(ctx.style().visuals.panel_fill)
-                    .inner_margin(egui::Margin::symmetric(26.0, 18.0)),
+                egui::Frame::NONE
+                    .fill(ctx.global_style().visuals.panel_fill)
+                    .inner_margin(egui::Margin::symmetric(26, 18)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 if matches!(self.phase, Phase::Confirming(_) | Phase::ConfirmingFallback) {
                     ui.disable();
                 }
@@ -66,16 +68,18 @@ impl RazeApp {
         self.resize_edges(ctx);
     }
 
-    fn title_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("titlebar")
-            .exact_height(42.0)
+    fn title_bar(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
+        egui::Panel::top("titlebar")
+            .exact_size(42.0)
             .show_separator_line(true)
             .frame(
-                egui::Frame::none()
-                    .fill(ctx.style().visuals.window_fill)
-                    .inner_margin(egui::Margin::symmetric(14.0, 0.0)),
+                egui::Frame::NONE
+                    .fill(ctx.global_style().visuals.window_fill)
+                    .inner_margin(egui::Margin::symmetric(14, 0)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     let width = (ui.available_width() - 3.0 * 40.0 - style::THEME_BTN_WIDTH - 40.0)
@@ -272,7 +276,7 @@ impl RazeApp {
         });
         let hovering = ui.ctx().input(|i| !i.raw.hovered_files.is_empty());
         if self.plan.is_empty() {
-            egui::Frame::none()
+            egui::Frame::NONE
                 .stroke(Stroke::new(
                     1.0_f32,
                     if hovering {
@@ -281,7 +285,7 @@ impl RazeApp {
                         ui.visuals().widgets.noninteractive.bg_stroke.color
                     },
                 ))
-                .inner_margin(egui::Margin::symmetric(18.0, 16.0))
+                .inner_margin(egui::Margin::symmetric(18, 16))
                 .show(ui, |ui| {
                     ui.set_min_width((ui.available_width()).max(0.0));
                     ui.vertical_centered(|ui| {
@@ -319,13 +323,13 @@ impl RazeApp {
             } else {
                 ui.visuals().widgets.inactive.bg_stroke.color
             };
-            let card = egui::Frame::none()
+            let card = egui::Frame::NONE
                 .fill(ui.visuals().window_fill)
                 .stroke(Stroke::new(
                     1.0_f32,
                     ui.visuals().widgets.inactive.bg_stroke.color,
                 ))
-                .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                .inner_margin(egui::Margin::symmetric(12, 10))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
@@ -623,9 +627,9 @@ impl RazeApp {
             }
         });
         if self.show_log {
-            egui::Frame::none()
+            egui::Frame::NONE
                 .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-                .inner_margin(egui::Margin::same(10.0))
+                .inner_margin(egui::Margin::same(10))
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical()
                         .id_salt("log-scroll")
@@ -648,7 +652,7 @@ impl RazeApp {
     }
 
     fn render_confirm(&mut self, ctx: &egui::Context, confirm: Confirm) {
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
         let layer = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Middle,
             egui::Id::new("modal-dimmer"),
@@ -786,7 +790,7 @@ impl RazeApp {
     /// Корзина отказала: ничего не удалено, спросить о безвозвратном удалении.
     /// Те же цели, что не приняла оболочка, — остальные в плане не тронуты.
     fn render_fallback(&mut self, ctx: &egui::Context) {
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
         let layer = ctx.layer_painter(egui::LayerId::new(
             egui::Order::Middle,
             egui::Id::new("modal-dimmer"),
@@ -881,7 +885,7 @@ impl RazeApp {
         if ctx.input(|i| i.viewport().maximized.unwrap_or(self.maximized)) {
             return;
         }
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
         let (w, h, e) = (screen.width(), screen.height(), 5.0);
         for (index, (pos, size, direction)) in [
             ([0.0, 0.0], [e, e], egui::ResizeDirection::NorthWest),

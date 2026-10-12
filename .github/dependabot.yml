@@ -1,0 +1,27 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    # windows-core must match the COM bindings selected by windows.
+    ignore:
+      - dependency-name: windows-core
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+    groups:
+      interface:
+        patterns: ["eframe", "egui*", "epaint*", "emath", "ecolor", "image"]
+      windows-bindings:
+        patterns: ["windows", "windows-core", "windows-sys", "winreg"]
+      rust-dependencies:
+        patterns: ["*"]
+        exclude-patterns: ["eframe", "egui*", "epaint*", "emath", "ecolor", "image", "windows", "windows-core", "windows-sys", "winreg"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]
