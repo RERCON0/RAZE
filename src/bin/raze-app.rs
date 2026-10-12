@@ -526,9 +526,12 @@ fn clone_target(target: &Target) -> Target {
 }
 
 impl eframe::App for RazeApp {
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Worker results must also be consumed while the window is minimized.
         self.drain_messages();
+        if ctx.input(|i| i.viewport().close_requested()) && self.phase.working() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -537,9 +540,6 @@ impl eframe::App for RazeApp {
         // eframe re-applies the OS scale factor on DPI/monitor changes, so the
         // pin is re-asserted every frame, not just at startup.
         style::pin_pixel_scale(ctx, false);
-        if ctx.input(|i| i.viewport().close_requested()) && self.phase.working() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-        }
         let dropped = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -606,6 +606,24 @@ mod tests {
     use raze_rs::engine::path::NtPath;
     use raze_rs::engine::recycle::RecycleVerdict;
     use raze_rs::report::TargetReport;
+
+    #[test]
+    fn a_hidden_window_cannot_close_during_removal() {
+        let ctx = egui::Context::default();
+        let mut app = RazeApp::new(&ctx);
+        app.phase = Phase::Removing;
+        let mut input = egui::RawInput::default();
+        let viewport = input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap();
+        viewport.minimized = Some(true);
+        viewport.events.push(egui::ViewportEvent::Close);
+        let output = ctx.run_logic(&input, |ctx| {
+            eframe::App::logic(&mut app, ctx, &mut eframe::Frame::_new_kittest());
+        });
+        assert!(output.viewport_commands[&egui::ViewportId::ROOT]
+            .iter()
+            .any(|command| matches!(command, egui::ViewportCommand::CancelClose)));
+        assert!(matches!(app.phase, Phase::Removing));
+    }
 
     fn target(path: PathBuf) -> Target {
         let path = NtPath::new(&path).unwrap();
