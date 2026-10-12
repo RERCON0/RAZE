@@ -840,6 +840,13 @@ mod tests {
         // «Системный файл» вне цели и жёсткая ссылка на него внутри.
         // Файл защищён от удаления, а его DACL менять нельзя: он общий.
         // RAZE обязан открыть удаление через родителя ссылки, не трогая файл.
+        // В повышенном процессе SeBackup/SeRestore открывает файл по
+        // привилегии, минуя отказ DACL, поэтому сам маршрут проверяется
+        // только без повышения; на диске ничего не меняется и при скипе.
+        if privs::is_elevated() {
+            eprintln!("skipped: DACL denial is not enforceable in an elevated process");
+            return;
+        }
         use windows::Win32::Storage::FileSystem::{
             FILE_ALL_ACCESS, FILE_DELETE_CHILD, FILE_GENERIC_READ, WRITE_DAC, WRITE_OWNER,
         };

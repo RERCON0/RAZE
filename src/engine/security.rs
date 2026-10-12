@@ -307,6 +307,14 @@ mod tests {
 
     #[test]
     fn ownership_and_acl_repair_do_not_require_delete_access() {
+        // В повышенном процессе RAZE держит SeBackup/SeRestore, и отказ DACL
+        // перестаёт быть отказом (открытие с BACKUP_SEMANTICS получает доступ
+        // по привилегии). Проверки, построенные на отказе, честны только без
+        // повышения — как у обычного пользователя.
+        if privs::is_elevated() {
+            eprintln!("skipped: DACL denial is not enforceable in an elevated process");
+            return;
+        }
         let base = std::env::temp_dir().join(format!(
             "raze-acl-repair-{}-{}",
             std::process::id(),
@@ -364,6 +372,14 @@ mod tests {
     #[test]
     fn unreadable_subdirectories_are_counted_once_and_obey_the_display_budget() {
         use crate::engine::scan::{scan, ScanOptions};
+        // См. `ownership_and_acl_repair_do_not_require_delete_access`: в
+        // повышенном процессе привилегия резервного копирования открывает и
+        // «закрытые» каталоги, поэтому проверка бюджета неполного обхода
+        // имеет смысл только без повышения.
+        if privs::is_elevated() {
+            eprintln!("skipped: DACL denial is not enforceable in an elevated process");
+            return;
+        }
         let base = std::env::temp_dir().join(format!(
             "raze-acl-scan-{}-{}",
             std::process::id(),
