@@ -20,7 +20,34 @@ impl RazeApp {
                 ui.horizontal(|ui| {
                     ui.weak(RichText::new(format!("raze {VERSION} — by rercon prod.")).size(11.0));
                     ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                        ui.hyperlink_to(RichText::new("t.me/rercon").size(11.0), TELEGRAM_URL);
+                        // eframe собран без feature `links`, поэтому hyperlink_to
+                        // молча ничего не открывает. Обычная кнопка без рамки
+                        // сохраняет вид ссылки и вызывает ShellExecuteW сама.
+                        let link = egui::Button::new(
+                            RichText::new("t.me/rercon")
+                                .size(11.0)
+                                .color(ui.visuals().hyperlink_color),
+                        )
+                        .frame(false);
+                        if ui
+                            .add(link)
+                            .on_hover_text(tr!(
+                                "Open the rercon channel in a browser",
+                                "Открыть канал rercon в браузере"
+                            ))
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .clicked()
+                            && !open_telegram_channel()
+                        {
+                            self.status_error = true;
+                            self.status = Some(
+                                tr!(
+                                    "Could not open the browser. Address: t.me/rercon",
+                                    "Не удалось открыть браузер. Адрес: t.me/rercon"
+                                )
+                                .to_owned(),
+                            );
+                        }
                     });
                 });
             });

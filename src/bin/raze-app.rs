@@ -7,12 +7,14 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 use eframe::egui;
-use raze_rs::engine::elevation::{build_arguments, is_elevated, relaunch_elevated};
+use raze_rs::engine::elevation::{
+    build_arguments, is_elevated, open_telegram_channel, relaunch_elevated,
+};
 use raze_rs::engine::path::{comparison_key, eq_ignore_case};
 use raze_rs::engine::recycle::Disposition;
 use raze_rs::job::{self, Options, RecycleFallback, Target};
 use raze_rs::report::{human_bytes, Report};
-use raze_rs::{i18n, tr, tr_format, TELEGRAM_URL, VERSION};
+use raze_rs::{i18n, tr, tr_format, VERSION};
 
 #[path = "raze-app/dialog.rs"]
 mod dialog;

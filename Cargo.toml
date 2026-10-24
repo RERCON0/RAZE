@@ -24,8 +24,11 @@ path = "src/bin/raze.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-# Ровно тот же egui/eframe, что и в SNATCH: та же визуальная «семья» и та же
-# вендорённая папка со шрифтами. glow вместо wgpu — exe заметно меньше.
+# Та же визуальная «семья», что и в SNATCH, и та же вендорённая папка со
+# шрифтами. glow вместо wgpu — exe заметно меньше.
+# Ссылку в футере открывает свой ShellExecuteW: eframe собран без feature
+# `links`, поэтому его OpenUrl молча игнорируется, а тянуть webbrowser+url+ICU
+# ради одной ссылки не нужно — windows-крейт с Win32_UI_Shell уже есть.
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow"] }
 # Подтягивается транзитивно через eframe; объявлен явно, чтобы наш код мог
 # пережать встроенный app-иконку в egui::IconData (см. build.rs).

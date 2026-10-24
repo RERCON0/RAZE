@@ -15,6 +15,21 @@ use super::error::NtError;
 use super::path::Wide;
 pub use super::privs::is_elevated;
 
+use crate::TELEGRAM_URL;
+
+/// Открывает канал проекта в браузере по умолчанию.
+/// Адрес — константа: ни выбранный путь, ни отчёт об удалении в ссылку не
+/// попадают. `false` — оболочка отказала в запуске.
+pub fn open_telegram_channel() -> bool {
+    if !TELEGRAM_URL.starts_with("https://t.me/") {
+        return false;
+    }
+    let verb = Wide::new("open");
+    let target = Wide::new(TELEGRAM_URL);
+    let result = unsafe { ShellExecuteW(None, verb.pc(), target.pc(), None, None, SW_SHOWNORMAL) };
+    result.0 as isize > 32
+}
+
 /// Запускает текущий исполняемый файл с теми же аргументами и verb `runas`.
 /// `Ok(true)` — процесс запущен и этот экземпляр должен завершиться.
 pub fn relaunch_elevated(exe: &Path, arguments: &OsStr) -> Result<bool, NtError> {
