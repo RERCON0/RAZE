@@ -1,6 +1,6 @@
 [package]
 name = "raze-shell"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "RAZE context-menu COM extension for the modern Windows 11 shell menu"
 license = "GPL-3.0-or-later"
