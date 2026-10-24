@@ -9,7 +9,7 @@ pub const CONTROL_HEIGHT: f32 = 40.0;
 pub const THEME_BTN_WIDTH: f32 = 56.0;
 
 /// Window size in egui points, as in SNATCH.
-pub const WINDOW_SIZE: [f32; 2] = [460.0, 720.0];
+pub const WINDOW_SIZE: [f32; 2] = [520.0, 840.0];
 pub const WINDOW_MIN_SIZE: [f32; 2] = [460.0, 600.0];
 
 /// One design pixel is UI_SCALE physical pixels on any display, whatever the

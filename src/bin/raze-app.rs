@@ -18,6 +18,9 @@ use raze_rs::{i18n, tr, tr_format, VERSION};
 
 #[path = "raze-app/dialog.rs"]
 mod dialog;
+#[cfg(windows)]
+#[path = "raze-app/placement.rs"]
+mod placement;
 #[path = "raze-app/style.rs"]
 mod style;
 #[path = "raze-app/view.rs"]
@@ -548,6 +551,9 @@ impl eframe::App for RazeApp {
         if self.startup_frames < 2 && ctx.current_pass_index() == 0 {
             self.startup_frames += 1;
             if self.startup_frames == 2 {
+                #[cfg(windows)]
+                placement::center(_frame);
+                #[cfg(not(windows))]
                 if let Some(center) = egui::ViewportCommand::center_on_screen(ctx) {
                     ctx.send_viewport_cmd(center);
                 }

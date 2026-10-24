@@ -11,6 +11,7 @@
 <p align="center"><a href="README.md">English</a> · <strong>Русский</strong></p>
 
 <p align="center">
+  <a href="https://github.com/RERCON0/RAZE/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/RERCON0/RAZE/total?color=49b675"></a>
   <a href="LICENSE"><img alt="GPL-3.0-or-later" src="https://img.shields.io/badge/license-GPL--3.0--or--later-2f855a"></a>
   <a href="https://t.me/rercon"><img alt="Telegram" src="https://img.shields.io/badge/Telegram-@rercon-26A5E4?logo=telegram&logoColor=white"></a>
 </p>
