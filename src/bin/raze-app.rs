@@ -101,6 +101,7 @@ struct Totals {
 }
 
 struct RazeApp {
+    startup_frames: u8,
     phase: Phase,
     mode: Confirm,
     plan: Vec<Target>,
@@ -141,6 +142,7 @@ impl RazeApp {
         style::pin_pixel_scale(ctx, true);
         let (tx, rx) = mpsc::channel();
         Self {
+            startup_frames: 0,
             phase: Phase::Idle,
             mode: Confirm::Recycle,
             plan: Vec::new(),
@@ -542,6 +544,16 @@ impl eframe::App for RazeApp {
         // eframe re-applies the OS scale factor on DPI/monitor changes, so the
         // pin is re-asserted every frame, not just at startup.
         style::pin_pixel_scale(ctx, false);
+        // The first frame applies the pixel-scale resize; center its final size.
+        if self.startup_frames < 2 && ctx.current_pass_index() == 0 {
+            self.startup_frames += 1;
+            if self.startup_frames == 2 {
+                if let Some(center) = egui::ViewportCommand::center_on_screen(ctx) {
+                    ctx.send_viewport_cmd(center);
+                }
+            }
+            ctx.request_repaint();
+        }
         let dropped = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -588,6 +600,7 @@ fn main() -> eframe::Result {
         "RAZE",
         eframe::NativeOptions {
             viewport,
+            centered: true,
             ..Default::default()
         },
         Box::new(|cc| Ok(Box::new(RazeApp::new(&cc.egui_ctx)))),
