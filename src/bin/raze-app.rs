@@ -25,6 +25,8 @@ mod placement;
 mod style;
 #[path = "raze-app/view.rs"]
 mod view;
+#[path = "raze-app/window_state.rs"]
+mod window_state;
 
 const MAX_LOG_LINES: usize = 500;
 const MAX_TARGETS: usize = 512;
@@ -105,6 +107,7 @@ struct Totals {
 
 struct RazeApp {
     startup_frames: u8,
+    window_state: window_state::WindowState,
     phase: Phase,
     mode: Confirm,
     plan: Vec<Target>,
@@ -142,10 +145,11 @@ impl RazeApp {
         let status_error = status.is_some();
         style::setup_fonts(ctx);
         style::setup_theme(ctx, true);
-        style::pin_pixel_scale(ctx, true);
+        style::pin_pixel_scale(ctx, false);
         let (tx, rx) = mpsc::channel();
         Self {
             startup_frames: 0,
+            window_state: window_state::WindowState::default(),
             phase: Phase::Idle,
             mode: Confirm::Recycle,
             plan: Vec::new(),
@@ -533,6 +537,14 @@ fn clone_target(target: &Target) -> Target {
 }
 
 impl eframe::App for RazeApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.window_state.save(storage);
+    }
+
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Worker results must also be consumed while the window is minimized.
         self.drain_messages();
@@ -548,17 +560,27 @@ impl eframe::App for RazeApp {
         // pin is re-asserted every frame, not just at startup.
         style::pin_pixel_scale(ctx, false);
         // The first frame applies the pixel-scale resize; center its final size.
-        if self.startup_frames < 2 && ctx.current_pass_index() == 0 {
+        if self.startup_frames < 3 && ctx.current_pass_index() == 0 {
             self.startup_frames += 1;
             if self.startup_frames == 2 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                    self.window_state.size.into(),
+                ));
+            }
+            if self.startup_frames == 3 {
                 #[cfg(windows)]
                 placement::center(_frame);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(
+                    self.window_state.maximized,
+                ));
                 #[cfg(not(windows))]
                 if let Some(center) = egui::ViewportCommand::center_on_screen(ctx) {
                     ctx.send_viewport_cmd(center);
                 }
             }
             ctx.request_repaint();
+        } else if self.startup_frames == 3 && ctx.current_pass_index() == 0 {
+            self.window_state.observe(ctx);
         }
         let dropped = ctx.input(|i| {
             i.raw
@@ -607,9 +629,16 @@ fn main() -> eframe::Result {
         eframe::NativeOptions {
             viewport,
             centered: true,
+            persist_window: false,
             ..Default::default()
         },
-        Box::new(|cc| Ok(Box::new(RazeApp::new(&cc.egui_ctx)))),
+        Box::new(|cc| {
+            #[cfg(windows)]
+            placement::square_window_corners(cc);
+            let mut app = RazeApp::new(&cc.egui_ctx);
+            app.window_state = window_state::WindowState::load(cc.storage);
+            Ok(Box::new(app))
+        }),
     );
     if let Err(error) = &result {
         fatal_dialog(tr!("RAZE — could not open window", "RAZE — не удалось открыть окно"),

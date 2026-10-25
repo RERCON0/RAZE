@@ -909,34 +909,44 @@ impl RazeApp {
 
     #[cfg(windows)]
     fn resize_edges(&self, ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().maximized.unwrap_or(self.maximized)) {
+        if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
             return;
         }
-        let screen = ctx.content_rect();
-        let (w, h, e) = (screen.width(), screen.height(), 5.0);
-        for (index, (pos, size, direction)) in [
-            ([0.0, 0.0], [e, e], egui::ResizeDirection::NorthWest),
-            ([e, 0.0], [w - 2.0 * e, e], egui::ResizeDirection::North),
-            ([w - e, 0.0], [e, e], egui::ResizeDirection::NorthEast),
-            ([0.0, e], [e, h - 2.0 * e], egui::ResizeDirection::West),
-            ([w - e, e], [e, h - 2.0 * e], egui::ResizeDirection::East),
-            ([0.0, h - e], [e, e], egui::ResizeDirection::SouthWest),
-            ([e, h - e], [w - 2.0 * e, e], egui::ResizeDirection::South),
-            ([w - e, h - e], [e, e], egui::ResizeDirection::SouthEast),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            egui::Area::new(egui::Id::new(("resize", index)))
-                .order(egui::Order::Foreground)
-                .fixed_pos(egui::pos2(pos[0], pos[1]))
-                .show(ctx, |ui| {
-                    let (_, r) =
-                        ui.allocate_exact_size(egui::vec2(size[0], size[1]), egui::Sense::drag());
-                    if r.drag_started() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
-                    }
-                });
+        let rect = ctx.input(|i| i.viewport_rect());
+        let Some(pos) = ctx.pointer_hover_pos() else {
+            return;
+        };
+        if !rect.contains(pos) {
+            return;
+        }
+        let margin = 6.0;
+        let left = pos.x < rect.left() + margin;
+        let right = pos.x > rect.right() - margin;
+        let top = pos.y < rect.top() + margin;
+        let bottom = pos.y > rect.bottom() - margin;
+        use egui::viewport::ResizeDirection as D;
+        let direction = match (left, right, top, bottom) {
+            (true, _, true, _) => Some(D::NorthWest),
+            (_, true, true, _) => Some(D::NorthEast),
+            (true, _, _, true) => Some(D::SouthWest),
+            (_, true, _, true) => Some(D::SouthEast),
+            (true, _, _, _) => Some(D::West),
+            (_, true, _, _) => Some(D::East),
+            (_, _, true, _) => Some(D::North),
+            (_, _, _, true) => Some(D::South),
+            _ => None,
+        };
+        if let Some(direction) = direction {
+            let cursor = match direction {
+                D::North | D::South => egui::CursorIcon::ResizeVertical,
+                D::East | D::West => egui::CursorIcon::ResizeHorizontal,
+                D::NorthEast | D::SouthWest => egui::CursorIcon::ResizeNeSw,
+                D::NorthWest | D::SouthEast => egui::CursorIcon::ResizeNwSe,
+            };
+            ctx.set_cursor_icon(cursor);
+            if ctx.input(|i| i.pointer.primary_pressed()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+            }
         }
     }
 }
@@ -991,4 +1001,43 @@ fn render_entries(ui: &mut egui::Ui, target: &Target, index: usize) {
                 );
             }
         });
+}
+
+#[cfg(all(test, windows))]
+mod resize_tests {
+    use super::*;
+
+    #[test]
+    fn resize_edges_show_native_cursors() {
+        let ctx = egui::Context::default();
+        let app = RazeApp::new(&ctx);
+        for (pos, expected) in [
+            (egui::pos2(2.0, 300.0), egui::CursorIcon::ResizeHorizontal),
+            (egui::pos2(518.0, 300.0), egui::CursorIcon::ResizeHorizontal),
+            (egui::pos2(200.0, 2.0), egui::CursorIcon::ResizeVertical),
+            (egui::pos2(200.0, 838.0), egui::CursorIcon::ResizeVertical),
+            (egui::pos2(2.0, 2.0), egui::CursorIcon::ResizeNwSe),
+            (egui::pos2(518.0, 838.0), egui::CursorIcon::ResizeNwSe),
+            (egui::pos2(518.0, 2.0), egui::CursorIcon::ResizeNeSw),
+            (egui::pos2(2.0, 838.0), egui::CursorIcon::ResizeNeSw),
+        ] {
+            let mut cursor = egui::CursorIcon::Default;
+            for _ in 0..3 {
+                let mut out = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(520.0, 840.0),
+                        )),
+                        events: vec![egui::Event::PointerMoved(pos)],
+                        ..Default::default()
+                    },
+                    |_| app.resize_edges(&ctx),
+                );
+                cursor = out.platform_output.cursor_icon;
+                out.textures_delta.clear();
+            }
+            assert_eq!(cursor, expected, "at {pos:?}");
+        }
+    }
 }
