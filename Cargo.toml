@@ -29,7 +29,7 @@ clap = { version = "4", features = ["derive"] }
 # Ссылку в футере открывает свой ShellExecuteW: eframe собран без feature
 # `links`, поэтому его OpenUrl молча игнорируется, а тянуть webbrowser+url+ICU
 # ради одной ссылки не нужно — windows-крейт с Win32_UI_Shell уже есть.
-eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "persistence"] }
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "persistence"] }
 # Подтягивается транзитивно через eframe; объявлен явно, чтобы наш код мог
 # пережать встроенный app-иконку в egui::IconData (см. build.rs).
 image = { version = "0.25", default-features = false, features = ["png"] }
